@@ -179,6 +179,7 @@ static esp_err_t h1_receive_packet(
         }
 
         if (level == 0) {
+            taskYIELD();
             continue;
         }
 
