@@ -7,6 +7,9 @@
 #include "esp_err.h"
 #include "sc16is752.h"
 
+#define H1_RX_PACKET_BUFFER_SIZE 2048
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,7 +31,8 @@ typedef enum {
 /**
  * Streaming state of H1 device, with a streaming frame count.
  */
-typedef struct {
+typedef struct
+{
     sc16_channel_t channel;
 
     char device_info[25];
@@ -37,6 +41,13 @@ typedef struct {
     bool streaming;
 
     uint32_t stream_frame_count;
+
+    /*
+     * Private receive buffer for this H1 instance.
+     *
+     * Ground H1 and sky H1 will each have their own copy.
+     */
+    uint8_t rx_packet[H1_RX_PACKET_BUFFER_SIZE];
 
 } h1_device_t;
 

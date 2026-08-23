@@ -1056,7 +1056,7 @@ esp_err_t h1_get_single_spectrum(
         h1_receive_packet(
             dev,
             response,
-            rx_buffer_size,
+            sizeof(response),
             &response_length,
             7000
         );
@@ -1384,19 +1384,14 @@ esp_err_t h1_read_stream_frame(
     }
 
 
-    /*
-     * Static because this packet buffer is large.
-     */
-    static uint8_t response[2048];
-
     size_t response_length = 0;
 
 
     esp_err_t ret =
         h1_receive_packet(
             dev,
-            response,
-            sizeof(response),
+            dev->rx_packet,
+            sizeof(dev->rx_packet),
             &response_length,
             timeout_ms
         );
@@ -1409,7 +1404,7 @@ esp_err_t h1_read_stream_frame(
 
     ret =
         h1_decode_spectrum_packet(
-            response,
+            dev->rx_packet,
             response_length,
             H1_CMD_START_STREAM,   // expected response type = 0x33
             frame
