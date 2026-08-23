@@ -10,6 +10,8 @@
 #include "sc16is752.h"
 #include "h1.h"
 
+#include "esp_timer.h"
+
 
 static const char *TAG = "DJI_H1";
 
@@ -154,147 +156,80 @@ void app_main(void)
     );
 
 
-    // --------------------------------------------------------
-    // Acquire one spectrum
-    // --------------------------------------------------------
+// --------------------------------------------------------
+// Continuous streaming test
+// --------------------------------------------------------
 
-    ESP_LOGI(
+ESP_LOGI(
+    TAG,
+    "Starting continuous H1 stream..."
+);
+
+
+sc16_reset_rx_overrun_count();
+
+
+ret =
+    h1_start_stream(&h1);
+
+
+if (ret != ESP_OK) {
+
+    ESP_LOGE(
         TAG,
-        "Requesting one spectrum..."
+        "Start stream failed: %s",
+        esp_err_to_name(ret)
     );
 
+    return;
+}
 
-    /*
-     * Static so the ~2 kB frame structure does not consume
-     * app_main task stack space.
-     */
 
-    static h1_spectrum_frame_t frame;
+static h1_spectrum_frame_t frame;
 
-    /**
-     * reset the fifo overrun counter before acquiring a spectrum
-     */
-    sc16_reset_rx_overrun_count();
+const uint32_t TEST_FRAMES = 10;
+
+
+printf("\n");
+printf("========================================\n");
+printf(" H1 CONTINUOUS STREAM TEST\n");
+printf("========================================\n");
+
+
+for (uint32_t n = 0;
+     n < TEST_FRAMES;
+     n++) {
+
+    int64_t t0 =
+        esp_timer_get_time();
 
 
     ret =
-        h1_get_single_spectrum(
+        h1_read_stream_frame(
             &h1,
-            &frame
+            &frame,
+            5000
         );
+
+
+    int64_t t1 =
+        esp_timer_get_time();
+
 
     if (ret != ESP_OK) {
 
         ESP_LOGE(
             TAG,
-            "Spectrum acquisition failed: %s",
+            "Frame %lu failed: %s",
+            (unsigned long)(n + 1),
             esp_err_to_name(ret)
         );
 
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        break;
     }
 
 
-    // --------------------------------------------------------
-    // Display result
-    // --------------------------------------------------------
-
-    printf("\n");
-    printf("========================================\n");
-    printf(" H1 SINGLE SPECTRUM\n");
-    printf("========================================\n");
-
-    printf(
-        "Exposure status : %s\n",
-        exposure_status_string(
-            frame.exposure_status
-        )
-    );
-
-    printf(
-        "Exposure time   : %lu us\n",
-        (unsigned long)frame.exposure_us
-    );
-
-    printf(
-        "Spectrum scale  : %d\n",
-        (int)frame.spectrum_scale
-    );
-
-    printf(
-        "Sample count    : %u\n",
-        (unsigned)frame.sample_count
-    );
-
-
-    // --------------------------------------------------------
-    // First five samples
-    // --------------------------------------------------------
-
-    printf("\nFirst samples:\n");
-
-
-    size_t first_count =
-        frame.sample_count < 5
-        ? frame.sample_count
-        : 5;
-
-
-    for (size_t i = 0;
-         i < first_count;
-         i++) {
-
-        /*
-         * For this current H1 configuration we expect
-         * 340 nm as the first sample.
-         */
-
-        unsigned wavelength =
-            340 + (unsigned)i;
-
-        printf(
-            "  %u nm : raw=%u\n",
-            wavelength,
-            (unsigned)frame.spectrum[i]
-        );
-    }
-
-
-    // --------------------------------------------------------
-    // Last five samples
-    // --------------------------------------------------------
-
-    if (frame.sample_count > 5) {
-
-        printf("\nLast samples:\n");
-
-
-        size_t start =
-            frame.sample_count - 5;
-
-
-        for (size_t i = start;
-             i < frame.sample_count;
-             i++) {
-
-            unsigned wavelength =
-                340 + (unsigned)i;
-
-            printf(
-                "  %u nm : raw=%u\n",
-                wavelength,
-                (unsigned)frame.spectrum[i]
-            );
-        }
-    }
-
-
-    // --------------------------------------------------------
-    // Find maximum raw value
-    // --------------------------------------------------------
-
+    // Find spectral maximum
     uint16_t max_value = 0;
     size_t max_index = 0;
 
@@ -303,7 +238,8 @@ void app_main(void)
          i < frame.sample_count;
          i++) {
 
-        if (frame.spectrum[i] > max_value) {
+        if (frame.spectrum[i] >
+            max_value) {
 
             max_value =
                 frame.spectrum[i];
@@ -315,16 +251,73 @@ void app_main(void)
 
 
     printf(
-        "\nMaximum raw value: %u at ~%u nm\n",
-        (unsigned)max_value,
-        340 + (unsigned)max_index
+        "Frame %2lu | "
+        "exp=%8lu us | "
+        "status=%u | "
+        "scale=%d | "
+        "N=%u | "
+        "max=%u @ %u nm | "
+        "interval=%.1f ms\n",
+
+        (unsigned long)(n + 1),
+
+        (unsigned long)
+        frame.exposure_us,
+
+        (unsigned)
+        frame.exposure_status,
+
+        (int)
+        frame.spectrum_scale,
+
+        (unsigned)
+        frame.sample_count,
+
+        (unsigned)
+        max_value,
+
+        340 + (unsigned)max_index,
+
+        (t1 - t0) / 1000.0
     );
+}
 
 
-    printf("\n");
-    printf("========================================\n");
-    printf(" SINGLE SPECTRUM TEST PASSED\n");
-    printf("========================================\n");
+// --------------------------------------------------------
+// Stop stream
+// --------------------------------------------------------
+
+ret =
+    h1_stop_stream(&h1);
+
+
+if (ret != ESP_OK) {
+
+    ESP_LOGE(
+        TAG,
+        "Stop stream failed: %s",
+        esp_err_to_name(ret)
+    );
+}
+
+
+printf("\n");
+
+printf(
+    "Frames received  : %lu\n",
+    (unsigned long)
+    h1.stream_frame_count
+);
+
+printf(
+    "RX overrun count : %lu\n",
+    (unsigned long)
+    sc16_get_rx_overrun_count()
+);
+
+printf("========================================\n");
+printf(" STREAM TEST COMPLETE\n");
+printf("========================================\n");
 
 
     while (1) {

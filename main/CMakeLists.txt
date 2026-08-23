@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES sc16is752 h1
+    REQUIRES sc16is752 h1 esp_timer
 )

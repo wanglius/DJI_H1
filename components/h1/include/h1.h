@@ -25,20 +25,27 @@ typedef enum {
 } h1_exposure_status_t;
 
 
-/*
- * Current H1 documentation gives 711 samples for 340-1050 nm.
- * Give ourselves some spare capacity.
+/**
+ * Streaming state of H1 device, with a streaming frame count.
  */
-#define H1_MAX_SPECTRUM_SAMPLES  1024
-
-
 typedef struct {
     sc16_channel_t channel;
 
     char device_info[25];
 
     bool initialized;
+    bool streaming;
+
+    uint32_t stream_frame_count;
+
 } h1_device_t;
+
+
+/*
+ * Current H1 documentation gives 711 samples for 340-1050 nm.
+ * Give ourselves some spare capacity.
+ */
+#define H1_MAX_SPECTRUM_SAMPLES  1024
 
 
 typedef struct {
@@ -95,6 +102,22 @@ esp_err_t h1_get_single_spectrum(
     h1_spectrum_frame_t *frame
 );
 
+/**
+ * stream controls
+ */
+esp_err_t h1_start_stream(
+    h1_device_t *dev
+);
+
+esp_err_t h1_read_stream_frame(
+    h1_device_t *dev,
+    h1_spectrum_frame_t *frame,
+    uint32_t timeout_ms
+);
+
+esp_err_t h1_stop_stream(
+    h1_device_t *dev
+);
 
 #ifdef __cplusplus
 }

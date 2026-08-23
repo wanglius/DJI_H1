@@ -699,3 +699,21 @@ esp_err_t sc16_read_fifo(
 
     return ESP_OK;
 }
+
+/**
+ * Read the SC16IS752 Line Status Register (LSR).
+ */
+esp_err_t sc16_get_lsr(
+    sc16_channel_t channel,
+    uint8_t *lsr)
+{
+    if (lsr == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return sc16_read_reg(
+        channel,
+        REG_LSR,
+        lsr
+    );
+}

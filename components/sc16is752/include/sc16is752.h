@@ -159,6 +159,14 @@ esp_err_t sc16_read_fifo(
 );
 
 
+/**
+ * Read the SC16IS752 Line Status Register.
+ */
+esp_err_t sc16_get_lsr(
+    sc16_channel_t channel,
+    uint8_t *lsr
+);
+
 #ifdef __cplusplus
 }
 #endif

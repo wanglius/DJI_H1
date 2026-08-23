@@ -33,6 +33,39 @@ static const char *TAG = "H1";
 #define H1_CMD_GET_EXPOSURE      0x0B
 #define H1_CMD_GET_SINGLE_SPECTRUM   0x32
 
+#define H1_CMD_START_STREAM          0x33
+#define H1_CMD_STOP_STREAM           0x04
+
+// ============================================================
+// Internal forward declarations
+// ============================================================
+
+static esp_err_t h1_validate_packet(
+    const uint8_t *packet,
+    size_t length,
+    uint8_t expected_type
+);
+
+static uint16_t h1_read_u16_le(
+    const uint8_t *p
+);
+
+static int16_t h1_read_i16_le(
+    const uint8_t *p
+);
+
+static uint32_t h1_read_u32_le(
+    const uint8_t *p
+);
+
+static esp_err_t h1_send_command_ex(
+    h1_device_t *dev,
+    uint8_t command_type,
+    const uint8_t *payload,
+    size_t payload_length,
+    bool clear_rx
+);
+
 
 // ============================================================
 // Utility: H1 checksum
@@ -61,10 +94,38 @@ static uint8_t h1_checksum(
 static void h1_clear_rx(
     h1_device_t *dev)
 {
-    uint8_t dummy;
+    uint8_t temp[64];
 
-    while (sc16_rx_available(dev->channel)) {
-        sc16_read_byte(dev->channel, &dummy);
+
+    while (1) {
+
+        uint8_t level = 0;
+
+
+        if (sc16_rx_level(
+                dev->channel,
+                &level) != ESP_OK) {
+
+            break;
+        }
+
+
+        if (level == 0) {
+            break;
+        }
+
+
+        size_t got = 0;
+
+
+        if (sc16_read_fifo(
+                dev->channel,
+                temp,
+                level,
+                &got) != ESP_OK) {
+
+            break;
+        }
     }
 }
 
@@ -92,10 +153,8 @@ static esp_err_t h1_receive_packet(
         return ESP_ERR_INVALID_ARG;
     }
 
-
     size_t count = 0;
     size_t expected_length = 0;
-
 
     int64_t start_us =
         esp_timer_get_time();
@@ -105,15 +164,9 @@ static esp_err_t h1_receive_packet(
         ((int64_t)timeout_ms * 1000);
 
 
-    while (esp_timer_get_time() <
-           deadline_us) {
-
-        // ----------------------------------------------------
-        // Ask SC16 how many UART bytes are currently buffered
-        // ----------------------------------------------------
+    while (esp_timer_get_time() < deadline_us) {
 
         uint8_t level = 0;
-
 
         esp_err_t ret =
             sc16_rx_level(
@@ -121,148 +174,103 @@ static esp_err_t h1_receive_packet(
                 &level
             );
 
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        if (level == 0) {
+            continue;
+        }
+
+
+        size_t read_size;
+
+
+        /*
+         * Before packet length is known,
+         * read only enough to obtain the
+         * complete 5-byte H1 header.
+         */
+        if (expected_length == 0) {
+
+            size_t header_remaining =
+                5 - count;
+
+            read_size =
+                level < header_remaining
+                ? level
+                : header_remaining;
+        }
+
+        else {
+
+            /*
+             * Never consume bytes belonging
+             * to the next stream frame.
+             */
+            size_t packet_remaining =
+                expected_length - count;
+
+            read_size =
+                level < packet_remaining
+                ? level
+                : packet_remaining;
+        }
+
+
+        if (count + read_size > buffer_size) {
+            return ESP_ERR_NO_MEM;
+        }
+
+
+        size_t got = 0;
+
+        ret =
+            sc16_read_fifo(
+                dev->channel,
+                &buffer[count],
+                read_size,
+                &got
+            );
 
         if (ret != ESP_OK) {
             return ret;
         }
 
-
-        if (level > 0) {
-
-            // ------------------------------------------------
-            // Never read beyond our H1 packet buffer
-            // ------------------------------------------------
-
-            size_t room =
-                buffer_size - count;
+        count += got;
 
 
-            size_t read_size =
-                level;
+        if (expected_length == 0 &&
+            count >= 5) {
+
+            expected_length =
+                ((size_t)buffer[2]) |
+                ((size_t)buffer[3] << 8) |
+                ((size_t)buffer[4] << 16);
 
 
-            if (read_size > room) {
-                read_size = room;
-            }
-
-
-            if (read_size == 0) {
+            if (expected_length < 9 ||
+                expected_length > buffer_size) {
 
                 ESP_LOGE(
                     TAG,
-                    "RX buffer overflow"
-                );
-
-                return ESP_ERR_NO_MEM;
-            }
-
-
-            // ------------------------------------------------
-            // Burst-drain SC16 FIFO
-            // ------------------------------------------------
-
-            size_t got = 0;
-
-
-            ret =
-                sc16_read_fifo(
-                    dev->channel,
-                    &buffer[count],
-                    read_size,
-                    &got
-                );
-
-
-            if (ret != ESP_OK) {
-                return ret;
-            }
-
-
-            count += got;
-
-
-            // ------------------------------------------------
-            // Once first 5 bytes exist, determine H1 packet size
-            // ------------------------------------------------
-
-            if (expected_length == 0 &&
-                count >= 5) {
-
-                expected_length =
-                    ((size_t)buffer[2]) |
-                    ((size_t)buffer[3] << 8) |
-                    ((size_t)buffer[4] << 16);
-
-
-                ESP_LOGI(
-                    TAG,
-                    "H1 packet length announced: %u bytes",
+                    "Invalid H1 packet length: %u",
                     (unsigned)expected_length
                 );
 
-
-                if (expected_length < 9) {
-
-                    ESP_LOGE(
-                        TAG,
-                        "Invalid H1 packet length: %u",
-                        (unsigned)expected_length
-                    );
-
-                    return ESP_ERR_INVALID_SIZE;
-                }
-
-
-                if (expected_length >
-                    buffer_size) {
-
-                    ESP_LOGE(
-                        TAG,
-                        "H1 packet too large: %u > %u",
-                        (unsigned)expected_length,
-                        (unsigned)buffer_size
-                    );
-
-                    return ESP_ERR_NO_MEM;
-                }
-            }
-
-
-            // ------------------------------------------------
-            // Packet complete
-            // ------------------------------------------------
-
-            if (expected_length > 0 &&
-                count >= expected_length) {
-
-                *packet_length =
-                    expected_length;
-
-
-                int64_t elapsed_us =
-                    esp_timer_get_time()
-                    - start_us;
-
-
-                ESP_LOGI(
-                    TAG,
-                    "RX complete: %u bytes in %.1f ms",
-                    (unsigned)expected_length,
-                    elapsed_us / 1000.0
-                );
-
-
-                return ESP_OK;
+                return ESP_ERR_INVALID_SIZE;
             }
         }
 
 
-        /*
-         * No FreeRTOS delay yet.
-         *
-         * Keep this qualification test aggressively polling.
-         * Once it works, we can make the driver cooperative.
-         */
+        if (expected_length > 0 &&
+            count == expected_length) {
+
+            *packet_length =
+                expected_length;
+
+            return ESP_OK;
+        }
     }
 
 
@@ -273,40 +281,123 @@ static esp_err_t h1_receive_packet(
         (unsigned)count
     );
 
-
-    // --------------------------------------------------------
-    // Keep your diagnostic partial HEX dump for now
-    // --------------------------------------------------------
-
-    printf("RX partial packet:\n");
-
-
-    for (size_t i = 0;
-         i < count;
-         i++) {
-
-        printf("%02X ", buffer[i]);
-
-        if ((i + 1) % 16 == 0) {
-            printf("\n");
-        }
-    }
-
-
-    printf("\n");
-
-
-    ESP_LOGE(
-        TAG,
-        "SC16 RX overrun count: %lu",
-        (unsigned long)
-        sc16_get_rx_overrun_count()
-    );
-
-
     return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * decode a spectrum packet
+ */
+static esp_err_t h1_decode_spectrum_packet(
+    const uint8_t *response,
+    size_t response_length,
+    uint8_t expected_type,
+    h1_spectrum_frame_t *frame)
+{
+    if (response == NULL ||
+        frame == NULL) {
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+
+    esp_err_t ret =
+        h1_validate_packet(
+            response,
+            response_length,
+            expected_type
+        );
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+
+    const size_t OFFSET_EXPOSURE_STATUS = 6;
+    const size_t OFFSET_EXPOSURE_TIME   = 7;
+
+    const size_t OFFSET_SCALE =
+        6
+        + 1
+        + 4
+        + 47 * 4
+        + 1 * 4
+        + 3 * 4
+        + 16 * 4;
+
+    const size_t OFFSET_SPECTRUM =
+        OFFSET_SCALE + 2;
+
+    const size_t TRAILER_SIZE = 3;
+
+
+    if (response_length <
+        OFFSET_SPECTRUM + TRAILER_SIZE) {
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+
+    memset(frame, 0, sizeof(*frame));
+
+
+    frame->exposure_status =
+        (h1_exposure_status_t)
+        response[OFFSET_EXPOSURE_STATUS];
+
+
+    frame->exposure_us =
+        h1_read_u32_le(
+            &response[OFFSET_EXPOSURE_TIME]
+        );
+
+
+    frame->spectrum_scale =
+        h1_read_i16_le(
+            &response[OFFSET_SCALE]
+        );
+
+
+    size_t spectrum_bytes =
+        response_length
+        - OFFSET_SPECTRUM
+        - TRAILER_SIZE;
+
+
+    if ((spectrum_bytes % 2) != 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+
+    size_t sample_count =
+        spectrum_bytes / 2;
+
+
+    if (sample_count >
+        H1_MAX_SPECTRUM_SAMPLES) {
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+
+    frame->sample_count =
+        sample_count;
+
+
+    for (size_t i = 0;
+         i < sample_count;
+         i++) {
+
+        frame->spectrum[i] =
+            h1_read_u16_le(
+                &response[
+                    OFFSET_SPECTRUM + i * 2
+                ]
+            );
+    }
+
+
+    return ESP_OK;
+}
 
 // ============================================================
 // Validate H1 response packet
@@ -411,6 +502,22 @@ static esp_err_t h1_send_command(
     const uint8_t *payload,
     size_t payload_length)
 {
+    return h1_send_command_ex(
+        dev,
+        command_type,
+        payload,
+        payload_length,
+        true
+    );
+}
+
+static esp_err_t h1_send_command_ex(
+    h1_device_t *dev,
+    uint8_t command_type,
+    const uint8_t *payload,
+    size_t payload_length,
+    bool clear_rx)
+{
     if (dev == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -481,7 +588,9 @@ static esp_err_t h1_send_command(
         H1_PACKET_END_1;
 
 
-    h1_clear_rx(dev);
+    if (clear_rx) {
+        h1_clear_rx(dev);
+    }
 
 
     size_t written =
@@ -1143,3 +1252,183 @@ esp_err_t h1_get_single_spectrum(
 
     return ESP_OK;
 }
+
+/**
+ * Start streaming mode (cmd 0x33)
+ */
+esp_err_t h1_start_stream(
+    h1_device_t *dev)
+{
+    if (dev == NULL ||
+        !dev->initialized) {
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+
+    if (dev->streaming) {
+        return ESP_OK;
+    }
+
+
+    /*
+     * H1 continuous spectrum command:
+     *
+     * CC 01 09 00 00 33 09 0D 0A
+     */
+
+    esp_err_t ret =
+        h1_send_command(
+            dev,
+            H1_CMD_START_STREAM,
+            NULL,
+            0
+        );
+
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+
+    dev->streaming = true;
+    dev->stream_frame_count = 0;
+
+
+    ESP_LOGI(
+        TAG,
+        "Continuous stream started"
+    );
+
+
+    return ESP_OK;
+}
+
+/**
+ * Stop streaming mode
+ */
+esp_err_t h1_stop_stream(
+    h1_device_t *dev)
+{
+    if (dev == NULL ||
+        !dev->initialized) {
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+
+    if (!dev->streaming) {
+        return ESP_OK;
+    }
+
+
+    /*
+     * Do NOT clear RX first.
+     */
+    esp_err_t ret =
+        h1_send_command_ex(
+            dev,
+            H1_CMD_STOP_STREAM,
+            NULL,
+            0,
+            false
+        );
+
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+
+    dev->streaming = false;
+
+
+    /*
+     * Give any already-transmitting frame
+     * time to finish arriving.
+     */
+    vTaskDelay(
+        pdMS_TO_TICKS(250)
+    );
+
+
+    h1_clear_rx(dev);
+
+
+    ESP_LOGI(
+        TAG,
+        "Continuous stream stopped"
+    );
+
+
+    return ESP_OK;
+}
+
+esp_err_t h1_read_stream_frame(
+    h1_device_t *dev,
+    h1_spectrum_frame_t *frame,
+    uint32_t timeout_ms)
+{
+    if (dev == NULL ||
+        frame == NULL) {
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+
+    if (!dev->initialized ||
+        !dev->streaming) {
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+
+    /*
+     * Static because this packet buffer is large.
+     */
+    static uint8_t response[2048];
+
+    size_t response_length = 0;
+
+
+    esp_err_t ret =
+        h1_receive_packet(
+            dev,
+            response,
+            sizeof(response),
+            &response_length,
+            timeout_ms
+        );
+
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+
+    ret =
+        h1_decode_spectrum_packet(
+            response,
+            response_length,
+            H1_CMD_START_STREAM,   // expected response type = 0x33
+            frame
+        );
+
+
+    if (ret != ESP_OK) {
+
+        ESP_LOGE(
+            TAG,
+            "Invalid stream frame"
+        );
+
+        return ret;
+    }
+
+
+    dev->stream_frame_count++;
+
+
+    return ESP_OK;
+}
+
