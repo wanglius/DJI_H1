@@ -82,7 +82,11 @@ void app_main(void)
     // H1 initialization
     // --------------------------------------------------------
 
-    h1_device_t h1;
+    /*
+     * h1_device_t owns a 2 kB RX packet buffer, so keep it off
+     * the relatively small app_main task stack.
+     */
+    static h1_device_t h1;
 
 
     ESP_ERROR_CHECK(
