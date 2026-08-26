@@ -1056,7 +1056,7 @@ esp_err_t h1_get_single_spectrum(
         h1_receive_packet(
             dev,
             response,
-            sizeof(response),
+            rx_buffer_size,
             &response_length,
             7000
         );
@@ -1427,4 +1427,3 @@ esp_err_t h1_read_stream_frame(
 
     return ESP_OK;
 }
-

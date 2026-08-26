@@ -629,6 +629,39 @@ esp_err_t sc16_read_fifo(
 
 
     /*
+     * Sample LSR on the same path used by streaming reception.
+     * This keeps the overrun diagnostic meaningful when H1
+     * reception uses RXLVL + FIFO burst reads instead of the
+     * legacy byte-at-a-time sc16_rx_available() path.
+     */
+    uint8_t lsr = 0;
+
+    esp_err_t ret =
+        sc16_read_reg(
+            channel,
+            REG_LSR,
+            &lsr
+        );
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (lsr & LSR_OE) {
+        s_rx_overrun_count++;
+    }
+
+    if (lsr & (LSR_PE | LSR_FE | LSR_BI | LSR_FIFO_ERR)) {
+        ESP_LOGW(
+            TAG,
+            "UART-%c RX error, LSR=0x%02X",
+            channel == SC16_CHANNEL_A ? 'A' : 'B',
+            lsr
+        );
+    }
+
+
+    /*
      * SC16IS752 RX FIFO depth = 64 bytes.
      */
     if (max_length > 64) {
@@ -670,7 +703,7 @@ esp_err_t sc16_read_fifo(
     };
 
 
-    esp_err_t ret =
+    ret =
         spi_device_transmit(
             s_spi,
             &t
