@@ -948,6 +948,18 @@ void app_main(void)
     }
 
 
+    /*
+     * Snapshot the diagnostic before stopping the H1. At short
+     * exposure times the H1 can transmit frames back-to-back.
+     * Once the acquisition task exits, bytes received while the
+     * STOP command settles are deliberately discarded and may
+     * overflow the 64-byte SC16 FIFO. Those shutdown overruns do
+     * not describe the integrity of the frames qualified above.
+     */
+    uint32_t acquisition_rx_overruns =
+        sc16_get_rx_overrun_count();
+
+
     // ========================================================
     // 16. NOW STOP THE H1 STREAM
     //
@@ -968,6 +980,14 @@ void app_main(void)
             esp_err_to_name(ret)
         );
     }
+
+
+    uint32_t total_rx_overruns =
+        sc16_get_rx_overrun_count();
+
+
+    uint32_t shutdown_rx_overruns =
+        total_rx_overruns - acquisition_rx_overruns;
 
 
     /*
@@ -1014,9 +1034,16 @@ void app_main(void)
 
 
     printf(
-        "RX overrun count : %lu\n",
+        "Acquisition RX overruns : %lu\n",
         (unsigned long)
-        sc16_get_rx_overrun_count()
+        acquisition_rx_overruns
+    );
+
+
+    printf(
+        "Shutdown RX overruns    : %lu\n",
+        (unsigned long)
+        shutdown_rx_overruns
     );
 
 
