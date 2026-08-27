@@ -10,6 +10,7 @@
 #include "driver/spi_master.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 
 static const char *TAG = "SC16IS752";
@@ -37,7 +38,7 @@ static SemaphoreHandle_t s_spi_mutex = NULL;
 static sc16_config_t s_config;
 static StreamBufferHandle_t s_rx_stream[2] = {NULL, NULL};
 static uint32_t s_software_rx_drop_count[2] = {0, 0};
-static volatile bool s_dual_rx_service_active = false;
+static bool s_dual_rx_service_active = false;
 
 static esp_err_t sc16_rx_level_hardware(sc16_channel_t channel, uint8_t *level);
 static esp_err_t sc16_read_fifo_hardware(
@@ -521,15 +522,16 @@ bool sc16_wait_tx_ready(
     sc16_channel_t channel,
     uint32_t timeout_ms)
 {
-    while (timeout_ms > 0) {
-
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    do {
         if (sc16_tx_ready(channel)) {
             return true;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(1));
-        timeout_ms--;
-    }
+        if (esp_timer_get_time() >= deadline_us) {
+            break;
+        }
+        vTaskDelay(1);
+    } while (true);
 
     return false;
 }
@@ -539,15 +541,16 @@ bool sc16_wait_rx(
     sc16_channel_t channel,
     uint32_t timeout_ms)
 {
-    while (timeout_ms > 0) {
-
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    do {
         if (sc16_rx_available(channel)) {
             return true;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(1));
-        timeout_ms--;
-    }
+        if (esp_timer_get_time() >= deadline_us) {
+            break;
+        }
+        vTaskDelay(1);
+    } while (true);
 
     return false;
 }
@@ -816,9 +819,7 @@ static void sc16_dual_rx_service_task(void *arg)
 
     ESP_LOGI(TAG, "Dual UART RX service started");
 
-    while (s_dual_rx_service_active) {
-        bool moved_data = false;
-
+    while (__atomic_load_n(&s_dual_rx_service_active, __ATOMIC_ACQUIRE)) {
         for (unsigned pass = 0; pass < 2; pass++) {
             unsigned index = (first_channel + pass) & 1U;
             sc16_channel_t channel = (sc16_channel_t)index;
@@ -834,7 +835,6 @@ static void sc16_dual_rx_service_task(void *arg)
                 continue;
             }
 
-            moved_data = moved_data || bytes_read != 0;
             size_t accepted = xStreamBufferSend(
                 s_rx_stream[index], scratch, bytes_read, 0
             );
@@ -848,9 +848,13 @@ static void sc16_dual_rx_service_task(void *arg)
         }
 
         first_channel ^= 1U;
-        if (!moved_data) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
+
+        /*
+         * Block once per service cycle so IDLE1 and lower-priority tasks run
+         * even during continuous input. At 115200 baud each UART receives
+         * about 12 bytes per millisecond, well below the 64-byte FIFO depth.
+         */
+        vTaskDelay(1);
     }
 
     vTaskDelete(NULL);
@@ -861,7 +865,7 @@ esp_err_t sc16_start_dual_rx_service(
     UBaseType_t task_priority,
     BaseType_t core_id)
 {
-    if (s_dual_rx_service_active) {
+    if (__atomic_load_n(&s_dual_rx_service_active, __ATOMIC_ACQUIRE)) {
         return ESP_OK;
     }
     if (s_spi == NULL || buffer_size < 64) {
@@ -880,7 +884,7 @@ esp_err_t sc16_start_dual_rx_service(
         __atomic_store_n(&s_software_rx_drop_count[i], 0, __ATOMIC_RELAXED);
     }
 
-    s_dual_rx_service_active = true;
+    __atomic_store_n(&s_dual_rx_service_active, true, __ATOMIC_RELEASE);
     BaseType_t result = xTaskCreatePinnedToCore(
         sc16_dual_rx_service_task,
         "sc16_dual_rx",
@@ -891,7 +895,7 @@ esp_err_t sc16_start_dual_rx_service(
         core_id
     );
     if (result != pdPASS) {
-        s_dual_rx_service_active = false;
+        __atomic_store_n(&s_dual_rx_service_active, false, __ATOMIC_RELEASE);
         for (unsigned i = 0; i < SC16_CHANNEL_COUNT; i++) {
             vStreamBufferDelete(s_rx_stream[i]);
             s_rx_stream[i] = NULL;
@@ -918,7 +922,7 @@ esp_err_t sc16_rx_level(sc16_channel_t channel, uint8_t *level)
     if (!sc16_channel_valid(channel) || level == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_dual_rx_service_active) {
+    if (!__atomic_load_n(&s_dual_rx_service_active, __ATOMIC_ACQUIRE)) {
         return sc16_rx_level_hardware(channel, level);
     }
 
@@ -939,7 +943,7 @@ esp_err_t sc16_read_fifo(
         bytes_read == NULL || max_length == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_dual_rx_service_active) {
+    if (!__atomic_load_n(&s_dual_rx_service_active, __ATOMIC_ACQUIRE)) {
         return sc16_read_fifo_hardware(
             channel, buffer, max_length, bytes_read
         );

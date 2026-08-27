@@ -255,20 +255,15 @@ void app_main(void)
         }
     }
 
-    /*
-     * The RX service intentionally occupies CPU1 whenever bytes are pending.
-     * Monitoring IDLE1 would generate diagnostic dumps that are themselves
-     * long enough to overflow the SC16 hardware FIFOs. Keep CPU0 idle-task
-     * monitoring enabled so the watchdog still covers the rest of the app.
-     */
+    /* The RX service blocks every cycle, so both idle tasks must remain healthy. */
     const esp_task_wdt_config_t streaming_wdt = {
         .timeout_ms = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U,
-        .idle_core_mask = 1U << 0,
+        .idle_core_mask = (1U << 0) | (1U << 1),
         .trigger_panic = false,
     };
     esp_err_t idle1_wdt = esp_task_wdt_reconfigure(&streaming_wdt);
     if (idle1_wdt == ESP_OK) {
-        ESP_LOGI(TAG, "TWDT reconfigured: monitor IDLE0, exclude IDLE1");
+        ESP_LOGI(TAG, "TWDT reconfigured: monitor IDLE0 and IDLE1");
     } else {
         ESP_LOGW(TAG, "Could not reconfigure TWDT for streaming: %s",
                  esp_err_to_name(idle1_wdt));
