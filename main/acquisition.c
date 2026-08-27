@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -34,6 +35,7 @@ typedef struct {
     h1_spectrum_frame_t frame;
     SemaphoreHandle_t done;
     TaskHandle_t task;
+    bool task_created;
     bool run; /* Accessed across cores through atomic builtins. */
     uint32_t frames_ok, frame_errors, reports_dropped;
     uint32_t min_interval_us, max_interval_us;
@@ -56,6 +58,9 @@ static sensor_context_t s_sensors[SENSOR_COUNT] = {
     {.name = "H1-B", .channel = SC16_CHANNEL_B},
 };
 static QueueHandle_t s_report_queue;
+static TaskHandle_t s_logger_task;
+static SemaphoreHandle_t s_logger_done;
+static bool s_logger_created;
 
 static const char *status_name(uint8_t status)
 {
@@ -145,6 +150,7 @@ static void acquisition_task(void *arg)
     ESP_LOGI(TAG, "%s stopped: ok=%lu errors=%lu dropped=%lu", ctx->name,
              (unsigned long)ctx->frames_ok, (unsigned long)ctx->frame_errors,
              (unsigned long)ctx->reports_dropped);
+    ctx->task = NULL;
     xSemaphoreGive(ctx->done);
     vTaskDelete(NULL);
 }
@@ -156,6 +162,9 @@ static void logger_task(void *arg)
     ESP_LOGI(TAG, "Detailed dual-channel logger started");
     while (true) {
         if (xQueueReceive(s_report_queue, &r, portMAX_DELAY) == pdTRUE) {
+            if (r.name == NULL) {
+                break;
+            }
             printf("%s frame=%4lu t=%10.3fms rx=%7.1fms dt=%7.1fms "
                    "exp=%8luus status=%-6s n=%3u scale=%d max=%5u@%4unm "
                    "hwov=%lu swdrop=%lu q=%u\n",
@@ -168,6 +177,26 @@ static void logger_task(void *arg)
                    (unsigned long)r.software_drops, (unsigned)r.queue_depth);
         }
     }
+
+    s_logger_task = NULL;
+    xSemaphoreGive(s_logger_done);
+    vTaskDelete(NULL);
+}
+
+static void reset_sensor_run_state(sensor_context_t *ctx)
+{
+    memset(&ctx->device, 0, sizeof(ctx->device));
+    memset(&ctx->frame, 0, sizeof(ctx->frame));
+    ctx->done = NULL;
+    ctx->task = NULL;
+    ctx->task_created = false;
+    __atomic_store_n(&ctx->run, false, __ATOMIC_RELEASE);
+    ctx->frames_ok = 0;
+    ctx->frame_errors = 0;
+    ctx->reports_dropped = 0;
+    ctx->min_interval_us = 0;
+    ctx->max_interval_us = 0;
+    ctx->interval_sum_us = 0;
 }
 
 static esp_err_t prepare_sensor(sensor_context_t *ctx)
@@ -223,15 +252,20 @@ static esp_err_t create_tasks(void)
 {
     s_report_queue = xQueueCreate(REPORT_QUEUE_LENGTH, sizeof(frame_report_t));
     if (s_report_queue == NULL) return ESP_ERR_NO_MEM;
+
+    s_logger_done = xSemaphoreCreateBinary();
+    if (s_logger_done == NULL) return ESP_ERR_NO_MEM;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         s_sensors[i].done = xSemaphoreCreateBinary();
         __atomic_store_n(&s_sensors[i].run, true, __ATOMIC_RELEASE);
         if (s_sensors[i].done == NULL) return ESP_ERR_NO_MEM;
     }
     if (xTaskCreatePinnedToCore(logger_task, "h1_dual_log", 4096, NULL,
-                                LOGGER_PRIORITY, NULL, LOGGER_CORE) != pdPASS) {
+                                LOGGER_PRIORITY, &s_logger_task,
+                                LOGGER_CORE) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+    s_logger_created = true;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         const char *name = i == 0 ? "h1_acq_A" : "h1_acq_B";
         if (xTaskCreatePinnedToCore(acquisition_task, name, 6144,
@@ -240,8 +274,65 @@ static esp_err_t create_tasks(void)
                                     ACQUISITION_CORE) != pdPASS) {
             return ESP_ERR_NO_MEM;
         }
+        s_sensors[i].task_created = true;
     }
     return ESP_OK;
+}
+
+static esp_err_t stop_acquisition_tasks(void)
+{
+    for (size_t i = 0; i < SENSOR_COUNT; i++) {
+        __atomic_store_n(&s_sensors[i].run, false, __ATOMIC_RELEASE);
+        if (s_sensors[i].task_created && s_sensors[i].task != NULL) {
+            xTaskNotifyGive(s_sensors[i].task);
+        }
+    }
+
+    esp_err_t result = ESP_OK;
+    for (size_t i = 0; i < SENSOR_COUNT; i++) {
+        if (!s_sensors[i].task_created) continue;
+        if (xSemaphoreTake(s_sensors[i].done,
+                           pdMS_TO_TICKS(6000)) != pdTRUE) {
+            ESP_LOGE(TAG, "%s did not stop within 6 seconds; task retained",
+                     s_sensors[i].name);
+            result = ESP_ERR_TIMEOUT;
+        }
+    }
+    return result;
+}
+
+static esp_err_t stop_logger_task(void)
+{
+    if (!s_logger_created) return ESP_OK;
+
+    const frame_report_t stop_report = {0};
+    if (xQueueSend(s_report_queue, &stop_report,
+                   pdMS_TO_TICKS(1000)) != pdTRUE ||
+        xSemaphoreTake(s_logger_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Logger task did not stop; task retained");
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+static void delete_runtime_objects(void)
+{
+    for (size_t i = 0; i < SENSOR_COUNT; i++) {
+        if (s_sensors[i].done != NULL) {
+            vSemaphoreDelete(s_sensors[i].done);
+            s_sensors[i].done = NULL;
+        }
+        s_sensors[i].task_created = false;
+    }
+    if (s_logger_done != NULL) {
+        vSemaphoreDelete(s_logger_done);
+        s_logger_done = NULL;
+    }
+    if (s_report_queue != NULL) {
+        vQueueDelete(s_report_queue);
+        s_report_queue = NULL;
+    }
+    s_logger_created = false;
 }
 
 static void configure_watchdog(void)
@@ -262,31 +353,40 @@ static void configure_watchdog(void)
 
 esp_err_t acquisition_run_dual(uint32_t duration_ms)
 {
+    bool service_started = false;
+    bool stream_started[SENSOR_COUNT] = {false, false};
+    bool tasks_stopped = false;
+    esp_err_t result = ESP_OK;
+
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
-        esp_err_t ret = prepare_sensor(&s_sensors[i]);
-        if (ret != ESP_OK) {
+        reset_sensor_run_state(&s_sensors[i]);
+        result = prepare_sensor(&s_sensors[i]);
+        if (result != ESP_OK) {
             ESP_LOGE(TAG, "%s preparation failed: %s",
-                     s_sensors[i].name, esp_err_to_name(ret));
-            return ret;
+                     s_sensors[i].name, esp_err_to_name(result));
+            goto cleanup;
         }
     }
 
-    esp_err_t ret = sc16_start_dual_rx_service(
+    result = sc16_start_dual_rx_service(
         RX_STREAM_BUFFER_SIZE, RX_SERVICE_PRIORITY, ACQUISITION_CORE);
-    if (ret != ESP_OK) return ret;
+    if (result != ESP_OK) goto cleanup;
+    service_started = true;
     ESP_LOGI(TAG, "SC16 service active: %u-byte software buffer per UART",
              RX_STREAM_BUFFER_SIZE);
-    ret = create_tasks();
-    if (ret != ESP_OK) return ret;
+    result = create_tasks();
+    if (result != ESP_OK) goto cleanup;
     configure_watchdog();
 
     sc16_reset_rx_overrun_count();
     int64_t start_a_us = esp_timer_get_time();
-    ret = h1_start_stream(&s_sensors[0].device);
-    if (ret != ESP_OK) return ret;
+    result = h1_start_stream(&s_sensors[0].device);
+    if (result != ESP_OK) goto cleanup;
+    stream_started[0] = true;
     int64_t start_b_us = esp_timer_get_time();
-    ret = h1_start_stream(&s_sensors[1].device);
-    if (ret != ESP_OK) return ret;
+    result = h1_start_stream(&s_sensors[1].device);
+    if (result != ESP_OK) goto cleanup;
+    stream_started[1] = true;
     ESP_LOGI(TAG, "Streams commanded A=%lldus B=%lldus separation=%.3fms",
              (long long)start_a_us, (long long)start_b_us,
              (start_b_us - start_a_us) / 1000.0);
@@ -299,18 +399,9 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     vTaskDelay(pdMS_TO_TICKS(duration_ms));
 
     ESP_LOGI(TAG, "Requesting both acquisition tasks to stop");
-    for (size_t i = 0; i < SENSOR_COUNT; i++) {
-        __atomic_store_n(&s_sensors[i].run, false, __ATOMIC_RELEASE);
-    }
-    for (size_t i = 0; i < SENSOR_COUNT; i++) {
-        if (xSemaphoreTake(s_sensors[i].done, pdMS_TO_TICKS(6000)) != pdTRUE) {
-            ESP_LOGE(TAG, "%s did not stop within 6 seconds", s_sensors[i].name);
-            if (s_sensors[i].task != NULL) {
-                vTaskDelete(s_sensors[i].task);
-                s_sensors[i].task = NULL;
-            }
-        }
-    }
+    result = stop_acquisition_tasks();
+    if (result != ESP_OK) goto cleanup;
+    tasks_stopped = true;
 
     uint32_t acquisition_overruns[SENSOR_COUNT], shutdown_overruns[SENSOR_COUNT];
     uint32_t acquisition_drops[SENSOR_COUNT], shutdown_drops[SENSOR_COUNT];
@@ -324,7 +415,9 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
         if (stop_ret != ESP_OK) {
             ESP_LOGE(TAG, "%s stop failed: %s", s_sensors[i].name,
                      esp_err_to_name(stop_ret));
+            if (result == ESP_OK) result = stop_ret;
         }
+        stream_started[i] = false;
     }
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         uint32_t total = sc16_get_channel_rx_overrun_count(s_sensors[i].channel);
@@ -348,5 +441,42 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     printf("Free heap after test        : %lu bytes\n",
            (unsigned long)esp_get_free_heap_size());
     printf("============================================================\n");
-    return ESP_OK;
+
+cleanup:
+    if (!tasks_stopped) {
+        esp_err_t stop_ret = stop_acquisition_tasks();
+        if (stop_ret == ESP_OK) {
+            tasks_stopped = true;
+        } else if (result == ESP_OK) {
+            result = stop_ret;
+        }
+    }
+
+    if (tasks_stopped) {
+        for (size_t i = 0; i < SENSOR_COUNT; i++) {
+            if (!stream_started[i]) continue;
+            ESP_LOGI(TAG, "Rollback: stopping %s stream", s_sensors[i].name);
+            esp_err_t stop_ret = h1_stop_stream(&s_sensors[i].device);
+            if (stop_ret != ESP_OK) {
+                ESP_LOGE(TAG, "%s rollback stop failed: %s",
+                         s_sensors[i].name, esp_err_to_name(stop_ret));
+                if (result == ESP_OK) result = stop_ret;
+            }
+            stream_started[i] = false;
+        }
+
+        esp_err_t logger_ret = stop_logger_task();
+        if (logger_ret != ESP_OK && result == ESP_OK) result = logger_ret;
+        if (logger_ret == ESP_OK) delete_runtime_objects();
+    }
+
+    if (service_started && tasks_stopped) {
+        esp_err_t service_ret = sc16_stop_dual_rx_service(1000);
+        if (service_ret != ESP_OK) {
+            ESP_LOGE(TAG, "RX service stop failed: %s",
+                     esp_err_to_name(service_ret));
+            if (result == ESP_OK) result = service_ret;
+        }
+    }
+    return result;
 }

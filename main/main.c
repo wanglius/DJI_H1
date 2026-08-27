@@ -5,6 +5,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 
 #include "acquisition.h"
 #include "sc16is752.h"

@@ -39,6 +39,8 @@ static sc16_config_t s_config;
 static StreamBufferHandle_t s_rx_stream[2] = {NULL, NULL};
 static uint32_t s_software_rx_drop_count[2] = {0, 0};
 static bool s_dual_rx_service_active = false;
+static TaskHandle_t s_dual_rx_service_task_handle = NULL;
+static SemaphoreHandle_t s_dual_rx_service_done = NULL;
 
 static esp_err_t sc16_rx_level_hardware(sc16_channel_t channel, uint8_t *level);
 static esp_err_t sc16_read_fifo_hardware(
@@ -857,6 +859,8 @@ static void sc16_dual_rx_service_task(void *arg)
         vTaskDelay(1);
     }
 
+    s_dual_rx_service_task_handle = NULL;
+    xSemaphoreGive(s_dual_rx_service_done);
     vTaskDelete(NULL);
 }
 
@@ -868,8 +872,16 @@ esp_err_t sc16_start_dual_rx_service(
     if (__atomic_load_n(&s_dual_rx_service_active, __ATOMIC_ACQUIRE)) {
         return ESP_OK;
     }
+    if (s_dual_rx_service_done != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (s_spi == NULL || buffer_size < 64) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    s_dual_rx_service_done = xSemaphoreCreateBinary();
+    if (s_dual_rx_service_done == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
     for (unsigned i = 0; i < 2; i++) {
@@ -879,6 +891,8 @@ esp_err_t sc16_start_dual_rx_service(
                 vStreamBufferDelete(s_rx_stream[j]);
                 s_rx_stream[j] = NULL;
             }
+            vSemaphoreDelete(s_dual_rx_service_done);
+            s_dual_rx_service_done = NULL;
             return ESP_ERR_NO_MEM;
         }
         __atomic_store_n(&s_software_rx_drop_count[i], 0, __ATOMIC_RELAXED);
@@ -891,7 +905,7 @@ esp_err_t sc16_start_dual_rx_service(
         4096,
         NULL,
         task_priority,
-        NULL,
+        &s_dual_rx_service_task_handle,
         core_id
     );
     if (result != pdPASS) {
@@ -900,9 +914,32 @@ esp_err_t sc16_start_dual_rx_service(
             vStreamBufferDelete(s_rx_stream[i]);
             s_rx_stream[i] = NULL;
         }
+        vSemaphoreDelete(s_dual_rx_service_done);
+        s_dual_rx_service_done = NULL;
         return ESP_ERR_NO_MEM;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t sc16_stop_dual_rx_service(uint32_t timeout_ms)
+{
+    if (s_dual_rx_service_done == NULL) {
+        return ESP_OK;
+    }
+
+    __atomic_store_n(&s_dual_rx_service_active, false, __ATOMIC_RELEASE);
+    if (xSemaphoreTake(s_dual_rx_service_done,
+                       pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    for (unsigned i = 0; i < SC16_CHANNEL_COUNT; i++) {
+        vStreamBufferDelete(s_rx_stream[i]);
+        s_rx_stream[i] = NULL;
+    }
+    vSemaphoreDelete(s_dual_rx_service_done);
+    s_dual_rx_service_done = NULL;
     return ESP_OK;
 }
 

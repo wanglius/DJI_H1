@@ -88,6 +88,13 @@ esp_err_t sc16_start_dual_rx_service(
 );
 
 /**
+ * Stop the dual RX service and release its software stream buffers.
+ *
+ * The service exits cooperatively after its current FIFO-service cycle.
+ */
+esp_err_t sc16_stop_dual_rx_service(uint32_t timeout_ms);
+
+/**
  * Get the cumulative number of bytes dropped because one software RX buffer
  * was full. Callers can snapshot this value to distinguish acquisition drops
  * from bytes deliberately discarded during shutdown.
