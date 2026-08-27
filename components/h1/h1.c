@@ -115,13 +115,23 @@ static void h1_clear_rx(
         }
 
 
+        /*
+         * With the dual RX service active, level describes bytes in the
+         * software stream buffer and can be greater than this local array.
+         * Drain it in bounded chunks to avoid overwriting the task stack.
+         */
+        size_t read_size =
+            level < sizeof(temp)
+            ? level
+            : sizeof(temp);
+
         size_t got = 0;
 
 
         if (sc16_read_fifo(
                 dev->channel,
                 temp,
-                level,
+                read_size,
                 &got) != ESP_OK) {
 
             break;
@@ -185,6 +195,37 @@ static esp_err_t h1_receive_packet(
 
 
         size_t read_size;
+
+        /*
+         * A UART overrun can remove any byte in the stream. Search for the
+         * response signature byte-by-byte so the next intact frame can be
+         * recovered instead of interpreting spectrum data as a new length.
+         */
+        if (count < 2) {
+            uint8_t byte = 0;
+            size_t got = 0;
+            ret = sc16_read_fifo(dev->channel, &byte, 1, &got);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            if (got == 0) {
+                continue;
+            }
+
+            if (count == 0) {
+                if (byte == H1_RESP_HEADER_0) {
+                    buffer[count++] = byte;
+                }
+            } else if (byte == H1_RESP_HEADER_1) {
+                buffer[count++] = byte;
+            } else if (byte == H1_RESP_HEADER_0) {
+                buffer[0] = byte;
+                count = 1;
+            } else {
+                count = 0;
+            }
+            continue;
+        }
 
 
         /*
@@ -252,14 +293,13 @@ static esp_err_t h1_receive_packet(
 
             if (expected_length < 9 ||
                 expected_length > buffer_size) {
-
-                ESP_LOGE(
-                    TAG,
-                    "Invalid H1 packet length: %u",
-                    (unsigned)expected_length
-                );
-
-                return ESP_ERR_INVALID_SIZE;
+                /* Keep a possible first header byte and continue scanning. */
+                count = buffer[4] == H1_RESP_HEADER_0 ? 1 : 0;
+                if (count == 1) {
+                    buffer[0] = H1_RESP_HEADER_0;
+                }
+                expected_length = 0;
+                continue;
             }
         }
 

@@ -6,6 +6,7 @@
 
 #include "esp_err.h"
 #include "driver/spi_master.h"
+#include "freertos/FreeRTOS.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,15 +64,35 @@ bool sc16_rx_available(sc16_channel_t channel);
  */
 bool sc16_tx_ready(sc16_channel_t channel);
 
-/*
- *diagnose the fifo overrun
- */
+/** Get the combined hardware RX FIFO overrun count. */
 uint32_t sc16_get_rx_overrun_count(void);
 
-/**
- * reset the overrun counter
- */
+/** Get the RX overrun count for one UART channel. */
+uint32_t sc16_get_channel_rx_overrun_count(sc16_channel_t channel);
+
+/** Reset both hardware RX FIFO overrun counters. */
 void sc16_reset_rx_overrun_count(void);
+
+/** Reset the RX overrun count for one UART channel. */
+void sc16_reset_channel_rx_overrun_count(sc16_channel_t channel);
+
+/**
+ * Start one high-priority task that drains both hardware UART FIFOs into
+ * independent ESP32 software stream buffers. Once active, sc16_rx_level()
+ * and sc16_read_fifo() consume those software buffers.
+ */
+esp_err_t sc16_start_dual_rx_service(
+    size_t buffer_size,
+    UBaseType_t task_priority,
+    BaseType_t core_id
+);
+
+/**
+ * Get the cumulative number of bytes dropped because one software RX buffer
+ * was full. Callers can snapshot this value to distinguish acquisition drops
+ * from bytes deliberately discarded during shutdown.
+ */
+uint32_t sc16_get_software_rx_drop_count(sc16_channel_t channel);
 
 /**
  * Write one byte.
@@ -144,10 +165,13 @@ esp_err_t sc16_rx_level(
 
 
 /**
- * Read multiple bytes directly from the UART RX FIFO.
+ * Read multiple bytes from the active RX source. Before the dual RX service
+ * starts this is the hardware FIFO; afterwards it is the channel's software
+ * stream buffer.
  *
  * Reads up to max_length bytes in one SPI transaction.
- * max_length must be <= 64.
+ * Direct hardware reads require max_length <= 64. Software-buffer reads may
+ * be larger, but callers should still size the destination accordingly.
  *
  * Returns number of bytes read through bytes_read.
  */

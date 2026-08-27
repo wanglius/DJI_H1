@@ -1,1 +1,13 @@
-/build/
+# ESP-IDF/CMake generated build trees. The suffix form covers temporary
+# diagnostic directories such as build-codex and build-uart-b.
+/build*/
+
+# ESP-IDF configuration backups and generated root-level tooling files.
+/sdkconfig.old
+/compile_commands.json
+
+# Local logs and editor/OS debris.
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

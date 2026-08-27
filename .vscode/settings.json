@@ -12,6 +12,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\ESP32\\DJI_H1\\build"
   ],
-  "idf.portWin": "COM14",
+  "idf.portWin": "COM5",
   "idf.flashType": "UART"
 }

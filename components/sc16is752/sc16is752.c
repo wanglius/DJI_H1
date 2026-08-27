@@ -3,6 +3,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -12,10 +14,53 @@
 
 static const char *TAG = "SC16IS752";
 
-static volatile uint32_t s_rx_overrun_count = 0;
+#define SC16_CHANNEL_COUNT 2U
+
+static uint32_t s_rx_overrun_count[2] = {0, 0};
+
+static bool sc16_channel_valid(sc16_channel_t channel)
+{
+    return channel == SC16_CHANNEL_A || channel == SC16_CHANNEL_B;
+}
+
+static void sc16_record_rx_overrun(sc16_channel_t channel)
+{
+    __atomic_fetch_add(
+        &s_rx_overrun_count[(unsigned)channel],
+        1,
+        __ATOMIC_RELAXED
+    );
+}
 
 static spi_device_handle_t s_spi = NULL;
+static SemaphoreHandle_t s_spi_mutex = NULL;
 static sc16_config_t s_config;
+static StreamBufferHandle_t s_rx_stream[2] = {NULL, NULL};
+static uint32_t s_software_rx_drop_count[2] = {0, 0};
+static volatile bool s_dual_rx_service_active = false;
+
+static esp_err_t sc16_rx_level_hardware(sc16_channel_t channel, uint8_t *level);
+static esp_err_t sc16_read_fifo_hardware(
+    sc16_channel_t channel,
+    uint8_t *buffer,
+    size_t max_length,
+    size_t *bytes_read
+);
+
+static esp_err_t sc16_spi_transmit(spi_transaction_t *transaction)
+{
+    if (s_spi == NULL || s_spi_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = spi_device_transmit(s_spi, transaction);
+    xSemaphoreGive(s_spi_mutex);
+    return ret;
+}
 
 
 // ============================================================
@@ -103,7 +148,7 @@ static esp_err_t sc16_write_reg(
         .tx_buffer = tx,
     };
 
-    return spi_device_transmit(s_spi, &t);
+    return sc16_spi_transmit(&t);
 }
 
 
@@ -133,7 +178,7 @@ static esp_err_t sc16_read_reg(
         .rx_buffer = rx,
     };
 
-    esp_err_t ret = spi_device_transmit(s_spi, &t);
+    esp_err_t ret = sc16_spi_transmit(&t);
 
     if (ret == ESP_OK) {
         *value = rx[1];
@@ -226,6 +271,12 @@ esp_err_t sc16_init(const sc16_config_t *config)
                  "spi_bus_add_device failed: %s",
                  esp_err_to_name(ret));
         return ret;
+    }
+
+    s_spi_mutex = xSemaphoreCreateMutex();
+    if (s_spi_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create SPI transaction mutex");
+        return ESP_ERR_NO_MEM;
     }
 
     ESP_LOGI(TAG,
@@ -410,7 +461,7 @@ bool sc16_rx_available(sc16_channel_t channel)
     }
 
     if (lsr & LSR_OE) {
-        s_rx_overrun_count++;
+        sc16_record_rx_overrun(channel);
     }
 
     return (lsr & LSR_DR) != 0;
@@ -573,7 +624,7 @@ size_t sc16_read(
 /*
  *pull the fifo all at once
  */
-esp_err_t sc16_rx_level(
+static esp_err_t sc16_rx_level_hardware(
     sc16_channel_t channel,
     uint8_t *level)
 {
@@ -594,7 +645,20 @@ esp_err_t sc16_rx_level(
  */
 uint32_t sc16_get_rx_overrun_count(void)
 {
-    return s_rx_overrun_count;
+    return sc16_get_channel_rx_overrun_count(SC16_CHANNEL_A) +
+           sc16_get_channel_rx_overrun_count(SC16_CHANNEL_B);
+}
+
+uint32_t sc16_get_channel_rx_overrun_count(sc16_channel_t channel)
+{
+    if (channel != SC16_CHANNEL_A && channel != SC16_CHANNEL_B) {
+        return 0;
+    }
+
+    return __atomic_load_n(
+        &s_rx_overrun_count[(unsigned)channel],
+        __ATOMIC_RELAXED
+    );
 }
 
 /**
@@ -602,13 +666,27 @@ uint32_t sc16_get_rx_overrun_count(void)
  */
 void sc16_reset_rx_overrun_count(void)
 {
-    s_rx_overrun_count = 0;
+    sc16_reset_channel_rx_overrun_count(SC16_CHANNEL_A);
+    sc16_reset_channel_rx_overrun_count(SC16_CHANNEL_B);
+}
+
+void sc16_reset_channel_rx_overrun_count(sc16_channel_t channel)
+{
+    if (channel != SC16_CHANNEL_A && channel != SC16_CHANNEL_B) {
+        return;
+    }
+
+    __atomic_store_n(
+        &s_rx_overrun_count[(unsigned)channel],
+        0,
+        __ATOMIC_RELAXED
+    );
 }
 
 /*
  * very fast FIFO burst read
  */
-esp_err_t sc16_read_fifo(
+static esp_err_t sc16_read_fifo_hardware(
     sc16_channel_t channel,
     uint8_t *buffer,
     size_t max_length,
@@ -648,7 +726,7 @@ esp_err_t sc16_read_fifo(
     }
 
     if (lsr & LSR_OE) {
-        s_rx_overrun_count++;
+        sc16_record_rx_overrun(channel);
     }
 
     if (lsr & (LSR_PE | LSR_FE | LSR_BI | LSR_FIFO_ERR)) {
@@ -704,10 +782,7 @@ esp_err_t sc16_read_fifo(
 
 
     ret =
-        spi_device_transmit(
-            s_spi,
-            &t
-        );
+        sc16_spi_transmit(&t);
 
 
     if (ret != ESP_OK) {
@@ -730,6 +805,149 @@ esp_err_t sc16_read_fifo(
         max_length;
 
 
+    return ESP_OK;
+}
+
+static void sc16_dual_rx_service_task(void *arg)
+{
+    (void)arg;
+    uint8_t scratch[64];
+    unsigned first_channel = 0;
+
+    ESP_LOGI(TAG, "Dual UART RX service started");
+
+    while (s_dual_rx_service_active) {
+        bool moved_data = false;
+
+        for (unsigned pass = 0; pass < 2; pass++) {
+            unsigned index = (first_channel + pass) & 1U;
+            sc16_channel_t channel = (sc16_channel_t)index;
+            uint8_t level = 0;
+
+            if (sc16_rx_level_hardware(channel, &level) != ESP_OK || level == 0) {
+                continue;
+            }
+
+            size_t bytes_read = 0;
+            if (sc16_read_fifo_hardware(channel, scratch, level,
+                                        &bytes_read) != ESP_OK) {
+                continue;
+            }
+
+            moved_data = moved_data || bytes_read != 0;
+            size_t accepted = xStreamBufferSend(
+                s_rx_stream[index], scratch, bytes_read, 0
+            );
+            if (accepted < bytes_read) {
+                __atomic_fetch_add(
+                    &s_software_rx_drop_count[index],
+                    (uint32_t)(bytes_read - accepted),
+                    __ATOMIC_RELAXED
+                );
+            }
+        }
+
+        first_channel ^= 1U;
+        if (!moved_data) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+esp_err_t sc16_start_dual_rx_service(
+    size_t buffer_size,
+    UBaseType_t task_priority,
+    BaseType_t core_id)
+{
+    if (s_dual_rx_service_active) {
+        return ESP_OK;
+    }
+    if (s_spi == NULL || buffer_size < 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (unsigned i = 0; i < 2; i++) {
+        s_rx_stream[i] = xStreamBufferCreate(buffer_size, 1);
+        if (s_rx_stream[i] == NULL) {
+            for (unsigned j = 0; j < i; j++) {
+                vStreamBufferDelete(s_rx_stream[j]);
+                s_rx_stream[j] = NULL;
+            }
+            return ESP_ERR_NO_MEM;
+        }
+        __atomic_store_n(&s_software_rx_drop_count[i], 0, __ATOMIC_RELAXED);
+    }
+
+    s_dual_rx_service_active = true;
+    BaseType_t result = xTaskCreatePinnedToCore(
+        sc16_dual_rx_service_task,
+        "sc16_dual_rx",
+        4096,
+        NULL,
+        task_priority,
+        NULL,
+        core_id
+    );
+    if (result != pdPASS) {
+        s_dual_rx_service_active = false;
+        for (unsigned i = 0; i < SC16_CHANNEL_COUNT; i++) {
+            vStreamBufferDelete(s_rx_stream[i]);
+            s_rx_stream[i] = NULL;
+        }
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+uint32_t sc16_get_software_rx_drop_count(sc16_channel_t channel)
+{
+    if (channel != SC16_CHANNEL_A && channel != SC16_CHANNEL_B) {
+        return 0;
+    }
+    return __atomic_load_n(
+        &s_software_rx_drop_count[(unsigned)channel],
+        __ATOMIC_RELAXED
+    );
+}
+
+esp_err_t sc16_rx_level(sc16_channel_t channel, uint8_t *level)
+{
+    if (!sc16_channel_valid(channel) || level == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_dual_rx_service_active) {
+        return sc16_rx_level_hardware(channel, level);
+    }
+
+    size_t available = xStreamBufferBytesAvailable(
+        s_rx_stream[(unsigned)channel]
+    );
+    *level = available > UINT8_MAX ? UINT8_MAX : (uint8_t)available;
+    return ESP_OK;
+}
+
+esp_err_t sc16_read_fifo(
+    sc16_channel_t channel,
+    uint8_t *buffer,
+    size_t max_length,
+    size_t *bytes_read)
+{
+    if (!sc16_channel_valid(channel) || buffer == NULL ||
+        bytes_read == NULL || max_length == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_dual_rx_service_active) {
+        return sc16_read_fifo_hardware(
+            channel, buffer, max_length, bytes_read
+        );
+    }
+
+    *bytes_read = xStreamBufferReceive(
+        s_rx_stream[(unsigned)channel], buffer, max_length, 0
+    );
     return ESP_OK;
 }
 
