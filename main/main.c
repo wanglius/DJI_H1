@@ -86,7 +86,8 @@ static void acquisition_task(void *arg)
                          esp_err_to_name(ret),
                          (unsigned long)sc16_get_channel_rx_overrun_count(ctx->channel));
             }
-            taskYIELD();
+            /* Avoid a high-priority retry spin if a channel keeps failing. */
+            vTaskDelay(1);
             continue;
         }
 

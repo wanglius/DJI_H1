@@ -36,6 +36,9 @@ static const char *TAG = "H1";
 #define H1_CMD_START_STREAM          0x33
 #define H1_CMD_STOP_STREAM           0x04
 
+#define H1_RX_CLEAR_MAX_US           100000
+#define H1_RX_CLEAR_MAX_BYTES        32768U
+
 // ============================================================
 // Internal forward declarations
 // ============================================================
@@ -95,9 +98,11 @@ static void h1_clear_rx(
     h1_device_t *dev)
 {
     uint8_t temp[64];
+    size_t total_drained = 0;
+    int64_t deadline_us = esp_timer_get_time() + H1_RX_CLEAR_MAX_US;
 
-
-    while (1) {
+    while (esp_timer_get_time() < deadline_us &&
+           total_drained < H1_RX_CLEAR_MAX_BYTES) {
 
         uint8_t level = 0;
 
@@ -136,6 +141,18 @@ static void h1_clear_rx(
 
             break;
         }
+
+        total_drained += got;
+        if (got == 0) {
+            vTaskDelay(1);
+        }
+    }
+
+    if (esp_timer_get_time() >= deadline_us ||
+        total_drained >= H1_RX_CLEAR_MAX_BYTES) {
+        ESP_LOGW(TAG, "RX purge bounded after %u bytes on UART-%c",
+                 (unsigned)total_drained,
+                 dev->channel == SC16_CHANNEL_A ? 'A' : 'B');
     }
 }
 
@@ -189,7 +206,14 @@ static esp_err_t h1_receive_packet(
         }
 
         if (level == 0) {
-            taskYIELD();
+            /*
+             * Block instead of merely yielding. The acquisition tasks run
+             * above IDLE1, so taskYIELD() can still starve the watched idle
+             * task while the RX service is waiting for the next UART bytes.
+             * With a 1 kHz tick and per-channel software buffering, this
+             * bounds the wait to 1 ms without risking the SC16 FIFO.
+             */
+            vTaskDelay(1);
             continue;
         }
 
