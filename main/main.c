@@ -3,37 +3,39 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_system.h"
 
-#include "acquisition.h"
-#include "sc16is752.h"
+#include "data_pipeline_test.h"
+#include "drone_data.h"
+#include "coexistence_test.h"
 
-static const char *TAG = "DJI_H1_DUAL";
+static const char *TAG = "DJI_H1_COEXIST";
+
 #define TEST_DURATION_MS 30000
 
 void app_main(void)
 {
     printf("\n============================================================\n");
-    printf(" DJI_H1 - DUAL UART 30-SECOND DIAGNOSTIC STREAMING TEST\n");
+    printf(" DJI_H1 - DUAL SPECTROMETER + SD COEXISTENCE TEST\n");
     printf("============================================================\n");
-    ESP_LOGI(TAG, "Free heap at boot: %lu bytes",
-             (unsigned long)esp_get_free_heap_size());
 
-    const sc16_config_t config = {
-        .spi_host = SPI2_HOST,
-        .pin_mosi = 2, .pin_miso = 3, .pin_sclk = 5,
-        .pin_cs = 1, .pin_reset = 6,
-        /* Two simultaneous 115200-baud UARTs share this SPI bus. */
-        .spi_clock_hz = 4000000, .crystal_hz = 1843200,
-    };
-    ESP_ERROR_CHECK(sc16_init(&config));
+    ESP_ERROR_CHECK(data_pipeline_self_test());
+    ESP_ERROR_CHECK(drone_data_init_fake());
+    gps_record_t gps;
+    ESP_ERROR_CHECK(drone_data_get_latest(&gps));
+    ESP_LOGI(TAG, "Fake GPS: lat=%.7f lon=%.7f alt=%.3fm utc=%lu.%03u",
+             gps.data.latitude_e7 / 10000000.0,
+             gps.data.longitude_e7 / 10000000.0,
+             gps.data.altitude_relative_mm / 1000.0,
+             (unsigned long)gps.data.utc_seconds,
+             (unsigned)gps.data.utc_milliseconds);
 
-    esp_err_t ret = acquisition_run_dual(TEST_DURATION_MS);
+    esp_err_t ret = coexistence_test_run(TEST_DURATION_MS);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Dual acquisition failed: %s", esp_err_to_name(ret));
-        return;
+        ESP_LOGE(TAG, "Coexistence test failed: %s",
+                 esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "SPECTROMETER + SD COEXISTENCE TEST PASSED");
     }
 
     while (true) {

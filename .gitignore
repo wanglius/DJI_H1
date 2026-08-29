@@ -9,5 +9,7 @@
 # Local logs and editor/OS debris.
 *.log
 *.tmp
+*.bak
+.cache/
 .DS_Store
 Thumbs.db
