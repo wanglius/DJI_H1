@@ -102,6 +102,14 @@ esp_err_t coexistence_test_run(uint32_t duration_ms)
     result = sc16_init(&sc16_config);
     if (result != ESP_OK) goto cleanup;
 
+    /*
+     * Flashing resets the ESP32 and SC16IS752 while the H1 spectrometers may
+     * remain powered. Leave both UARTs idle before sending the first command
+     * to isolate reset-domain settling from protocol recovery behavior.
+     */
+    ESP_LOGI(TAG, "Waiting 500 ms for UART/H1 settling after SC16 reset");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     writer.result = ESP_OK;
     writer.done = xSemaphoreCreateBinary();
     if (writer.done == NULL) {
