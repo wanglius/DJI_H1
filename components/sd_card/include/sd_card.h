@@ -35,7 +35,7 @@ typedef struct {
     .pin_miso = 13,                                \
     .max_frequency_khz = 10000,                    \
     .max_transfer_size = 4096,                     \
-    .max_open_files = 4,                           \
+    .max_open_files = 8,                           \
     .mount_point = "/sdcard",                     \
 }
 
@@ -45,9 +45,20 @@ bool sd_card_is_mounted(void);
 esp_err_t sd_card_print_info(FILE *stream);
 
 /**
+ * Create one directory relative to the mount point.
+ * Returns ESP_OK if the directory already exists. Parent directories must
+ * already exist; call this function once for each level of a nested path.
+ */
+esp_err_t sd_card_mkdir(const char *path);
+
+/**
  * Open a path relative to the mount point using an fopen-style mode.
  * Paths must use forward slashes and may not contain empty, ".", or ".."
  * components. The caller must not use a handle concurrently with close().
+ *
+ * CONFIG_FATFS_FS_LOCK is deliberately zero. All filesystem access while the
+ * card is mounted must therefore use this component so s_lock serializes it;
+ * direct stdio/POSIX access from another task violates that invariant.
  */
 esp_err_t sd_card_file_open(const char *path,
                             const char *mode,

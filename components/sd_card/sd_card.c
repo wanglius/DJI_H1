@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
@@ -207,6 +208,32 @@ esp_err_t sd_card_print_info(FILE *stream)
     sdmmc_card_print_info(stream, s_card);
     unlock_card();
     return ESP_OK;
+}
+
+esp_err_t sd_card_mkdir(const char *path)
+{
+    esp_err_t result = lock_card();
+    if (result != ESP_OK) return result;
+    if (!s_mounted) {
+        unlock_card();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char full_path[SD_CARD_PATH_CAPACITY];
+    result = make_full_path(path, full_path);
+    if (result == ESP_OK && mkdir(full_path, 0775) != 0) {
+        if (errno == EEXIST) {
+            struct stat info;
+            result = stat(full_path, &info) == 0 && S_ISDIR(info.st_mode)
+                ? ESP_OK : ESP_FAIL;
+        } else {
+            ESP_LOGE(TAG, "Could not create %s: errno=%d (%s)",
+                     full_path, errno, strerror(errno));
+            result = ESP_FAIL;
+        }
+    }
+    unlock_card();
+    return result;
 }
 
 esp_err_t sd_card_file_open(const char *path,

@@ -91,6 +91,9 @@ esp_err_t sc16_start_dual_rx_service(
  * Stop the dual RX service and release its software stream buffers.
  *
  * The service exits cooperatively after its current FIFO-service cycle.
+ * All tasks that can call sc16_read_byte(), sc16_read_fifo(), or
+ * sc16_rx_level() must be stopped before this function is called; their
+ * backing stream buffers are destroyed during a successful stop.
  */
 esp_err_t sc16_stop_dual_rx_service(uint32_t timeout_ms);
 
