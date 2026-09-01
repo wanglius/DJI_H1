@@ -6,6 +6,8 @@
 #include "esp_log.h"
 
 #include "data_pipeline_test.h"
+#include "ab_protocol_test.h"
+#include "ab_link_test.h"
 #include "drone_data.h"
 #include "coexistence_test.h"
 
@@ -20,6 +22,8 @@ void app_main(void)
     printf("============================================================\n");
 
     ESP_ERROR_CHECK(data_pipeline_self_test());
+    ESP_ERROR_CHECK(ab_protocol_self_test());
+    ESP_ERROR_CHECK(ab_link_test_start());
     ESP_ERROR_CHECK(drone_data_init_fake());
     gps_record_t gps;
     ESP_ERROR_CHECK(drone_data_get_latest(&gps));

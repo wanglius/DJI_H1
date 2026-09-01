@@ -9,6 +9,10 @@ milestone firmware selects them explicitly from `main/CMakeLists.txt`.
 - `sd_card_test.c` overwrites `H1TEST.TXT`, then reads it back.
 - `data_pipeline_test.c` validates the documented 30-byte drone payload decoder
   and common in-memory record metadata.
+- `ab_protocol_test.c` validates A-B CRC, complete-frame encoding, incremental
+  parsing, timeout recovery, CRC rejection, and status-payload round trips.
+- `ab_link_test.c` is a simulated B-board endpoint on GPIO17/GPIO18 for the
+  PC-side A-board emulator. Its mission state and storage percentage are fake.
 - `h1_single_frame_test.c` is the original standalone `app_main` retained for
   regression diagnosis; it is not part of the normal build.
 
