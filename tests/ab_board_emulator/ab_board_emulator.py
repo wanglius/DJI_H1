@@ -54,6 +54,8 @@ class Parser:
     def feed(self, data: bytes, now: float) -> list[Frame]:
         frames: list[Frame] = []
         if self.buffer and self.last_byte_at is not None and now - self.last_byte_at > INTERBYTE_TIMEOUT_S:
+            # Discard only the stale partial frame; incoming data below is
+            # scanned afresh for AA 55, including a trailing split AA byte.
             self.buffer.clear()
         if data:
             self.buffer.extend(data)
@@ -107,9 +109,9 @@ def realtime_payload(started_at: float) -> bytes:
     )
 
 
-def describe_status(payload: bytes) -> str:
+def describe_status(payload: bytes) -> tuple[str, bool]:
     if len(payload) != 14:
-        return f"invalid status length={len(payload)}"
+        return f"invalid status length={len(payload)}", False
     state, capture, error, free, frames, session, safe, reserved = struct.unpack("<BBBBIIBB", payload)
     problems = []
     if state > 2:
@@ -118,7 +120,7 @@ def describe_status(payload: bytes) -> str:
         problems.append("bad-field")
     suffix = f" WARNING={','.join(problems)}" if problems else ""
     return (f"state={state} capture={capture} error={error} free={free}% "
-            f"frames={frames} session={session} safe={safe}{suffix}")
+            f"frames={frames} session={session} safe={safe}{suffix}"), not problems
 
 
 @dataclass
@@ -143,8 +145,23 @@ class Emulator:
         self.next_realtime = self.started_at
         self.handshake_sequence = self.next_sequence()
         self.last_heartbeat: float | None = None
+        self.last_heartbeat_sequence: int | None = None
+        self.heartbeat_count = 0
+        self.failures: list[str] = []
+        self.acked_commands: set[int] = set()
+        self.expected_phase = "idle"
+        # These flags prove each phase was observed at least once, not that
+        # every later report remained consistent. TODO: reject regressions
+        # after confirmation and validate nonzero B-board error reports.
+        self.observed_capture = False
+        self.observed_stopped = False
+        self.observed_safe = False
+        self.last_capture_frame_count: int | None = None
+        self.heartbeat_timeout_reported = False
+        self.ignored_ack_commands: set[int] = set()
         self.pending: PendingCommand | None = None
         self.start_sent = False
+        self.repeat_start_sent = False
         self.stop_sent = False
         self.power_sent = False
         self.bad_crc_sent = False
@@ -154,6 +171,10 @@ class Emulator:
         value = self.sequence
         self.sequence = (self.sequence + 1) & 0xFF
         return value
+
+    def fail(self, message: str) -> None:
+        self.failures.append(message)
+        print(f"{stamp()}  ERROR {message}")
 
     def transmit(self, command: int, sequence: int, payload: bytes, label: str,
                  corrupt_crc: bool = False) -> None:
@@ -170,6 +191,8 @@ class Emulator:
         self.retry_pending(label)
 
     def retry_pending(self, label: str = "command") -> None:
+        # Reuse both SEQ and payload; allocating a new SEQ would not test
+        # frame-level duplicate handling at the B endpoint.
         assert self.pending is not None
         self.pending.attempts += 1
         self.pending.sent_at = time.monotonic()
@@ -179,7 +202,7 @@ class Emulator:
     def handle_frame(self, frame: Frame, now: float) -> None:
         if frame.command == CMD_HANDSHAKE_RESPONSE:
             if len(frame.payload) != 5:
-                print(f"{stamp()}  RX invalid handshake response length={len(frame.payload)}")
+                self.fail(f"invalid handshake response length={len(frame.payload)}")
                 return
             version, ready, firmware, request_sequence = struct.unpack("<BBHB", frame.payload)
             print(f"{stamp()}  RX handshake-ack seq={frame.sequence} version={version} "
@@ -187,7 +210,7 @@ class Emulator:
             sequence_ok = (frame.sequence == self.handshake_sequence and
                            request_sequence == self.handshake_sequence)
             if not sequence_ok:
-                print(f"{stamp()}  ERROR handshake response did not echo seq={self.handshake_sequence}")
+                self.fail(f"handshake response did not echo seq={self.handshake_sequence}")
             newly_linked = version == 1 and ready == 1 and sequence_ok
             if newly_linked and not self.linked:
                 self.linked_at = now
@@ -195,29 +218,72 @@ class Emulator:
             self.linked = newly_linked
             return
         if frame.command == CMD_STATUS:
+            if self.last_heartbeat_sequence is not None:
+                expected_sequence = (self.last_heartbeat_sequence + 1) & 0xFF
+                if frame.sequence != expected_sequence:
+                    self.fail(f"heartbeat sequence expected={expected_sequence} got={frame.sequence}")
+            self.last_heartbeat_sequence = frame.sequence
             interval = "first"
             if self.last_heartbeat is not None:
                 elapsed = now - self.last_heartbeat
                 interval = f"dt={elapsed:.3f}s"
                 if not 0.8 <= elapsed <= 1.2:
                     interval += " TIMING_WARNING"
+                    self.fail(f"heartbeat timing outside tolerance: {elapsed:.3f}s")
             self.last_heartbeat = now
+            self.heartbeat_count += 1
+            description, valid = describe_status(frame.payload)
+            if not valid:
+                self.fail("invalid heartbeat fields")
+            if len(frame.payload) == 14:
+                _, capture, _, _, frame_count, session, safe, _ = struct.unpack(
+                    "<BBBBIIBB", frame.payload)
+                if self.expected_phase == "capturing" and capture == 1 and session == self.session_id:
+                    self.observed_capture = True
+                    if (self.last_capture_frame_count is not None and
+                            frame_count < self.last_capture_frame_count):
+                        self.fail("capture frame count moved backwards after a retransmission")
+                    self.last_capture_frame_count = frame_count
+                elif self.expected_phase == "stopped" and capture == 0 and session == 0:
+                    self.observed_stopped = True
+                elif self.expected_phase == "safe" and capture == 0 and session == 0 and safe == 1:
+                    self.observed_safe = True
             print(f"{stamp()}  RX heartbeat seq={frame.sequence} {interval} "
-                  f"{describe_status(frame.payload)}")
+                  f"{description}")
             return
         if frame.command == CMD_ACK:
             if len(frame.payload) != 3:
-                print(f"{stamp()}  RX invalid ACK length={len(frame.payload)}")
+                self.fail(f"invalid ACK length={len(frame.payload)}")
                 return
             ack_command, ack_sequence, result = struct.unpack("<BBB", frame.payload)
             print(f"{stamp()}  RX ACK cmd=0x{ack_command:02X} seq={ack_sequence} result={result}")
             if (self.pending is not None and ack_command == self.pending.command and
                     ack_sequence == self.pending.sequence):
+                if (self.args.simulate_lost_ack and result == 0 and
+                        ack_command not in self.ignored_ack_commands):
+                    # Leave pending intact, including its original send time,
+                    # so the ordinary timeout path generates the retransmit.
+                    self.ignored_ack_commands.add(ack_command)
+                    print(f"{stamp()}  SIMULATE lost ACK for cmd=0x{ack_command:02X}; "
+                          "waiting for same-SEQ retry")
+                    return
+                if result != 0:
+                    self.fail(f"command 0x{ack_command:02X} returned result={result}")
+                else:
+                    self.acked_commands.add(ack_command)
+                    if ack_command == CMD_START:
+                        self.expected_phase = "capturing"
+                    elif ack_command == CMD_STOP:
+                        self.expected_phase = "stopped"
+                    elif ack_command == CMD_POWER_OFF:
+                        self.expected_phase = "safe"
                 self.pending = None
+            else:
+                self.fail(f"unexpected ACK cmd=0x{ack_command:02X} seq={ack_sequence}")
             return
-        print(f"{stamp()}  RX unexpected cmd=0x{frame.command:02X} seq={frame.sequence} len={len(frame.payload)}")
+        self.fail(f"unexpected cmd=0x{frame.command:02X} seq={frame.sequence} len={len(frame.payload)}")
 
-    def run(self) -> None:
+    def run(self) -> bool:
         deadline = self.started_at + self.args.duration
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -241,6 +307,12 @@ class Emulator:
                 if elapsed >= 3 and not self.start_sent:
                     self.start_sent = True
                     self.queue_command(CMD_START, struct.pack("<BBI", 1, 0, self.session_id), "start")
+                elif elapsed >= 6 and not self.repeat_start_sent:
+                    # Unlike a retry, this intentionally gets a new SEQ and
+                    # tests session-level idempotency with the same session ID.
+                    self.repeat_start_sent = True
+                    self.queue_command(CMD_START, struct.pack("<BBI", 1, 0, self.session_id),
+                                       "repeat-start")
                 elif elapsed >= 12 and not self.stop_sent:
                     self.stop_sent = True
                     self.queue_command(CMD_STOP, struct.pack("<BBI", 1, 0, self.session_id), "stop")
@@ -250,15 +322,40 @@ class Emulator:
 
             if self.pending is not None and now - self.pending.sent_at >= 0.2:
                 if self.pending.attempts >= 3:
-                    print(f"{stamp()}  ERROR no ACK after 3 attempts")
+                    self.fail("no ACK after 3 attempts")
                     self.pending = None
                 else:
                     self.retry_pending()
 
-            if self.linked and self.last_heartbeat is not None and now - self.last_heartbeat > 3.0:
-                print(f"{stamp()}  ERROR heartbeat timeout (>3s)")
-                self.last_heartbeat = now
+            heartbeat_reference = self.last_heartbeat if self.last_heartbeat is not None else self.linked_at
+            if (self.linked and heartbeat_reference is not None and
+                    now - heartbeat_reference > 3.0 and not self.heartbeat_timeout_reported):
+                self.fail("heartbeat timeout (>3s)")
+                self.heartbeat_timeout_reported = True
             time.sleep(0.005)
+
+        if not self.linked:
+            self.fail("handshake never completed")
+        if self.heartbeat_count < 2:
+            self.fail(f"only {self.heartbeat_count} heartbeat frame(s) received")
+        if self.pending is not None:
+            self.fail("test ended with an unacknowledged command")
+        if self.args.scenario == "mission":
+            missing = {CMD_START, CMD_STOP, CMD_POWER_OFF} - self.acked_commands
+            if missing:
+                self.fail("missing successful ACK(s): " +
+                          ", ".join(f"0x{command:02X}" for command in sorted(missing)))
+            if not self.observed_capture:
+                self.fail("no heartbeat confirmed the capturing state")
+            if not self.observed_stopped:
+                self.fail("no heartbeat confirmed the stopped state with session=0")
+            if not self.observed_safe:
+                self.fail("no heartbeat confirmed safe power-off")
+        if self.failures:
+            print(f"{stamp()}  TEST FAILED ({len(self.failures)} failure(s))")
+            return False
+        print(f"{stamp()}  TEST PASSED ({self.heartbeat_count} heartbeats)")
+        return True
 
 
 def self_test() -> None:
@@ -270,6 +367,16 @@ def self_test() -> None:
     for index, byte in enumerate(wire):
         frames.extend(parser.feed(bytes((byte,)), index / 1000.0))
     assert frames == [Frame(CMD_STATUS, 9, wire[5:-2])]
+    expected = Frame(CMD_STATUS, 9, wire[5:-2])
+    assert Parser().feed(b"\x00\x55\xAA\xAA\x42" * 100 + wire, 0) == [expected]
+    parser = Parser()
+    assert parser.feed(wire[:6], 0) == []
+    assert parser.feed(b"\x12\xAA", 0.2) == []
+    assert parser.feed(wire[1:], 0.201) == [expected]
+    corrupted = bytearray(wire)
+    corrupted[5] ^= 1
+    assert Parser().feed(bytes(corrupted) + wire, 0) == [expected]
+    assert Parser().feed(wire + wire, 0) == [expected, expected]
     print("A-board emulator self-test passed")
 
 
@@ -282,6 +389,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-id", type=lambda value: int(value, 0), default=0x00010001)
     parser.add_argument("--drone-sn", default="DJI-H1-A-EMULATOR")
     parser.add_argument("--inject-bad-crc", action="store_true")
+    parser.add_argument("--simulate-lost-ack", action="store_true",
+                        help="discard first successful ACK per action to exercise same-SEQ retries")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -300,8 +409,7 @@ def main() -> int:
         print("pyserial is required: python -m pip install pyserial", file=sys.stderr)
         return 2
     with serial.Serial(args.port, args.baud, timeout=0.01) as serial_port:
-        Emulator(serial_port, args).run()
-    return 0
+        return 0 if Emulator(serial_port, args).run() else 1
 
 
 if __name__ == "__main__":

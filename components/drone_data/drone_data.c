@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "ab_protocol.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -29,19 +30,6 @@ static portMUX_TYPE s_init_guard = portMUX_INITIALIZER_UNLOCKED;
 static gps_record_t s_latest;
 static uint32_t s_record_sequence;
 
-static uint16_t read_le16(const uint8_t *data)
-{
-    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-}
-
-static uint32_t read_le32(const uint8_t *data)
-{
-    return (uint32_t)data[0] |
-           ((uint32_t)data[1] << 8) |
-           ((uint32_t)data[2] << 16) |
-           ((uint32_t)data[3] << 24);
-}
-
 static esp_err_t ensure_initialized(void)
 {
     taskENTER_CRITICAL(&s_init_guard);
@@ -52,6 +40,7 @@ static esp_err_t ensure_initialized(void)
     return s_lock != NULL ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+/* Caller holds s_lock across sequence allocation and the complete snapshot. */
 static void publish(const drone_realtime_data_t *data,
                     uint8_t protocol_sequence,
                     int64_t b_timestamp_us)
@@ -76,7 +65,7 @@ esp_err_t drone_data_init_fake(void)
 }
 
 esp_err_t drone_data_update_payload(
-    const uint8_t payload[DRONE_REALTIME_PAYLOAD_SIZE],
+    const uint8_t payload[AB_REALTIME_DATA_SIZE],
     uint8_t protocol_sequence,
     int64_t b_receive_timestamp_us)
 {
@@ -84,22 +73,10 @@ esp_err_t drone_data_update_payload(
     esp_err_t result = ensure_initialized();
     if (result != ESP_OK) return result;
 
-    drone_realtime_data_t decoded = {
-        .latitude_e7 = (int32_t)read_le32(payload + 0),
-        .longitude_e7 = (int32_t)read_le32(payload + 4),
-        .altitude_relative_mm = (int32_t)read_le32(payload + 8),
-        .utc_seconds = read_le32(payload + 12),
-        .a_monotonic_ms = read_le32(payload + 16),
-        .utc_milliseconds = read_le16(payload + 20),
-        .source_flags = payload[22],
-        .gps_fix = payload[23],
-        .rtk_solution = payload[24],
-        .flight_status = payload[25],
-        .display_mode = payload[26],
-        .battery_percent = payload[27],
-        .a_status = payload[28],
-        .valid_flags = payload[29],
-    };
+    drone_realtime_data_t decoded;
+    if (!ab_decode_realtime_data(payload, AB_REALTIME_DATA_SIZE, &decoded)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     if (decoded.utc_milliseconds > 999 || decoded.battery_percent > 100) {
         return ESP_ERR_INVALID_RESPONSE;
     }

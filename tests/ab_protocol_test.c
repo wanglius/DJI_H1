@@ -52,6 +52,27 @@ esp_err_t ab_protocol_self_test(void)
                      sizeof(handshake.drone_serial)) == 0,
           "32-byte non-terminated serial preservation");
 
+    CHECK(!ab_handshake_request_is_valid(NULL), "null handshake rejected");
+    /* Exhaust the byte-valued policy fields, including early drone_link=0. */
+    for (unsigned version = 0; version <= UINT8_MAX; version++) {
+        decoded_handshake.protocol_version = (uint8_t)version;
+        CHECK(ab_handshake_request_is_valid(&decoded_handshake) ==
+                  (version == AB_PROTOCOL_VERSION), "handshake version gate");
+    }
+    decoded_handshake.protocol_version = AB_PROTOCOL_VERSION;
+    for (unsigned link = 0; link <= UINT8_MAX; link++) {
+        decoded_handshake.drone_link = (uint8_t)link;
+        CHECK(ab_handshake_request_is_valid(&decoded_handshake) == (link <= 1),
+              "handshake drone-link gate");
+    }
+    decoded_handshake.drone_link = 0;
+    memset(decoded_handshake.drone_serial, 0, sizeof(decoded_handshake.drone_serial));
+    CHECK(ab_handshake_request_is_valid(&decoded_handshake),
+          "early handshake before drone link accepted");
+    CHECK(!ab_decode_handshake_request(handshake_payload,
+        sizeof(handshake_payload) - 1, &decoded_handshake),
+        "truncated handshake rejected");
+
     const ab_realtime_data_t realtime = {
         .latitude_e7 = 399042000,
         .longitude_e7 = 1164074000,
@@ -133,6 +154,65 @@ esp_err_t ab_protocol_self_test(void)
     CHECK(ab_parser_feed(&parser, 0x55, AB_INTERBYTE_TIMEOUT_MS + 1,
                          &frame) == AB_PARSE_TIMEOUT_RESET,
           "inter-byte timeout");
+
+    /* Restore CRC, then test payload corruption rather than only CRC damage. */
+    wire[wire_length - 1] ^= 0x01;
+    wire[5] ^= 0x01;
+    ab_parser_init(&parser);
+    for (size_t i = 0; i < wire_length; i++) {
+        parse_result = ab_parser_feed(&parser, wire[i], (uint32_t)i, &frame);
+    }
+    CHECK(parse_result == AB_PARSE_CRC_ERROR, "payload corruption rejected");
+    wire[5] ^= 0x01;
+
+    static const uint8_t garbage[] = {0, 0x55, 0x13, 0xAA, 0xAA, 0x42};
+    ab_parser_init(&parser);
+    for (size_t i = 0; i < sizeof(garbage); i++) {
+        CHECK(ab_parser_feed(&parser, garbage[i], (uint32_t)i, &frame) ==
+                  AB_PARSE_NONE, "garbage rejection");
+    }
+    for (size_t i = 0; i < wire_length; i++) {
+        parse_result = ab_parser_feed(&parser, wire[i],
+                                     (uint32_t)(sizeof(garbage) + i), &frame);
+    }
+    CHECK(parse_result == AB_PARSE_FRAME && frame.sequence == 0xFE,
+          "header resync after garbage");
+
+    /* A timeout abandons the partial frame, but preserves a new AA candidate. */
+    ab_parser_init(&parser);
+    for (size_t i = 0; i < 6; i++) {
+        ab_parser_feed(&parser, wire[i], (uint32_t)i, &frame);
+    }
+    CHECK(ab_parser_feed(&parser, wire[0], AB_INTERBYTE_TIMEOUT_MS + 10,
+                         &frame) == AB_PARSE_TIMEOUT_RESET, "truncation timeout");
+    for (size_t i = 1; i < wire_length; i++) {
+        parse_result = ab_parser_feed(&parser, wire[i],
+            AB_INTERBYTE_TIMEOUT_MS + 10 + (uint32_t)i, &frame);
+    }
+    CHECK(parse_result == AB_PARSE_FRAME && frame.sequence == 0xFE,
+          "valid frame after truncation");
+
+    uint8_t second_wire[AB_MAX_FRAME_SIZE];
+    size_t second_length = 0;
+    CHECK(ab_frame_encode(AB_CMD_PREPARE_POWER_OFF, 0xFF, power_payload,
+        sizeof(power_payload), second_wire, sizeof(second_wire), &second_length),
+        "back-to-back frame encode");
+    ab_parser_init(&parser);
+    unsigned parsed_frames = 0;
+    for (size_t i = 0; i < wire_length + second_length; i++) {
+        uint8_t byte = i < wire_length ? wire[i] : second_wire[i - wire_length];
+        if (ab_parser_feed(&parser, byte, (uint32_t)i, &frame) == AB_PARSE_FRAME) {
+            parsed_frames++;
+        }
+    }
+    CHECK(parsed_frames == 2 && frame.command == AB_CMD_PREPARE_POWER_OFF,
+          "back-to-back frames");
+
+    ab_parser_init(&parser);
+    CHECK(ab_parser_feed(&parser, 0xAA, UINT32_MAX - 50U, &frame) == AB_PARSE_NONE,
+          "timestamp rollover setup");
+    CHECK(ab_parser_feed(&parser, 0x55, 60, &frame) == AB_PARSE_TIMEOUT_RESET,
+          "timestamp rollover timeout");
 
     ESP_LOGI(TAG, "A-B PROTOCOL SELF-TEST PASSED");
     return ESP_OK;

@@ -30,7 +30,7 @@ esp_err_t data_pipeline_self_test(void)
                  sizeof(record.data)) == 0, "fixed GPS contents");
 
     /* Explicit CMD 0x01 test vector from the documented field layout. */
-    uint8_t payload[DRONE_REALTIME_PAYLOAD_SIZE] = {
+    uint8_t payload[AB_REALTIME_DATA_SIZE] = {
         0xD0, 0xE5, 0xC8, 0x17, /* latitude 399042000 */
         0x10, 0x5C, 0x62, 0x45, /* longitude 1164074000 */
         0xC0, 0xD4, 0x01, 0x00, /* relative altitude 120000 mm */

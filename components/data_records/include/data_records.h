@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ab_protocol.h"
 #include "h1.h"
 
 #ifdef __cplusplus
@@ -11,7 +12,6 @@ extern "C" {
 #endif
 
 #define DATA_RECORD_FORMAT_VERSION 1U
-#define DRONE_REALTIME_PAYLOAD_SIZE 30U
 
 typedef enum {
     DATA_RECORD_GPS = 1,
@@ -28,22 +28,8 @@ typedef struct {
     int64_t b_timestamp_us;
 } data_record_header_t;
 
-typedef struct {
-    int32_t latitude_e7;
-    int32_t longitude_e7;
-    int32_t altitude_relative_mm;
-    uint32_t utc_seconds;
-    uint32_t a_monotonic_ms;
-    uint16_t utc_milliseconds;
-    uint8_t source_flags;
-    uint8_t gps_fix;
-    uint8_t rtk_solution;
-    uint8_t flight_status;
-    uint8_t display_mode;
-    uint8_t battery_percent;
-    uint8_t a_status;
-    uint8_t valid_flags;
-} drone_realtime_data_t;
+/* The protocol owns the single field map for the 30-byte realtime payload. */
+typedef ab_realtime_data_t drone_realtime_data_t;
 
 enum {
     DRONE_SOURCE_POSITION_RTK = 1U << 0,

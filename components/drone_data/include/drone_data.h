@@ -18,9 +18,11 @@ esp_err_t drone_data_init_fake(void);
 /**
  * Decode one documented 30-byte CMD 0x01 payload and publish it as latest.
  * Multi-byte fields are decoded explicitly as little-endian values.
+ * Caller must validate the received length is AB_REALTIME_DATA_SIZE first:
+ * a C array parameter decays to a pointer and cannot enforce buffer length.
  */
 esp_err_t drone_data_update_payload(
-    const uint8_t payload[DRONE_REALTIME_PAYLOAD_SIZE],
+    const uint8_t payload[AB_REALTIME_DATA_SIZE],
     uint8_t protocol_sequence,
     int64_t b_receive_timestamp_us);
 

@@ -138,6 +138,9 @@ bool ab_encode_handshake_request(const ab_handshake_request_t *value,
                                  uint8_t payload[AB_HANDSHAKE_REQUEST_SIZE]);
 bool ab_decode_handshake_request(const uint8_t *payload, size_t length,
                                  ab_handshake_request_t *value);
+/** Validate decoded version and drone_link (0 or 1). A disconnected drone
+ * and empty serial are allowed during early A-board startup. */
+bool ab_handshake_request_is_valid(const ab_handshake_request_t *request);
 bool ab_encode_handshake_response(const ab_handshake_response_t *value,
                                   uint8_t payload[AB_HANDSHAKE_RESPONSE_SIZE]);
 bool ab_decode_handshake_response(const uint8_t *payload, size_t length,

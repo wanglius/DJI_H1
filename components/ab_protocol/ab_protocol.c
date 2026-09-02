@@ -204,6 +204,12 @@ bool ab_decode_handshake_request(const uint8_t *payload, size_t length,
     return true;
 }
 
+bool ab_handshake_request_is_valid(const ab_handshake_request_t *request)
+{
+    return request != NULL && request->protocol_version == AB_PROTOCOL_VERSION &&
+           request->drone_link <= 1;
+}
+
 bool ab_encode_handshake_response(const ab_handshake_response_t *value,
                                   uint8_t payload[AB_HANDSHAKE_RESPONSE_SIZE])
 {
