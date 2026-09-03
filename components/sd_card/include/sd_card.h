@@ -42,6 +42,8 @@ typedef struct {
 esp_err_t sd_card_mount(const sd_card_config_t *config);
 esp_err_t sd_card_unmount(void);
 bool sd_card_is_mounted(void);
+/** Read FAT capacity under the component lock; may block on card I/O. */
+esp_err_t sd_card_get_space(uint64_t *total_bytes, uint64_t *free_bytes);
 esp_err_t sd_card_print_info(FILE *stream);
 
 /**

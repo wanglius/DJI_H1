@@ -196,6 +196,17 @@ bool sd_card_is_mounted(void)
     return __atomic_load_n(&s_mounted, __ATOMIC_ACQUIRE);
 }
 
+esp_err_t sd_card_get_space(uint64_t *total_bytes, uint64_t *free_bytes)
+{
+    if (total_bytes == NULL || free_bytes == NULL) return ESP_ERR_INVALID_ARG;
+    esp_err_t result = lock_card();
+    if (result != ESP_OK) return result;
+    result = s_mounted ? esp_vfs_fat_info(s_mount_point, total_bytes, free_bytes)
+                       : ESP_ERR_INVALID_STATE;
+    unlock_card();
+    return result;
+}
+
 esp_err_t sd_card_print_info(FILE *stream)
 {
     if (stream == NULL) return ESP_ERR_INVALID_ARG;

@@ -1,17 +1,22 @@
 # A-board serial emulator
 
+For a complete takeoff/survey/return/landing mission on COM5, see
+[the flight emulator guide](FLIGHT_EMULATOR.md). The script below remains the
+short milestone regression test.
+
 This script emulates the drone-side A board over a 3.3 V USB-to-TTL adapter.
 Connect adapter TX to B-board GPIO18 (RX), adapter RX to GPIO17 (TX), and join
 the grounds. Do not apply a 5 V UART signal to the ESP32-S3.
 
-The B-board UART link task currently simulates capture and power-off state;
-it does not control the real acquisition/recorder yet. Install `pyserial` and run
-(replace COM6 with your adapter's port):
+The current B-board firmware controls real acquisition and reports real status.
+It does not yet record spectra. Use the complete hardware runner above for
+start/stop/restart and debug-count verification. The older short runner below
+is retained for protocol regression. Install `pyserial` and run:
 
 ```powershell
-python tests/ab_board_emulator/ab_board_emulator.py --port COM6
-python tests/ab_board_emulator/ab_board_emulator.py --port COM6 --scenario mission --simulate-lost-ack
-python tests/ab_board_emulator/ab_board_emulator.py --port COM6 --inject-bad-crc
+python tests/ab_board_emulator/ab_board_emulator.py --port COM5
+python tests/ab_board_emulator/ab_board_emulator.py --port COM5 --scenario mission --simulate-lost-ack
+python tests/ab_board_emulator/ab_board_emulator.py --port COM5 --inject-bad-crc
 ```
 
 The heartbeat scenario performs the handshake, sends fixed navigation data at
@@ -24,8 +29,9 @@ action to force a same-SEQ retry. Use at least 20 seconds for the mission test.
 
 The emulator returns exit code 1 on validation failure, or 0 on success.
 Mission success requires ACKs and heartbeats confirming capture, stopped
-(session=0), and safe power-off states. This validates simulated state, not
-physical SD flushing or power removal.
+(session=0), and safe power-off states. The short runner alone cannot compare
+counts against the real H1 logs. Neither runner physically removes power.
+Reset B before another mission after it has acknowledged safe shutdown.
 
 The codec and parser can be checked without hardware or `pyserial`:
 

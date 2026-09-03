@@ -14,6 +14,8 @@ extern const drone_realtime_data_t DRONE_DATA_FAKE_FIXED;
 
 /** Initialize the latest-sample store with DRONE_DATA_FAKE_FIXED. */
 esp_err_t drone_data_init_fake(void);
+/** Clear test/old samples. get_latest returns INVALID_STATE until telemetry arrives. */
+esp_err_t drone_data_clear(void);
 
 /**
  * Decode one documented 30-byte CMD 0x01 payload and publish it as latest.

@@ -29,6 +29,7 @@ static StaticSemaphore_t s_lock_storage;
 static portMUX_TYPE s_init_guard = portMUX_INITIALIZER_UNLOCKED;
 static gps_record_t s_latest;
 static uint32_t s_record_sequence;
+static bool s_have_sample;
 
 static esp_err_t ensure_initialized(void)
 {
@@ -51,6 +52,19 @@ static void publish(const drone_realtime_data_t *data,
     s_latest.protocol_sequence = protocol_sequence;
     memset(s_latest.reserved, 0, sizeof(s_latest.reserved));
     s_latest.data = *data;
+    s_have_sample = true;
+}
+
+esp_err_t drone_data_clear(void)
+{
+    esp_err_t result = ensure_initialized();
+    if (result != ESP_OK) return result;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    memset(&s_latest, 0, sizeof(s_latest));
+    s_record_sequence = 0;
+    s_have_sample = false;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
 }
 
 esp_err_t drone_data_init_fake(void)
@@ -90,8 +104,13 @@ esp_err_t drone_data_update_payload(
 esp_err_t drone_data_get_latest(gps_record_t *out_record)
 {
     if (out_record == NULL) return ESP_ERR_INVALID_ARG;
-    if (s_lock == NULL) return ESP_ERR_INVALID_STATE;
+    esp_err_t result = ensure_initialized();
+    if (result != ESP_OK) return result;
     if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    if (!s_have_sample) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     *out_record = s_latest;
     xSemaphoreGive(s_lock);
     return ESP_OK;

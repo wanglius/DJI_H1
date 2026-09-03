@@ -1,4 +1,6 @@
-#include "ab_link_test.h"
+#include "ab_link.h"
+#include "mission_control.h"
+#include "drone_data.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,35 +15,27 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const char *TAG = "AB_LINK_TEST";
+static const char *TAG = "AB_LINK";
 
-/* Protocol exercise only: commands below update synthetic state, not the
- * acquisition tasks or SD writer running in the coexistence test. */
+/* UART owns protocol state; mission_control owns blocking hardware work. */
 #define AB_RX_BUFFER_SIZE 1024
 #define AB_LINK_TASK_STACK 4096
 #define AB_LINK_TASK_PRIORITY 8
-#define AB_TEST_B_FIRMWARE_VERSION 0x0001
+#define AB_B_FIRMWARE_VERSION 0x0001
 
 typedef struct {
     bool linked;
-    bool capturing;
-    bool safe_power_off;
     uint8_t tx_sequence;
-    uint32_t session_id;
-    uint32_t last_completed_session_id;
-    /* Zero is an opaque session value, not an "uninitialized" sentinel. */
-    bool has_completed_session;
-    uint32_t frame_count;
     uint32_t realtime_count;
     int64_t next_heartbeat_us;
-} ab_link_test_state_t;
+} ab_link_state_t;
 
-static ab_link_test_state_t s_state;
+static ab_link_state_t s_state;
 static TaskHandle_t s_task;
 
-/* This test endpoint has one owner task. Cache bounded retry bursts, not an
+/* This endpoint has one owner task. Cache bounded retry bursts, not an
  * indefinitely remembered 8-bit SEQ (which eventually wraps). Session checks
- * below independently prevent a repeated start from resetting acquisition. */
+ * in mission_control independently prevent repeated starts from resetting acquisition. */
 typedef struct {
     bool valid;
     uint8_t sequence;
@@ -146,8 +140,8 @@ static void handle_frame(const ab_frame_t *frame)
         }
         const ab_handshake_response_t response = {
             .protocol_version = AB_PROTOCOL_VERSION,
-            .b_ready = 1,
-            .firmware_version = AB_TEST_B_FIRMWARE_VERSION,
+            .b_ready = mission_control_ready() ? 1 : 0,
+            .firmware_version = AB_B_FIRMWARE_VERSION,
             .request_sequence = frame->sequence,
         };
         uint8_t payload[AB_HANDSHAKE_RESPONSE_SIZE];
@@ -173,10 +167,13 @@ static void handle_frame(const ab_frame_t *frame)
             ESP_LOGW(TAG, "Rejected malformed realtime frame");
             return;
         }
+        if (!s_state.linked) return;
+        if (drone_data_update_payload(frame->payload, frame->sequence,
+                                      esp_timer_get_time()) != ESP_OK) return;
         s_state.realtime_count++;
         /* Keep RX-path logging throttled; per-frame printing delays heartbeat
          * and parsing when the navigation stream grows faster. */
-        if (s_state.realtime_count == 1 || s_state.realtime_count % 5 == 0) {
+        if (s_state.realtime_count == 1 || s_state.realtime_count % 25 == 0) {
             ESP_LOGI(TAG,
                      "GPS #%lu seq=%u lat=%.7f lon=%.7f alt=%.3fm mono=%lums",
                      (unsigned long)s_state.realtime_count, frame->sequence,
@@ -194,51 +191,19 @@ static void handle_frame(const ab_frame_t *frame)
             cache_and_send_ack(frame, 3);
             return;
         }
-        if (s_state.capturing) {
-            /* Reconnection may resend this session with a NEW sequence.
-             * Session idempotency therefore cannot rely on the retry cache. */
-            cache_and_send_ack(frame, command.session_id == s_state.session_id ? 0 : 2);
-            return;
-        }
-        if (s_state.has_completed_session &&
-            command.session_id == s_state.last_completed_session_id) {
-            /* Remember only the most recently completed task, not a persistent
-             * mission history. An ESP32 reset also loses this information. */
-            cache_and_send_ack(frame, 0);
-            return;
-        }
-        s_state.session_id = command.session_id;
-        s_state.frame_count = 0;
-        s_state.safe_power_off = false;
-        s_state.capturing = true;
-        cache_and_send_ack(frame, 0);
-        ESP_LOGI(TAG, "Simulated capture started: session=%lu",
-                 (unsigned long)s_state.session_id);
+        cache_and_send_ack(frame, s_state.linked ?
+            mission_control_start(command.session_id) : 4);
         break;
     }
     case AB_CMD_STOP_CAPTURE: {
         ab_stop_capture_t command;
         if (!ab_decode_stop_capture(frame->payload, frame->length, &command) ||
-            command.reserved != 0) {
+            command.reserved != 0 || command.reason < 1 || command.reason > 8) {
             cache_and_send_ack(frame, 3);
             return;
         }
-        if (!s_state.capturing) {
-            cache_and_send_ack(frame, s_state.has_completed_session &&
-                command.session_id == s_state.last_completed_session_id ? 0 : 4);
-            return;
-        }
-        if (command.session_id != s_state.session_id) {
-            cache_and_send_ack(frame, 4);
-            return;
-        }
-        s_state.capturing = false;
-        s_state.last_completed_session_id = s_state.session_id;
-        s_state.has_completed_session = true;
-        s_state.session_id = 0;
-        cache_and_send_ack(frame, 0);
-        ESP_LOGI(TAG, "Simulated capture stopped: session=%lu reason=%u",
-                 (unsigned long)command.session_id, command.reason);
+        cache_and_send_ack(frame, s_state.linked ?
+            mission_control_stop(command.session_id) : 4);
         break;
     }
     case AB_CMD_PREPARE_POWER_OFF: {
@@ -248,18 +213,8 @@ static void handle_frame(const ab_frame_t *frame)
             cache_and_send_ack(frame, 3);
             return;
         }
-        if (s_state.capturing) {
-            s_state.last_completed_session_id = s_state.session_id;
-            s_state.has_completed_session = true;
-        }
-        s_state.capturing = false;
-        s_state.session_id = 0;
-        /* Synthetic readiness only. Production must wait for acquisition stop
-         * and successful recorder flush/close before advertising safe=1. */
-        s_state.safe_power_off = true;
-        cache_and_send_ack(frame, 0);
-        ESP_LOGI(TAG, "Simulated data flush complete; safe power-off within %us",
-                 grace_seconds);
+        cache_and_send_ack(frame, s_state.linked ? mission_control_power_off() : 4);
+        ESP_LOGI(TAG, "Power-off request: grace=%us (A owns deadline)", grace_seconds);
         break;
     }
     default:
@@ -271,18 +226,8 @@ static void handle_frame(const ab_frame_t *frame)
 
 static void send_heartbeat(void)
 {
-    /* One synthetic frame per heartbeat; this is not the H1 frame count. */
-    if (s_state.capturing) s_state.frame_count++;
-    const ab_status_report_t status = {
-        .b_state = 1,
-        .actual_capture = s_state.capturing ? 1 : 0,
-        .error_code = 0,
-        .storage_free_percent = 75,
-        .frame_count = s_state.frame_count,
-        .session_id = s_state.capturing ? s_state.session_id : 0,
-        .safe_power_off = s_state.safe_power_off ? 1 : 0,
-        .reserved = 0,
-    };
+    ab_status_report_t status;
+    mission_control_get_status(&status);
     uint8_t payload[AB_STATUS_REPORT_SIZE];
     ab_encode_status_report(&status, payload);
     ESP_ERROR_CHECK_WITHOUT_ABORT(send_frame(
@@ -324,7 +269,7 @@ static void ab_link_task(void *argument)
     }
 }
 
-esp_err_t ab_link_test_start(void)
+esp_err_t ab_link_start(void)
 {
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
     const uart_config_t config = {
@@ -348,12 +293,12 @@ esp_err_t ab_link_test_start(void)
         uart_driver_delete(DJI_AB_UART_PORT);
         return result;
     }
-    if (xTaskCreate(ab_link_task, "ab_link_test", AB_LINK_TASK_STACK, NULL,
+    if (xTaskCreate(ab_link_task, "ab_link", AB_LINK_TASK_STACK, NULL,
                     AB_LINK_TASK_PRIORITY, &s_task) != pdPASS) {
         uart_driver_delete(DJI_AB_UART_PORT);
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "A-B emulator endpoint: UART%d TX=GPIO%d RX=GPIO%d 115200 8N1",
+    ESP_LOGI(TAG, "A-B control endpoint: UART%d TX=GPIO%d RX=GPIO%d 115200 8N1",
              DJI_AB_UART_PORT, DJI_AB_UART_TX_GPIO, DJI_AB_UART_RX_GPIO);
     return ESP_OK;
 }

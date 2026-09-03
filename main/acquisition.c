@@ -36,6 +36,7 @@ typedef struct {
     SemaphoreHandle_t done;
     TaskHandle_t task;
     bool task_created;
+    bool gate_released; /* Owner-only; never notify a self-deleted worker. */
     bool run; /* Accessed across cores through atomic builtins. */
     uint32_t frames_ok, frame_errors, reports_dropped;
     uint32_t min_interval_us, max_interval_us;
@@ -61,6 +62,31 @@ static QueueHandle_t s_report_queue;
 static TaskHandle_t s_logger_task;
 static SemaphoreHandle_t s_logger_done;
 static bool s_logger_created;
+static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
+static acquisition_status_t s_status;
+static bool s_stop_requested;
+static bool s_read_failed;
+
+void acquisition_get_status(acquisition_status_t *out)
+{
+    taskENTER_CRITICAL(&s_status_lock);
+    *out = s_status;
+    taskEXIT_CRITICAL(&s_status_lock);
+}
+
+void acquisition_arm(void)
+{
+    taskENTER_CRITICAL(&s_status_lock);
+    memset(&s_status, 0, sizeof(s_status));
+    taskEXIT_CRITICAL(&s_status_lock);
+    __atomic_store_n(&s_read_failed, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_stop_requested, false, __ATOMIC_RELEASE);
+}
+
+void acquisition_request_stop(void)
+{
+    __atomic_store_n(&s_stop_requested, true, __ATOMIC_RELEASE);
+}
 
 static const char *status_name(uint8_t status)
 {
@@ -76,6 +102,8 @@ static void acquisition_task(void *arg)
 {
     sensor_context_t *ctx = (sensor_context_t *)arg;
     int64_t previous_us = 0;
+    unsigned consecutive_errors = 0;
+    size_t sensor_index = (size_t)(ctx - s_sensors);
     ESP_LOGI(TAG, "%s task ready on UART-%c; waiting for start gate",
              ctx->name, ctx->channel == SC16_CHANNEL_A ? 'A' : 'B');
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -90,6 +118,15 @@ static void acquisition_task(void *arg)
         int64_t now_us = esp_timer_get_time();
         if (ret != ESP_OK) {
             ctx->frame_errors++;
+            taskENTER_CRITICAL(&s_status_lock);
+            s_status.errors[sensor_index] = ctx->frame_errors;
+            taskEXIT_CRITICAL(&s_status_lock);
+            /* Bound a broken stream; the owner stops both channels safely. */
+            if (++consecutive_errors >= 3) {
+                __atomic_store_n(&s_read_failed, true, __ATOMIC_RELEASE);
+                acquisition_request_stop();
+                break;
+            }
             if (ctx->frame_errors <= 3 || (ctx->frame_errors % 100) == 0) {
                 ESP_LOGE(TAG, "%s error #%lu after %.1f ms: %s; overruns=%lu",
                          ctx->name, (unsigned long)ctx->frame_errors,
@@ -103,6 +140,10 @@ static void acquisition_task(void *arg)
         }
 
         ctx->frames_ok++;
+        consecutive_errors = 0;
+        taskENTER_CRITICAL(&s_status_lock);
+        s_status.frames[sensor_index] = ctx->frames_ok;
+        taskEXIT_CRITICAL(&s_status_lock);
         uint32_t interval_us = previous_us == 0
             ? 0 : (uint32_t)(now_us - previous_us);
         previous_us = now_us;
@@ -150,7 +191,8 @@ static void acquisition_task(void *arg)
     ESP_LOGI(TAG, "%s stopped: ok=%lu errors=%lu dropped=%lu", ctx->name,
              (unsigned long)ctx->frames_ok, (unsigned long)ctx->frame_errors,
              (unsigned long)ctx->reports_dropped);
-    ctx->task = NULL;
+    /* Owner retains the handle until it has received done; never race a
+     * concurrent stop notification with a worker clearing its own handle. */
     xSemaphoreGive(ctx->done);
     vTaskDelete(NULL);
 }
@@ -190,6 +232,7 @@ static void reset_sensor_run_state(sensor_context_t *ctx)
     ctx->done = NULL;
     ctx->task = NULL;
     ctx->task_created = false;
+    ctx->gate_released = false;
     __atomic_store_n(&ctx->run, false, __ATOMIC_RELEASE);
     ctx->frames_ok = 0;
     ctx->frame_errors = 0;
@@ -283,8 +326,9 @@ static esp_err_t stop_acquisition_tasks(void)
 {
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         __atomic_store_n(&s_sensors[i].run, false, __ATOMIC_RELEASE);
-        if (s_sensors[i].task_created && s_sensors[i].task != NULL) {
+        if (s_sensors[i].task_created && !s_sensors[i].gate_released) {
             xTaskNotifyGive(s_sensors[i].task);
+            s_sensors[i].gate_released = true;
         }
     }
 
@@ -296,6 +340,9 @@ static esp_err_t stop_acquisition_tasks(void)
             ESP_LOGE(TAG, "%s did not stop within 6 seconds; task retained",
                      s_sensors[i].name);
             result = ESP_ERR_TIMEOUT;
+        } else {
+            s_sensors[i].task = NULL;
+            s_sensors[i].task_created = false;
         }
     }
     return result;
@@ -351,6 +398,16 @@ static void configure_watchdog(void)
     }
 }
 
+esp_err_t acquisition_prepare_dual(void)
+{
+    for (size_t i = 0; i < SENSOR_COUNT; i++) {
+        reset_sensor_run_state(&s_sensors[i]);
+        esp_err_t result = prepare_sensor(&s_sensors[i]);
+        if (result != ESP_OK) return result;
+    }
+    return ESP_OK;
+}
+
 esp_err_t acquisition_run_dual(uint32_t duration_ms)
 {
     bool service_started = false;
@@ -358,8 +415,12 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     bool tasks_stopped = false;
     esp_err_t result = ESP_OK;
 
+    /* Cancellation is armed by the owner before publishing STARTING, not
+     * here: a stop received before this task wakes must never be lost. */
+
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         reset_sensor_run_state(&s_sensors[i]);
+        if (__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) goto cleanup;
         result = prepare_sensor(&s_sensors[i]);
         if (result != ESP_OK) {
             ESP_LOGE(TAG, "%s preparation failed: %s",
@@ -367,6 +428,8 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
             goto cleanup;
         }
     }
+
+    if (__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) goto cleanup;
 
     result = sc16_start_dual_rx_service(
         RX_STREAM_BUFFER_SIZE, RX_SERVICE_PRIORITY, ACQUISITION_CORE);
@@ -383,6 +446,11 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     result = h1_start_stream(&s_sensors[0].device);
     if (result != ESP_OK) goto cleanup;
     stream_started[0] = true;
+    /* A partial dual-start failure still leaves real hardware streaming.
+     * Keep capture asserted until cleanup has stopped every started channel. */
+    taskENTER_CRITICAL(&s_status_lock);
+    s_status.capturing = true;
+    taskEXIT_CRITICAL(&s_status_lock);
     int64_t start_b_us = esp_timer_get_time();
     result = h1_start_stream(&s_sensors[1].device);
     if (result != ESP_OK) goto cleanup;
@@ -392,11 +460,22 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
              (start_b_us - start_a_us) / 1000.0);
     xTaskNotifyGive(s_sensors[0].task);
     xTaskNotifyGive(s_sensors[1].task);
+    s_sensors[0].gate_released = true;
+    s_sensors[1].gate_released = true;
 
     printf("\n============================================================\n");
-    printf(" BOTH CHANNELS ACQUIRING FOR %.1f SECONDS\n", duration_ms / 1000.0);
+    if (duration_ms) {
+        printf(" BOTH CHANNELS ACQUIRING FOR %.1f SECONDS\n", duration_ms / 1000.0);
+    } else {
+        printf(" BOTH CHANNELS ACQUIRING UNTIL A-BOARD STOP\n");
+    }
     printf("============================================================\n");
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    int64_t deadline = duration_ms == 0 ? INT64_MAX :
+        esp_timer_get_time() + (int64_t)duration_ms * 1000;
+    while (!__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE) &&
+           esp_timer_get_time() < deadline) {
+        vTaskDelay(1);
+    }
 
     ESP_LOGI(TAG, "Requesting both acquisition tasks to stop");
     result = stop_acquisition_tasks();
@@ -417,7 +496,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
                      esp_err_to_name(stop_ret));
             if (result == ESP_OK) result = stop_ret;
         }
-        stream_started[i] = false;
+        if (stop_ret == ESP_OK) stream_started[i] = false;
     }
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         uint32_t total = sc16_get_channel_rx_overrun_count(s_sensors[i].channel);
@@ -462,7 +541,7 @@ cleanup:
                          s_sensors[i].name, esp_err_to_name(stop_ret));
                 if (result == ESP_OK) result = stop_ret;
             }
-            stream_started[i] = false;
+            if (stop_ret == ESP_OK) stream_started[i] = false;
         }
 
         esp_err_t logger_ret = stop_logger_task();
@@ -477,6 +556,14 @@ cleanup:
                      esp_err_to_name(service_ret));
             if (result == ESP_OK) result = service_ret;
         }
+    }
+    if (__atomic_load_n(&s_read_failed, __ATOMIC_ACQUIRE) && result == ESP_OK) {
+        result = ESP_FAIL;
+    }
+    if (tasks_stopped && !stream_started[0] && !stream_started[1]) {
+        taskENTER_CRITICAL(&s_status_lock);
+        s_status.capturing = false;
+        taskEXIT_CRITICAL(&s_status_lock);
     }
     return result;
 }
