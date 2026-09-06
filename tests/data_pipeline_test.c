@@ -53,8 +53,8 @@ esp_err_t data_pipeline_self_test(void)
     ESP_RETURN_ON_ERROR(drone_data_get_latest(&record), TAG,
                         "Could not read decoded record");
 
-    CHECK(record.header.sequence == 2, "record sequence advancement");
-    CHECK(record.header.b_timestamp_us == receive_timestamp_us,
+    CHECK(record.header.record_sequence == 2, "record sequence advancement");
+    CHECK(record.header.timestamp.b_monotonic_us == receive_timestamp_us,
           "B-board receive timestamp");
     CHECK(record.protocol_sequence == 0x5A, "protocol sequence");
     CHECK(record.data.latitude_e7 == 399042000, "latitude decode");
@@ -78,19 +78,43 @@ esp_err_t data_pipeline_self_test(void)
           "invalid battery rejection");
     ESP_RETURN_ON_ERROR(drone_data_get_latest(&record), TAG,
                         "Could not reread latest record");
-    CHECK(record.header.sequence == 2 && record.protocol_sequence == 0x5A,
+    CHECK(record.header.record_sequence == 2 && record.protocol_sequence == 0x5A,
           "last valid record preservation");
 
+    /* Invalid protocol fields may contain placeholders; they must not reject
+     * valid timing/status data and must be canonicalized before recording. */
+    payload[20] = 0xFF; payload[21] = 0xFF;
+    payload[27] = 0xFF;
+    payload[29] = DRONE_VALID_POSITION | DRONE_VALID_ALTITUDE;
+    ESP_RETURN_ON_ERROR(drone_data_update_payload(
+                            payload, 0x5C, receive_timestamp_us + 2),
+                        TAG, "invalid-field placeholder handling");
+    ESP_RETURN_ON_ERROR(drone_data_get_latest(&record), TAG,
+                        "invalid-field canonical record");
+    CHECK(record.data.utc_seconds == 0 &&
+              record.data.utc_milliseconds == 0 &&
+              record.data.battery_percent == 0,
+          "invalid fields canonicalized");
+
+    record_time_t raw_time = {
+        .b_monotonic_us = 1000,
+        .valid_flags = RECORD_TIME_VALID_B_MONOTONIC,
+    };
     data_record_header_t raw_header = {0};
-    data_record_header_init(&raw_header, DATA_RECORD_RAW_SPECTRAL_PAIR,
-                            sizeof(raw_spectral_record_t), 7, 42, 1000);
-    CHECK(raw_header.record_type == DATA_RECORD_RAW_SPECTRAL_PAIR &&
-              raw_header.sequence == 7 && raw_header.session_id == 42,
+    data_record_header_init(&raw_header, DATA_RECORD_RAW_SPECTRUM,
+                            sizeof(raw_spectrum_record_t), 7, 42, 3, &raw_time);
+    CHECK(raw_header.magic == DATA_RECORD_MAGIC &&
+              raw_header.format_version == 0x01 &&
+              raw_header.header_size == DATA_RECORD_WIRE_HEADER_SIZE &&
+              raw_header.record_type == DATA_RECORD_RAW_SPECTRUM &&
+              raw_header.record_sequence == 7 && raw_header.session_id == 42 &&
+              raw_header.segment_id == 3 &&
+              raw_header.timestamp.b_monotonic_us == 1000,
           "raw spectral header initialization");
 
     data_record_header_t reflectance_header = {0};
     data_record_header_init(&reflectance_header, DATA_RECORD_REFLECTANCE,
-                            sizeof(reflectance_record_t), 8, 42, 1100);
+                            sizeof(reflectance_record_t), 8, 42, 3, &raw_time);
     CHECK(reflectance_header.record_type == DATA_RECORD_REFLECTANCE &&
               reflectance_header.record_size == sizeof(reflectance_record_t),
           "reflectance header initialization");

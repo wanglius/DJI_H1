@@ -331,6 +331,53 @@ esp_err_t sd_card_file_flush(sd_card_file_t *file)
     return result;
 }
 
+esp_err_t sd_card_path_exists(const char *path, bool *exists)
+{
+    if (exists == NULL) return ESP_ERR_INVALID_ARG;
+    *exists = false;
+    esp_err_t result = lock_card();
+    if (result != ESP_OK) return result;
+    if (!s_mounted) {
+        unlock_card();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char full_path[SD_CARD_PATH_CAPACITY];
+    result = make_full_path(path, full_path);
+    if (result == ESP_OK) {
+        struct stat info;
+        if (stat(full_path, &info) == 0) {
+            *exists = true;
+        } else if (errno != ENOENT) {
+            ESP_LOGE(TAG, "Could not inspect %s: errno=%d (%s)",
+                     full_path, errno, strerror(errno));
+            result = ESP_FAIL;
+        }
+    }
+    unlock_card();
+    return result;
+}
+
+esp_err_t sd_card_file_size(sd_card_file_t *file, uint64_t *size_bytes)
+{
+    if (file == NULL || file->stream == NULL || size_bytes == NULL)
+        return ESP_ERR_INVALID_ARG;
+    esp_err_t result = lock_card();
+    if (result != ESP_OK) return result;
+    long original = ftell(file->stream);
+    if (original < 0 || fseek(file->stream, 0, SEEK_END) != 0) {
+        result = ESP_FAIL;
+    } else {
+        long end = ftell(file->stream);
+        if (end < 0 || fseek(file->stream, original, SEEK_SET) != 0)
+            result = ESP_FAIL;
+        else
+            *size_bytes = (uint64_t)end;
+    }
+    unlock_card();
+    return result;
+}
+
 esp_err_t sd_card_file_close(sd_card_file_t *file)
 {
     if (file == NULL || file->stream == NULL) return ESP_ERR_INVALID_ARG;

@@ -14,6 +14,7 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "h1.h"
+#include "measurement_recorder.h"
 #include "sc16is752.h"
 
 static const char *TAG = "DJI_H1_ACQ";
@@ -144,6 +145,17 @@ static void acquisition_task(void *arg)
         taskENTER_CRITICAL(&s_status_lock);
         s_status.frames[sensor_index] = ctx->frames_ok;
         taskEXIT_CRITICAL(&s_status_lock);
+        esp_err_t record_result = measurement_recorder_submit(
+            sensor_index == 0 ? SPECTROMETER_GROUND : SPECTROMETER_SKY,
+            ctx->frames_ok, &ctx->frame, now_us);
+        if (record_result != ESP_OK) {
+            ESP_LOGE(TAG, "%s raw frame %lu could not be queued: %s",
+                     ctx->name, (unsigned long)ctx->frames_ok,
+                     esp_err_to_name(record_result));
+            __atomic_store_n(&s_read_failed, true, __ATOMIC_RELEASE);
+            acquisition_request_stop();
+            break;
+        }
         uint32_t interval_us = previous_us == 0
             ? 0 : (uint32_t)(now_us - previous_us);
         previous_us = now_us;
@@ -442,26 +454,44 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     configure_watchdog();
 
     sc16_reset_rx_overrun_count();
-    int64_t start_a_us = esp_timer_get_time();
-    result = h1_start_stream(&s_sensors[0].device);
+    /* Sky is the denominator for every ground-derived reflectance row. Prime
+     * its stream first so a short capture segment cannot lose its initial
+     * ground frames merely because no causal sky reference exists yet. */
+    int64_t start_b_us = esp_timer_get_time();
+    result = h1_start_stream(&s_sensors[1].device);
     if (result != ESP_OK) goto cleanup;
-    stream_started[0] = true;
+    stream_started[1] = true;
     /* A partial dual-start failure still leaves real hardware streaming.
      * Keep capture asserted until cleanup has stopped every started channel. */
     taskENTER_CRITICAL(&s_status_lock);
     s_status.capturing = true;
     taskEXIT_CRITICAL(&s_status_lock);
-    int64_t start_b_us = esp_timer_get_time();
-    result = h1_start_stream(&s_sensors[1].device);
-    if (result != ESP_OK) goto cleanup;
-    stream_started[1] = true;
-    ESP_LOGI(TAG, "Streams commanded A=%lldus B=%lldus separation=%.3fms",
-             (long long)start_a_us, (long long)start_b_us,
-             (start_b_us - start_a_us) / 1000.0);
-    xTaskNotifyGive(s_sensors[0].task);
     xTaskNotifyGive(s_sensors[1].task);
-    s_sensors[0].gate_released = true;
     s_sensors[1].gate_released = true;
+
+    int64_t prime_deadline = esp_timer_get_time() + FRAME_TIMEOUT_MS * 1000LL;
+    while (!__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) {
+        acquisition_status_t status;
+        acquisition_get_status(&status);
+        if (status.frames[1] != 0) break;
+        if (esp_timer_get_time() >= prime_deadline) {
+            ESP_LOGE(TAG, "Sky stream did not produce its priming frame");
+            result = ESP_ERR_TIMEOUT;
+            goto cleanup;
+        }
+        vTaskDelay(1);
+    }
+    if (__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) goto cleanup;
+
+    int64_t start_a_us = esp_timer_get_time();
+    result = h1_start_stream(&s_sensors[0].device);
+    if (result != ESP_OK) goto cleanup;
+    stream_started[0] = true;
+    ESP_LOGI(TAG, "Sky primed; streams commanded B=%lldus A=%lldus separation=%.3fms",
+             (long long)start_b_us, (long long)start_a_us,
+             (start_a_us - start_b_us) / 1000.0);
+    xTaskNotifyGive(s_sensors[0].task);
+    s_sensors[0].gate_released = true;
 
     printf("\n============================================================\n");
     if (duration_ms) {
@@ -516,7 +546,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
         printf("------------------------------------------------------------\n");
     }
     printf("Start-command separation    : %.3f ms\n",
-           (start_b_us - start_a_us) / 1000.0);
+           (start_a_us - start_b_us) / 1000.0);
     printf("Free heap after test        : %lu bytes\n",
            (unsigned long)esp_get_free_heap_size());
     printf("============================================================\n");

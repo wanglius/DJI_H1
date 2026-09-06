@@ -52,6 +52,8 @@ esp_err_t sd_card_print_info(FILE *stream);
  * already exist; call this function once for each level of a nested path.
  */
 esp_err_t sd_card_mkdir(const char *path);
+/** Test whether a validated relative path already exists on the mounted card. */
+esp_err_t sd_card_path_exists(const char *path, bool *exists);
 
 /**
  * Open a path relative to the mount point using an fopen-style mode.
@@ -74,6 +76,8 @@ esp_err_t sd_card_file_read(sd_card_file_t *file,
                             size_t capacity,
                             size_t *bytes_read);
 esp_err_t sd_card_file_flush(sd_card_file_t *file);
+/** Return the current file length without changing the caller's position. */
+esp_err_t sd_card_file_size(sd_card_file_t *file, uint64_t *size_bytes);
 esp_err_t sd_card_file_close(sd_card_file_t *file);
 
 #ifdef __cplusplus

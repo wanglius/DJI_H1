@@ -16,7 +16,7 @@ from flight_emulator import FlightEmulator
 from ab_board_emulator import encode_frame, CMD_POWER_OFF
 
 
-def verify_debug(log, report, require_clock=False):
+def verify_debug(log, report, require_clock=False, require_recording=False):
     failures = []
     if re.search(r'Guru Meditation|Task watchdog got triggered|abort\(\)', log):
         failures.append('MCU panic/watchdog in debug log')
@@ -36,8 +36,10 @@ def verify_debug(log, report, require_clock=False):
             pair = counts[2*i:2*i+2]
             if [p[0] for p in pair] != ['A', 'B'] or any(int(p[1]) == 0 for p in pair):
                 failures.append('both H1 channels must produce frames in each session')
-            if sum(int(p[1]) for p in pair) != expected:
-                failures.append('heartbeat count differs from real A+B totals')
+            # Protocol status carries completed ground measurements. Sky is a
+            # reference input and must not inflate the product frame count.
+            if int(pair[0][1]) != expected:
+                failures.append('heartbeat count differs from real ground totals')
     if 'Shutdown complete: safe=1 result=ESP_OK' not in log:
         failures.append('missing real successful shutdown/unmount')
     if require_clock:
@@ -55,6 +57,22 @@ def verify_debug(log, report, require_clock=False):
             failures.append('no valid synchronized UTC diagnostic')
         elif max(abs(value) for value in deltas) > 250:
             failures.append('synchronized UTC differs from A observation by over 250 ms')
+    if require_recording:
+        summaries = re.findall(
+            r'Segment recorded: raw=(\d+) reflectance=(\d+) dropped=(\d+) '
+            r'rejected=(\d+) write_errors=(\d+)', log)
+        if len(summaries) != 2:
+            failures.append('missing two production recorder summaries')
+        else:
+            for raw, reflectance, dropped, rejected, errors in summaries:
+                if int(raw) <= 0 or int(reflectance) <= 0:
+                    failures.append('a segment recorded no raw/reflectance data')
+                if int(dropped) != 0:
+                    failures.append('production recorder dropped raw data')
+                if int(errors) != 0:
+                    failures.append('production recorder reported SD write errors')
+                if int(rejected) != 0:
+                    failures.append('production recorder rejected reflectance data')
     return failures
 
 
@@ -122,7 +140,8 @@ def main():
             stop.set()
             thread.join(2)
         result['hardware_failures'] = verify_debug(
-            ''.join(chunks), result, require_clock=True) + capture_errors
+            ''.join(chunks), result, require_clock=True,
+            require_recording=True) + capture_errors
         result['passed'] &= not result['hardware_failures']
         json.dump(result, report_file, indent=2)
         print('HARDWARE MISSION:', 'PASSED' if result['passed'] else 'FAILED', flush=True)

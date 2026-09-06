@@ -46,9 +46,13 @@ static void publish(const drone_realtime_data_t *data,
                     uint8_t protocol_sequence,
                     int64_t b_timestamp_us)
 {
+    record_time_t timestamp = {
+        .b_monotonic_us = b_timestamp_us >= 0 ? (uint64_t)b_timestamp_us : 0,
+        .valid_flags = RECORD_TIME_VALID_B_MONOTONIC,
+    };
     data_record_header_init(&s_latest.header, DATA_RECORD_GPS,
                             sizeof(s_latest), ++s_record_sequence,
-                            0, b_timestamp_us);
+                            0, 0, &timestamp);
     s_latest.protocol_sequence = protocol_sequence;
     memset(s_latest.reserved, 0, sizeof(s_latest.reserved));
     s_latest.data = *data;
@@ -91,9 +95,27 @@ esp_err_t drone_data_update_payload(
     if (!ab_decode_realtime_data(payload, AB_REALTIME_DATA_SIZE, &decoded)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
-    if (decoded.utc_milliseconds > 999 || decoded.battery_percent > 100) {
+    if (((decoded.valid_flags & DRONE_VALID_UTC) &&
+         decoded.utc_milliseconds > 999) ||
+        ((decoded.valid_flags & DRONE_VALID_BATTERY) &&
+         decoded.battery_percent > 100)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
+    /* Section 4.3.6 forbids recording invalid fields. Preserve validity flags
+     * and canonicalize unavailable values so downstream logging cannot
+     * accidentally treat protocol placeholders as measurements. */
+    if (!(decoded.valid_flags & DRONE_VALID_POSITION)) {
+        decoded.latitude_e7 = 0;
+        decoded.longitude_e7 = 0;
+    }
+    if (!(decoded.valid_flags & DRONE_VALID_ALTITUDE))
+        decoded.altitude_relative_mm = 0;
+    if (!(decoded.valid_flags & DRONE_VALID_UTC)) {
+        decoded.utc_seconds = 0;
+        decoded.utc_milliseconds = 0;
+    }
+    if (!(decoded.valid_flags & DRONE_VALID_BATTERY))
+        decoded.battery_percent = 0;
 
     if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
     publish(&decoded, protocol_sequence, b_receive_timestamp_us);

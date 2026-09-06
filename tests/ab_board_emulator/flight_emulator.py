@@ -341,10 +341,10 @@ class FlightEmulator:
         if not self.confirmed_capture or not self.confirmed_stop or not self.safe:
             self.fail("missing capture/stop/safe heartbeat confirmation")
         for session in (self.args.session_id, self.restart_session):
-            if self.session_frames.get(session, 0) == 0:
-                self.fail(f"no acquired frames observed for session {session}")
             if session not in self.session_final_counts:
                 self.fail(f"no stopped heartbeat observed for session {session}")
+            elif self.session_final_counts[session] == 0:
+                self.fail(f"no acquired frames observed for session {session}")
         if self.handshake is not None:
             self.fail("handshake still outstanding")
         if self.args.blackout and (not self.blackout_seen or not self.reconnections):
