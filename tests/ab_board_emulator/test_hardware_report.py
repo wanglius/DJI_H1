@@ -25,3 +25,11 @@ class HardwareReportTests(unittest.TestCase):
 
     def test_missing_shutdown_rejected(self):
         self.assertTrue(verify_debug(self.log.replace('safe=1', 'safe=0'), self.report))
+
+    def test_clock_lifecycle(self):
+        log = self.log + ('State ACQUIRING -> LOCKED\n'
+                          'State LOCKED -> HOLDOVER\n'
+                          'State HOLDOVER -> LOCKED\n'
+                          'sync=LOCKED gen=1 age=1ms utc_delta=2ms valid=0x07\n')
+        report = dict(self.report, reconnections=1)
+        self.assertEqual(verify_debug(log, report, require_clock=True), [])

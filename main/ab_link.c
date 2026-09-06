@@ -1,6 +1,7 @@
 #include "ab_link.h"
 #include "mission_control.h"
 #include "drone_data.h"
+#include "clock_sync.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -168,19 +169,39 @@ static void handle_frame(const ab_frame_t *frame)
             return;
         }
         if (!s_state.linked) return;
+        int64_t b_receive_us = esp_timer_get_time();
         if (drone_data_update_payload(frame->payload, frame->sequence,
-                                      esp_timer_get_time()) != ESP_OK) return;
+                                      b_receive_us) != ESP_OK) return;
+        if (clock_sync_submit(&data, b_receive_us) != ESP_OK) {
+            ESP_LOGW(TAG, "Clock observation dropped at GPS #%lu",
+                     (unsigned long)(s_state.realtime_count + 1));
+        }
         s_state.realtime_count++;
         /* Keep RX-path logging throttled; per-frame printing delays heartbeat
          * and parsing when the navigation stream grows faster. */
         if (s_state.realtime_count == 1 || s_state.realtime_count % 25 == 0) {
+            record_time_t synchronized;
+            clock_sync_timestamp(b_receive_us, &synchronized);
+            int64_t utc_delta_ms = 0;
+            if ((synchronized.valid_flags & RECORD_TIME_VALID_UTC) &&
+                (data.valid_flags & (1U << 2))) {
+                uint64_t source_utc_ms = (uint64_t)data.utc_seconds * 1000ULL +
+                                         data.utc_milliseconds;
+                utc_delta_ms = (int64_t)synchronized.utc_ms -
+                               (int64_t)source_utc_ms;
+            }
             ESP_LOGI(TAG,
-                     "GPS #%lu seq=%u lat=%.7f lon=%.7f alt=%.3fm mono=%lums",
+                     "GPS #%lu seq=%u lat=%.7f lon=%.7f alt=%.3fm mono=%lums "
+                     "sync=%s gen=%u age=%lums utc_delta=%lldms valid=0x%02X",
                      (unsigned long)s_state.realtime_count, frame->sequence,
                      data.latitude_e7 / 10000000.0,
                      data.longitude_e7 / 10000000.0,
                      data.altitude_relative_mm / 1000.0,
-                     (unsigned long)data.a_monotonic_ms);
+                     (unsigned long)data.a_monotonic_ms,
+                     clock_sync_state_name(synchronized.sync_state),
+                     synchronized.sync_generation,
+                     (unsigned long)synchronized.sync_age_ms,
+                     (long long)utc_delta_ms, synchronized.valid_flags);
         }
         break;
     }

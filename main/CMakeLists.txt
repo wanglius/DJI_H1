@@ -5,6 +5,6 @@ idf_component_register(
          "../tests/ab_protocol_test.c"
          "../tests/coexistence_test.c"
     INCLUDE_DIRS "." "../tests"
-    REQUIRES sc16is752 h1 sd_card data_records drone_data ab_protocol
+    REQUIRES sc16is752 h1 sd_card data_records drone_data ab_protocol clock_sync
              esp_timer esp_system esp_driver_uart
 )

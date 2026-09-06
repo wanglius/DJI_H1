@@ -16,7 +16,7 @@ from flight_emulator import FlightEmulator
 from ab_board_emulator import encode_frame, CMD_POWER_OFF
 
 
-def verify_debug(log, report):
+def verify_debug(log, report, require_clock=False):
     failures = []
     if re.search(r'Guru Meditation|Task watchdog got triggered|abort\(\)', log):
         failures.append('MCU panic/watchdog in debug log')
@@ -40,6 +40,21 @@ def verify_debug(log, report):
                 failures.append('heartbeat count differs from real A+B totals')
     if 'Shutdown complete: safe=1 result=ESP_OK' not in log:
         failures.append('missing real successful shutdown/unmount')
+    if require_clock:
+        if 'State ACQUIRING -> LOCKED' not in log:
+            failures.append('clock synchronization never locked')
+        if report.get('reconnections'):
+            if 'State LOCKED -> HOLDOVER' not in log:
+                failures.append('clock synchronization did not enter holdover')
+            if not ('State HOLDOVER -> LOCKED' in log or
+                    'State INVALID -> LOCKED' in log):
+                failures.append('clock synchronization did not relock')
+        deltas = [int(value) for value in re.findall(
+            r'sync=LOCKED[^\r\n]*utc_delta=(-?\d+)ms[^\r\n]*valid=0x07', log)]
+        if not deltas:
+            failures.append('no valid synchronized UTC diagnostic')
+        elif max(abs(value) for value in deltas) > 250:
+            failures.append('synchronized UTC differs from A observation by over 250 ms')
     return failures
 
 
@@ -106,7 +121,8 @@ def main():
         finally:
             stop.set()
             thread.join(2)
-        result['hardware_failures'] = verify_debug(''.join(chunks), result) + capture_errors
+        result['hardware_failures'] = verify_debug(
+            ''.join(chunks), result, require_clock=True) + capture_errors
         result['passed'] &= not result['hardware_failures']
         json.dump(result, report_file, indent=2)
         print('HARDWARE MISSION:', 'PASSED' if result['passed'] else 'FAILED', flush=True)
