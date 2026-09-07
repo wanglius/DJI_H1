@@ -1,0 +1,3 @@
+# Test-only build overlay: emulate one long consumer-card erase/flush stall.
+CONFIG_DJI_H1_TEST_FAULT_INJECTION=y
+CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS=8000

@@ -26,16 +26,14 @@ is retained for that standalone bench harness; duration zero is command-driven.
 - Same accepted session start: success, no counter reset or repeated action.
 - Completed-session start: success, no restart. Restart requires a NEW ID.
 - Completed-session stop: success; unknown session stop: state error.
-- Boot-local history retains up to 64 accepted sessions, including ID zero.
-  Further new sessions return busy, rather than evicting IDs and allowing a
-  stale start to execute. History is lost on reset; it is not persistent replay
-  protection across power cycles.
+- Boot-local history suppresses the 64 most recently accepted session IDs.
+  Older IDs are evicted, so A must not reuse IDs within a flight. History is
+  lost on reset; it is not persistent replay protection across power cycles.
 - Prepare-power-off is terminal until reset. It cancels acquisition and
   unmounts SD. Safe=1 requires successful cleanup, no latched lifecycle failure,
   and successful unmount. A owns the grace deadline and physical power switch.
   Software never claims safety merely because the grace period expired.
-- Before adding recording, insert recorder drain/flush/close before unmount.
-  No spectral/GPS file recording is implemented in this milestone.
+- Raw and reflectance files drain, synchronize, and close before unmount.
 
 ## Heartbeat meaning
 
@@ -43,20 +41,28 @@ is retained for that standalone bench harness; duration zero is command-driven.
 |---|---|
 | b_state | 0 during initialization, 1 initialized, 2 fault |
 | actual_capture | At least one H1 stream started; held until all streams/readers are stopped |
-| frame_count | Successful decoded spectra A+B, not synchronized pairs or saved frames |
+| frame_count | Successful ground spectra in the current acquisition session |
 | session_id | Accepted session during preparation/run/cleanup; zero after completion |
 | storage_free_pct | FAT free/total bytes, measured at initialization and after each run |
 | safe_power_off | Actual cleanup/unmount completion, never a synthetic timer |
 
-Capacity is cached outside the UART task; this mode has no file writer. A future
-recorder must refresh it periodically from its own I/O owner. Error codes are
+Capacity is cached outside the UART task and refreshed after each run. Error codes are
 B-defined: 1=SD initialization/capacity, 2=bridge/H1 initialization,
 3=acquisition or cleanup, 4=SD shutdown, 5=frame decode errors in the current run.
 Three consecutive read failures stop both readers through normal cleanup.
 An isolated failed frame is reported, rather than silently counted as success.
-Lifecycle failures inhibit further starts until reset to avoid reusing retained
-resources. Heartbeats continue on failure. Stop latency includes the current
+Storage, initialization, and shutdown failures inhibit further starts until
+reset. A safely terminated acquisition failure may be retried with a new
+session ID; accepting that retry clears error 3. ACK result 1 is only the
+protocol's generic failure—the heartbeat error code identifies the subsystem.
+Heartbeats continue on failure. Stop latency includes the current
 bounded H1 frame read (up to 5 seconds), then stream draining and cleanup.
+
+Recorder pool/queue pressure is deliberately nonfatal. A dropped raw record is
+counted, exposes heartbeat error 5, and remains detectable through per-channel
+frame-count gaps; the acquisition continues to preserve the rest of the flight.
+Persistent write or flush failure remains fatal because the open file can no
+longer be trusted.
 
 Navigation payloads now update `drone_data` with the B reception timestamp.
 Self-test data is cleared before linking; no sample is available until valid

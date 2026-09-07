@@ -37,12 +37,35 @@ class HardwareReportTests(unittest.TestCase):
     def test_production_recording(self):
         log = self.log + (
             'Segment recorded: raw=52 reflectance=13 dropped=0 rejected=0 '
-            'write_errors=0\n'
+            'write_errors=0 flushes=8 flush_errors=0 max_flush=12000us '
+            'queue_hwm=3\n'
             'Segment recorded: raw=12 reflectance=3 dropped=0 rejected=0 '
-            'write_errors=0\n')
+            'write_errors=0 flushes=1 flush_errors=0 max_flush=9000us '
+            'queue_hwm=2\n')
         self.assertEqual(verify_debug(log, self.report,
                                      require_recording=True), [])
         self.assertTrue(verify_debug(log.replace('dropped=0', 'dropped=1', 1),
                                      self.report, require_recording=True))
         self.assertTrue(verify_debug(log.replace('rejected=0', 'rejected=1', 1),
                                      self.report, require_recording=True))
+        self.assertTrue(verify_debug(log.replace('flush_errors=0',
+                                                 'flush_errors=1', 1),
+                                     self.report, require_recording=True))
+
+    def test_expected_recorder_pressure(self):
+        log = self.log + (
+            'TEST ONLY: injecting 8000 ms one-shot flush stall\n'
+            'Segment recorded: raw=40 reflectance=9 dropped=8 rejected=0 '
+            'write_errors=0 flushes=3 flush_errors=0 max_flush=8001000us '
+            'queue_hwm=24\n'
+            'Segment recorded: raw=12 reflectance=3 dropped=0 rejected=0 '
+            'write_errors=0 flushes=2 flush_errors=0 max_flush=2000us '
+            'queue_hwm=2\n')
+        report = dict(self.report, events=[
+            {'event': 'heartbeat', 'state': 2, 'error': 5}])
+        self.assertEqual(verify_debug(log, report,
+                                     require_recording=True,
+                                     expect_pressure=True), [])
+        self.assertTrue(verify_debug(log, self.report,
+                                     require_recording=True,
+                                     expect_pressure=True))

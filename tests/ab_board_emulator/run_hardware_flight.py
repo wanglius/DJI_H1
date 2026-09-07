@@ -16,7 +16,8 @@ from flight_emulator import FlightEmulator
 from ab_board_emulator import encode_frame, CMD_POWER_OFF
 
 
-def verify_debug(log, report, require_clock=False, require_recording=False):
+def verify_debug(log, report, require_clock=False, require_recording=False,
+                 expect_pressure=False):
     failures = []
     if re.search(r'Guru Meditation|Task watchdog got triggered|abort\(\)', log):
         failures.append('MCU panic/watchdog in debug log')
@@ -60,19 +61,37 @@ def verify_debug(log, report, require_clock=False, require_recording=False):
     if require_recording:
         summaries = re.findall(
             r'Segment recorded: raw=(\d+) reflectance=(\d+) dropped=(\d+) '
-            r'rejected=(\d+) write_errors=(\d+)', log)
+            r'rejected=(\d+) write_errors=(\d+) flushes=(\d+) '
+            r'flush_errors=(\d+) max_flush=(\d+)us queue_hwm=(\d+)', log)
         if len(summaries) != 2:
             failures.append('missing two production recorder summaries')
         else:
-            for raw, reflectance, dropped, rejected, errors in summaries:
+            observed_drops = 0
+            for (raw, reflectance, dropped, rejected, errors, flushes,
+                 flush_errors, _max_flush, _queue_hwm) in summaries:
                 if int(raw) <= 0 or int(reflectance) <= 0:
                     failures.append('a segment recorded no raw/reflectance data')
-                if int(dropped) != 0:
+                observed_drops += int(dropped)
+                if int(dropped) != 0 and not expect_pressure:
                     failures.append('production recorder dropped raw data')
                 if int(errors) != 0:
                     failures.append('production recorder reported SD write errors')
                 if int(rejected) != 0:
                     failures.append('production recorder rejected reflectance data')
+                if int(flushes) == 0 or int(flush_errors) != 0:
+                    failures.append('production recorder flush verification failed')
+            if not any(int(summary[5]) > 1 for summary in summaries):
+                failures.append('periodic SD flush was not observed')
+            if expect_pressure and observed_drops == 0:
+                failures.append('injected writer stall caused no recorder pressure')
+            if expect_pressure and 'TEST ONLY: injecting' not in log:
+                failures.append('test-only writer stall was not activated')
+            pressure_heartbeats = [
+                event for event in report.get('events', [])
+                if event.get('event') == 'heartbeat' and
+                event.get('state') == 2 and event.get('error') == 5]
+            if expect_pressure and not pressure_heartbeats:
+                failures.append('recorder pressure was not exposed as heartbeat error 5')
     return failures
 
 
@@ -83,6 +102,8 @@ def main():
     parser.add_argument('--reset', action='store_true')
     parser.add_argument('--faults', action='store_true')
     parser.add_argument('--probe', action='store_true', help='command edge cases instead of flight')
+    parser.add_argument('--expect-pressure', action='store_true',
+                        help='expect test-only writer stall and visible raw drops')
     parser.add_argument('--report-prefix', required=True)
     cli = parser.parse_args()
     if cli.port.upper() == cli.debug_port.upper():
@@ -93,6 +114,7 @@ def main():
         session_id=(secrets.randbelow(65535) + 1) << 16 | 1,
         drone_sn='DJI-H1-HARDWARE-MISSION', lost_ack=cli.faults,
         blackout=cli.faults, bad_frames=cli.faults)
+    args.allow_data_gaps = cli.expect_pressure
     import serial
     stop = threading.Event()
     chunks, capture_errors = [], []
@@ -141,7 +163,8 @@ def main():
             thread.join(2)
         result['hardware_failures'] = verify_debug(
             ''.join(chunks), result, require_clock=True,
-            require_recording=True) + capture_errors
+            require_recording=True,
+            expect_pressure=cli.expect_pressure) + capture_errors
         result['passed'] &= not result['hardware_failures']
         json.dump(result, report_file, indent=2)
         print('HARDWARE MISSION:', 'PASSED' if result['passed'] else 'FAILED', flush=True)

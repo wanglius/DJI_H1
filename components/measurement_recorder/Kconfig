@@ -1,0 +1,20 @@
+menu "DJI H1 measurement recorder"
+
+config DJI_H1_TEST_FAULT_INJECTION
+    bool "Enable measurement-recorder fault injection"
+    default n
+    help
+        Unlock test-only recorder fault injection. Never enable this option in
+        a production image.
+
+config DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS
+    int "TEST ONLY: one-shot SD flush stall (milliseconds)"
+    range 0 30000
+    default 0
+    depends on DJI_H1_TEST_FAULT_INJECTION
+    help
+        Inject one delay before the first active flush to exercise bounded
+        recorder backpressure. The firmware prints a boot warning when this is
+        nonzero. Keep fault injection disabled in every production build.
+
+endmenu

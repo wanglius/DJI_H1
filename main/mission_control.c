@@ -23,7 +23,8 @@ static uint32_t s_sessions[SESSION_LIMIT];
 static size_t s_session_count;
 
 /* Error mapping is B-defined: 1 SD, 2 initialization, 3 acquisition/lifecycle,
- * 4 shutdown, 5 decoded-frame errors (latched for the current session). */
+ * 4 shutdown, 5 measurement-data degradation (decode failures, recorder
+ * pressure drops, or rejected calculations; latched for the current session). */
 static bool known_session(uint32_t session)
 {
     size_t count = s_session_count < SESSION_LIMIT ? s_session_count : SESSION_LIMIT;
@@ -39,12 +40,16 @@ uint8_t mission_control_start(uint32_t session)
     taskENTER_CRITICAL(&s_lock);
     if (s_power_off) result = 4;
     else if (known_session(session)) result = 0;
-    else if (s_error) result = 1;
+    /* Storage/init/shutdown faults remain latched. A safely terminated
+     * acquisition fault may be retried with a new session ID. ACK result 1 is
+     * the protocol's generic failure; the heartbeat carries the exact cause. */
+    else if (s_error && s_error != 3) result = 1;
     else if (!s_initialized || s_busy) result = 2;
     else {
         /* Arm before exposing the pending run; a subsequent STOP cannot be
          * overwritten by the worker when it starts preparing the sensors. */
         acquisition_arm();
+        s_error = 0;
         s_sessions[s_session_count % SESSION_LIMIT] = session;
         s_session_count++;
         s_session = session;
@@ -77,7 +82,7 @@ uint8_t mission_control_power_off(void)
 bool mission_control_ready(void)
 {
     taskENTER_CRITICAL(&s_lock);
-    bool ready = s_initialized && !s_error && !s_power_off;
+    bool ready = s_initialized && (!s_error || s_error == 3) && !s_power_off;
     taskEXIT_CRITICAL(&s_lock);
     return ready;
 }
@@ -91,6 +96,8 @@ void mission_control_get_status(ab_status_report_t *out)
     acquisition_get_status(&acquisition);
     uint8_t error = s_error;
     if (!error && !recorder.healthy) error = 1;
+    if (!error && (recorder.raw_dropped || recorder.calculation_rejected))
+        error = 5;
     if (!error && (acquisition.errors[0] || acquisition.errors[1])) error = 5;
     *out = (ab_status_report_t) {
         .b_state = error ? 2 : (s_initialized ? 1 : 0),

@@ -148,7 +148,14 @@ static void acquisition_task(void *arg)
         esp_err_t record_result = measurement_recorder_submit(
             sensor_index == 0 ? SPECTROMETER_GROUND : SPECTROMETER_SKY,
             ctx->frames_ok, &ctx->frame, now_us);
-        if (record_result != ESP_OK) {
+        if (record_result == ESP_ERR_NO_MEM) {
+            /* Preserve the flight: frame_count makes this explicit gap
+             * detectable, and recorder status exposes accumulated pressure. */
+            if (ctx->frames_ok <= 3 || (ctx->frames_ok % 100) == 0) {
+                ESP_LOGW(TAG, "%s raw frame %lu dropped by recorder pressure",
+                         ctx->name, (unsigned long)ctx->frames_ok);
+            }
+        } else if (record_result != ESP_OK) {
             ESP_LOGE(TAG, "%s raw frame %lu could not be queued: %s",
                      ctx->name, (unsigned long)ctx->frames_ok,
                      esp_err_to_name(record_result));

@@ -178,7 +178,9 @@ class FlightEmulator:
                 "<BBBBIIBB", frame.payload)
             if state > 2 or capture > 1 or free > 100 or safe > 1 or reserved:
                 self.fail("invalid heartbeat fields")
-            if error or state == 2:
+            expected_gap = (getattr(self.args, 'allow_data_gaps', False) and
+                            error == 5 and state == 2)
+            if (error or state == 2) and not expected_gap:
                 self.fail(f"B-board fault state={state} error={error}")
             if self.last_hb_sequence is not None:
                 if frame.sequence != ((self.last_hb_sequence + 1) & 255):

@@ -11,15 +11,17 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "sd_card.h"
 
 static const char *TAG = "MEAS_REC";
 
-#define RAW_POOL_COUNT 12
+#define RAW_POOL_COUNT 24
 #define WRITER_QUEUE_LENGTH (RAW_POOL_COUNT + 2)
 #define SERIAL_BUFFER_SIZE 4096
 #define FILE_HEADER_SIZE 16U
 #define SKY_HISTORY_COUNT 8U
+#define PERIODIC_FLUSH_MS 1500U
 
 typedef enum { MSG_RAW, MSG_BARRIER } message_type_t;
 typedef struct { message_type_t type; raw_spectrum_record_t *raw; } message_t;
@@ -40,6 +42,10 @@ static sd_card_file_t *s_raw_file, *s_reflectance_file;
 static uint8_t s_serial_buffer[SERIAL_BUFFER_SIZE];
 static raw_spectrum_record_t s_sky_history[SKY_HISTORY_COUNT];
 static reflectance_record_t s_calculated;
+#if CONFIG_DJI_H1_TEST_FAULT_INJECTION && \
+    CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS > 0
+static bool s_test_stall_done;
+#endif
 
 static void remember_sky(const raw_spectrum_record_t *sky,
                          size_t *next, size_t *count)
@@ -166,26 +172,59 @@ static void note_write_result(esp_err_t result, bool reflectance)
     taskEXIT_CRITICAL(&s_lock);
 }
 
+static esp_err_t flush_files(void)
+{
+    int64_t started_us = esp_timer_get_time();
+#if CONFIG_DJI_H1_TEST_FAULT_INJECTION && \
+    CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS > 0
+    if (!s_test_stall_done) {
+        s_test_stall_done = true;
+        ESP_LOGW(TAG, "TEST ONLY: injecting %d ms one-shot flush stall",
+                 CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS);
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS));
+    }
+#endif
+    esp_err_t result = s_raw_file ? sd_card_file_flush(s_raw_file) : ESP_OK;
+    esp_err_t second = s_reflectance_file
+        ? sd_card_file_flush(s_reflectance_file) : ESP_OK;
+    if (result == ESP_OK) result = second;
+    uint32_t elapsed_us = (uint32_t)(esp_timer_get_time() - started_us);
+
+    taskENTER_CRITICAL(&s_lock);
+    s_status.flush_count++;
+    if (elapsed_us > s_status.max_flush_us) s_status.max_flush_us = elapsed_us;
+    if (result != ESP_OK) {
+        s_status.flush_errors++;
+        s_status.write_errors++;
+        s_status.healthy = false;
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    if (result != ESP_OK)
+        ESP_LOGE(TAG, "SD flush failed after %lu us: %s",
+                 (unsigned long)elapsed_us, esp_err_to_name(result));
+    return result;
+}
+
 static void writer_task(void *unused)
 {
     (void)unused;
     size_t sky_next = 0, sky_count = 0;
+    TickType_t last_flush = xTaskGetTickCount();
     message_t message;
     while (true) {
-        if (xQueueReceive(s_writer_queue, &message, portMAX_DELAY) != pdTRUE)
-            continue;
-        if (message.type == MSG_BARRIER) {
-            esp_err_t result = s_raw_file
-                ? sd_card_file_flush(s_raw_file) : ESP_OK;
-            esp_err_t second = s_reflectance_file
-                ? sd_card_file_flush(s_reflectance_file) : ESP_OK;
-            if (result == ESP_OK) result = second;
-            taskENTER_CRITICAL(&s_lock);
-            if (result != ESP_OK) {
-                s_status.write_errors++;
-                s_status.healthy = false;
+        if (xQueueReceive(s_writer_queue, &message,
+                          pdMS_TO_TICKS(PERIODIC_FLUSH_MS)) != pdTRUE) {
+            measurement_recorder_status_t status;
+            measurement_recorder_get_status(&status);
+            if (status.active && (s_raw_file || s_reflectance_file)) {
+                (void)flush_files();
+                last_flush = xTaskGetTickCount();
             }
-            taskEXIT_CRITICAL(&s_lock);
+            continue;
+        }
+        if (message.type == MSG_BARRIER) {
+            (void)flush_files();
+            last_flush = xTaskGetTickCount();
             /* A barrier terminates a capture segment. Never pair a later
              * ground frame with a reference retained across that boundary. */
             sky_next = sky_count = 0;
@@ -237,12 +276,22 @@ static void writer_task(void *unused)
             }
         }
         xQueueSend(s_free_queue, &raw, portMAX_DELAY);
+        if (xTaskGetTickCount() - last_flush >=
+            pdMS_TO_TICKS(PERIODIC_FLUSH_MS)) {
+            (void)flush_files();
+            last_flush = xTaskGetTickCount();
+        }
     }
 }
 
 esp_err_t measurement_recorder_init(void)
 {
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
+#if CONFIG_DJI_H1_TEST_FAULT_INJECTION && \
+    CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS > 0
+    ESP_LOGW(TAG, "TEST BUILD: recorder flush fault injection enabled (%d ms)",
+             CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS);
+#endif
     s_free_queue = xQueueCreate(RAW_POOL_COUNT, sizeof(raw_spectrum_record_t *));
     s_writer_queue = xQueueCreate(WRITER_QUEUE_LENGTH, sizeof(message_t));
     s_barrier = xSemaphoreCreateBinary();
@@ -304,7 +353,7 @@ esp_err_t measurement_recorder_begin(uint32_t session_id, uint16_t segment_id)
             if (result != ESP_OK) return result;
             if (!exists) break;
         }
-        if (exists) return ESP_ERR_NO_MEM;
+        if (exists) return ESP_ERR_NOT_FOUND;
         result = sd_card_mkdir(s_directory);
         if (result != ESP_OK) return result;
         snprintf(path, sizeof(path), "%s/RAW_SPECTRA.BIN", s_directory);
@@ -372,6 +421,11 @@ esp_err_t measurement_recorder_submit(spectrometer_role_t role,
         taskENTER_CRITICAL(&s_lock); s_status.raw_dropped++; taskEXIT_CRITICAL(&s_lock);
         return ESP_ERR_NO_MEM;
     }
+    UBaseType_t depth = uxQueueMessagesWaiting(s_writer_queue);
+    taskENTER_CRITICAL(&s_lock);
+    if (depth > s_status.queue_high_watermark)
+        s_status.queue_high_watermark = depth;
+    taskEXIT_CRITICAL(&s_lock);
     return ESP_OK;
 }
 
@@ -387,12 +441,17 @@ esp_err_t measurement_recorder_end(void)
         return ESP_ERR_TIMEOUT;
     measurement_recorder_get_status(&status);
     ESP_LOGI(TAG, "Segment recorded: raw=%lu reflectance=%lu dropped=%lu "
-                  "rejected=%lu write_errors=%lu",
+                  "rejected=%lu write_errors=%lu flushes=%lu flush_errors=%lu "
+                  "max_flush=%luus queue_hwm=%lu",
              (unsigned long)status.raw_written,
              (unsigned long)status.reflectance_written,
              (unsigned long)status.raw_dropped,
              (unsigned long)status.calculation_rejected,
-             (unsigned long)status.write_errors);
+             (unsigned long)status.write_errors,
+             (unsigned long)status.flush_count,
+             (unsigned long)status.flush_errors,
+             (unsigned long)status.max_flush_us,
+             (unsigned long)status.queue_high_watermark);
     return status.healthy ? ESP_OK : ESP_FAIL;
 }
 

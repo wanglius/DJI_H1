@@ -19,6 +19,10 @@ typedef struct {
     uint32_t raw_dropped;
     uint32_t calculation_rejected;
     uint32_t write_errors;
+    uint32_t flush_count;
+    uint32_t flush_errors;
+    uint32_t max_flush_us;
+    uint32_t queue_high_watermark;
 } measurement_recorder_status_t;
 
 /** Create the fixed pools, pointer queue, and sole SD writer task. */
@@ -31,8 +35,10 @@ esp_err_t measurement_recorder_end(void);
 esp_err_t measurement_recorder_shutdown(void);
 
 /** Copy a completed H1 frame into a fixed pool buffer and enqueue its pointer.
- * Never blocks acquisition. Failure means raw data would be lost and should
- * stop the active measurement in a controlled manner. */
+ * Never blocks acquisition. ESP_ERR_NO_MEM means this frame was deliberately
+ * dropped and counted because the bounded writer queue was under pressure;
+ * callers should continue acquisition. Other errors indicate recorder failure.
+ */
 esp_err_t measurement_recorder_submit(spectrometer_role_t role,
                                       uint32_t frame_count,
                                       const h1_spectrum_frame_t *frame,
