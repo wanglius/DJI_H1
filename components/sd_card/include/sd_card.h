@@ -54,6 +54,14 @@ esp_err_t sd_card_print_info(FILE *stream);
 esp_err_t sd_card_mkdir(const char *path);
 /** Test whether a validated relative path already exists on the mounted card. */
 esp_err_t sd_card_path_exists(const char *path, bool *exists);
+/**
+ * Replace target with a fully written temporary file. If target exists it is
+ * moved to backup first, so an interrupted checkpoint leaves at least one
+ * recoverable copy. All paths are relative to the mount point.
+ */
+esp_err_t sd_card_replace_file(const char *temporary_path,
+                               const char *target_path,
+                               const char *backup_path);
 
 /**
  * Open a path relative to the mount point using an fopen-style mode.

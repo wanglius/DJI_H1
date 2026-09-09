@@ -15,7 +15,19 @@ from ab_board_emulator import (
     Parser, encode_frame, CMD_HANDSHAKE, CMD_HANDSHAKE_RESPONSE, CMD_REALTIME,
     CMD_START, CMD_STOP, CMD_POWER_OFF, CMD_ACK, CMD_STATUS,
 )
-from flight_model import FlightModel, STAGES
+from flight_model import FlightModel
+
+
+def is_start_stage(name):
+    return name in ("survey", "restart-survey") or name.endswith("-start")
+
+
+def action_label(stage):
+    if stage.name == "survey":
+        return "survey-start"
+    if stage.name == "restart-survey":
+        return "restart-start"
+    return stage.name
 
 
 @dataclass
@@ -58,6 +70,8 @@ class FlightEmulator:
         self.planned_session = args.session_id
         task = ((args.session_id & 0xFFFF) + 1) & 0xFFFF
         self.restart_session = (args.session_id & 0xFFFF0000) | (task or 1)
+        self.planned_sessions = [args.session_id]
+        self.start_stage_count = 0
         self.capture_started = False
         self.confirmed_capture = False
         self.session_frames = {}
@@ -75,6 +89,7 @@ class FlightEmulator:
         self.truncated_sent = False
         self.blackout_seen = False
         self.blackout_active = False
+        self.rtk_degraded_active = False
 
     def log(self, event, **fields):
         row = dict(t=round(self.clock() - self.boot, 3), event=event, **fields)
@@ -110,6 +125,12 @@ class FlightEmulator:
                    struct.pack("<BBI", 1 if command == CMD_START else reason,
                                0, session))
         self.queue.append((command, payload, label))
+
+    def advance_session(self):
+        task = ((self.planned_session & 0xFFFF) + 1) & 0xFFFF
+        self.planned_session = ((self.planned_session & 0xFFFF0000) |
+                                (task or 1))
+        self.planned_sessions.append(self.planned_session)
 
     def sync_capture(self):
         # A new sequence synchronizes target state after reconnect (doc 5.5).
@@ -234,6 +255,12 @@ class FlightEmulator:
             self.log("injected-link-outage" if blackout else "injected-link-restored")
             self.parser = Parser()
             self.last_hb_sequence = None
+        rtk_degraded = (self.args.scenario == "endurance" and
+                        self.args.duration * .50 <= elapsed < self.args.duration * .54)
+        if rtk_degraded != self.rtk_degraded_active:
+            self.rtk_degraded_active = rtk_degraded
+            self.log("injected-rtk-degradation" if rtk_degraded else
+                     "rtk-quality-restored")
         incoming = self.uart.read(self.uart.in_waiting or 1)
         if not blackout:
             for frame in self.parser.feed(incoming, self.clock()):
@@ -266,18 +293,24 @@ class FlightEmulator:
         if not self.linked:
             return
         # Stage events execute once in order, even if a scheduling pause skips one.
-        for stage in STAGES:
+        for stage in self.model.stages:
             if elapsed >= stage.fraction * self.args.duration and stage.name not in self.stages:
                 self.stages.add(stage.name)
-                self.log("stage", name=stage.name)
+                nav = struct.unpack("<iiiIIH8B", self.model.telemetry(
+                    elapsed, self.wall_clock(), now - self.boot))
+                self.log("stage", name=stage.name,
+                         latitude=round(nav[0] / 1e7, 7),
+                         longitude=round(nav[1] / 1e7, 7),
+                         altitude_m=round(nav[2] / 1000, 1))
                 if stage.name == "preflight":
                     self.begin_handshake(True)
                     self.supplement_sent = True
-                elif stage.name == "survey":
-                    self.enqueue(CMD_START, "survey-start")
-                elif stage.name == "restart-survey":
-                    self.planned_session = self.restart_session
-                    self.enqueue(CMD_START, "restart-start", session=self.restart_session)
+                elif is_start_stage(stage.name):
+                    if self.start_stage_count:
+                        self.advance_session()
+                    self.start_stage_count += 1
+                    self.enqueue(CMD_START, action_label(stage),
+                                 session=self.planned_session)
                 elif stage.name == "power-off":
                     self.enqueue(CMD_POWER_OFF, "power-off")
                 elif stage.stop_reason:
@@ -336,13 +369,14 @@ class FlightEmulator:
             self.finished = True
 
     def report(self):
-        required = {"survey-start", "survey-complete", "restart-start", "return-home", "landing",
-                    "landed", "prepare-shutdown", "power-off"}
+        required = {action_label(stage) for stage in self.model.stages
+                    if is_start_stage(stage.name) or stage.stop_reason or
+                    stage.name == "power-off"}
         for label in sorted(required - self.completed):
             self.fail(f"missing successful action: {label}")
         if not self.confirmed_capture or not self.confirmed_stop or not self.safe:
             self.fail("missing capture/stop/safe heartbeat confirmation")
-        for session in (self.args.session_id, self.restart_session):
+        for session in self.planned_sessions:
             if session not in self.session_final_counts:
                 self.fail(f"no stopped heartbeat observed for session {session}")
             elif self.session_final_counts[session] == 0:
@@ -376,15 +410,21 @@ def parse_args():
     parser.add_argument("--duration", type=float, default=60)
     parser.add_argument("--grace", type=int, default=10)
     parser.add_argument("--scenario", choices=("normal", "low-battery", "manual-abort",
-                                              "drone-link-loss"), default="normal")
+                                              "drone-link-loss", "endurance"), default="normal")
     parser.add_argument("--session-id", type=lambda x: int(x, 0),
                         default=(secrets.randbelow(65535) + 1) << 16 | 1)
     parser.add_argument("--drone-sn", default="DJI-H1-SIMULATED-FLIGHT")
     parser.add_argument("--lost-ack", action="store_true")
     parser.add_argument("--blackout", action="store_true")
     parser.add_argument("--bad-frames", action="store_true")
+    parser.add_argument("--endurance", action="store_true",
+                        help="10-minute, four-line mission with all transport incidents")
     parser.add_argument("--report", help="new JSON report file; existing files are not overwritten")
     args = parser.parse_args()
+    if args.endurance:
+        args.duration = 600
+        args.scenario = "endurance"
+        args.lost_ack = args.blackout = args.bad_frames = True
     if not 60 <= args.duration <= 86400 or not 1 <= args.grace <= 255:
         parser.error("duration must be 60..86400 seconds; grace must be 1..255")
     if not 0 <= args.session_id <= 0xFFFFFFFF:

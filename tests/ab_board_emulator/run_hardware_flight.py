@@ -30,8 +30,8 @@ def verify_debug(log, report, require_clock=False, require_recording=False,
                 failures.append(line.strip())
     counts = re.findall(r'H1-([AB]) frames OK\s*:\s*(\d+)', log)
     finals = list(report['session_final_counts'].values())
-    if len(counts) != 2 * len(finals) or len(finals) != 2:
-        failures.append('missing two real A/B acquisition summaries')
+    if len(counts) != 2 * len(finals) or not finals:
+        failures.append('missing real A/B acquisition summaries')
     else:
         for i, expected in enumerate(finals):
             pair = counts[2*i:2*i+2]
@@ -63,9 +63,20 @@ def verify_debug(log, report, require_clock=False, require_recording=False,
             r'Segment recorded: raw=(\d+) reflectance=(\d+) dropped=(\d+) '
             r'rejected=(\d+) write_errors=(\d+) flushes=(\d+) '
             r'flush_errors=(\d+) max_flush=(\d+)us queue_hwm=(\d+)', log)
-        if len(summaries) != 2:
-            failures.append('missing two production recorder summaries')
+        if len(summaries) != len(finals) or not finals:
+            failures.append('recorder summary count differs from completed sessions')
         else:
+            auxiliary = re.findall(
+                r'Segment recorded:[^\r\n]*gps=(\d+) gps_dropped=(\d+) '
+                r'events=(\d+) events_dropped=(\d+)', log)
+            if len(auxiliary) != len(summaries):
+                failures.append('missing GPS/event recorder summaries')
+            else:
+                for gps, gps_dropped, events, events_dropped in auxiliary:
+                    if int(gps) <= 0 or int(events) <= 0:
+                        failures.append('a segment recorded no GPS/events')
+                    if (int(gps_dropped) or int(events_dropped)) and not expect_pressure:
+                        failures.append('production recorder dropped GPS/events')
             observed_drops = 0
             for (raw, reflectance, dropped, rejected, errors, flushes,
                  flush_errors, _max_flush, _queue_hwm) in summaries:
@@ -104,16 +115,21 @@ def main():
     parser.add_argument('--probe', action='store_true', help='command edge cases instead of flight')
     parser.add_argument('--expect-pressure', action='store_true',
                         help='expect test-only writer stall and visible raw drops')
+    parser.add_argument('--endurance', action='store_true',
+                        help='run the 10-minute four-line mission with incidents')
     parser.add_argument('--report-prefix', required=True)
     cli = parser.parse_args()
     if cli.port.upper() == cli.debug_port.upper():
         parser.error('protocol and debug ports must differ')
     if cli.probe and cli.faults:
         parser.error('--probe and --faults are separate scenarios')
-    args = argparse.Namespace(duration=60, grace=10, scenario='normal',
+    args = argparse.Namespace(duration=600 if cli.endurance else 60, grace=10,
+        scenario='endurance' if cli.endurance else 'normal',
         session_id=(secrets.randbelow(65535) + 1) << 16 | 1,
-        drone_sn='DJI-H1-HARDWARE-MISSION', lost_ack=cli.faults,
-        blackout=cli.faults, bad_frames=cli.faults)
+        drone_sn='DJI-H1-HARDWARE-MISSION',
+        lost_ack=cli.faults or cli.endurance,
+        blackout=cli.faults or cli.endurance,
+        bad_frames=cli.faults or cli.endurance)
     args.allow_data_gaps = cli.expect_pressure
     import serial
     stop = threading.Event()

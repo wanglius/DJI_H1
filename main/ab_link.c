@@ -2,6 +2,7 @@
 #include "mission_control.h"
 #include "drone_data.h"
 #include "clock_sync.h"
+#include "measurement_recorder.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -158,6 +159,9 @@ static void handle_frame(const ab_frame_t *frame)
             s_state.linked = true;
             s_state.next_heartbeat_us = esp_timer_get_time();
         }
+        measurement_recorder_note_handshake(request.drone_serial,
+                                            request.firmware_version,
+                                            request.drone_link);
         ESP_LOGI(TAG, "Handshake accepted: seq=%u drone_link=%u A-fw=0x%04X",
                  frame->sequence, request.drone_link, request.firmware_version);
         break;
@@ -175,6 +179,14 @@ static void handle_frame(const ab_frame_t *frame)
         if (clock_sync_submit(&data, b_receive_us) != ESP_OK) {
             ESP_LOGW(TAG, "Clock observation dropped at GPS #%lu",
                      (unsigned long)(s_state.realtime_count + 1));
+            (void)measurement_recorder_log_event(
+                MEASUREMENT_EVENT_CLOCK_OBSERVATION_DROP,
+                s_state.realtime_count + 1, 0);
+        }
+        gps_record_t gps;
+        if (drone_data_get_latest(&gps) == ESP_OK) {
+            (void)clock_sync_timestamp(b_receive_us, &gps.header.timestamp);
+            (void)measurement_recorder_submit_gps(&gps);
         }
         s_state.realtime_count++;
         /* Keep RX-path logging throttled; per-frame printing delays heartbeat
@@ -223,8 +235,13 @@ static void handle_frame(const ab_frame_t *frame)
             cache_and_send_ack(frame, 3);
             return;
         }
-        cache_and_send_ack(frame, s_state.linked ?
-            mission_control_stop(command.session_id) : 4);
+        uint8_t result = s_state.linked ?
+            mission_control_stop(command.session_id) : 4;
+        cache_and_send_ack(frame, result);
+        if (result == 0)
+            (void)measurement_recorder_log_event(
+                MEASUREMENT_EVENT_STOP_REQUEST, command.session_id,
+                command.reason);
         break;
     }
     case AB_CMD_PREPARE_POWER_OFF: {
@@ -234,7 +251,15 @@ static void handle_frame(const ab_frame_t *frame)
             cache_and_send_ack(frame, 3);
             return;
         }
-        cache_and_send_ack(frame, s_state.linked ? mission_control_power_off() : 4);
+        /* Queue the durable event before waking shutdown. The recorder closes
+         * auxiliary admission as soon as mission_control handles this request. */
+        uint8_t result = 4;
+        if (s_state.linked) {
+            (void)measurement_recorder_log_event(
+                MEASUREMENT_EVENT_POWER_OFF_REQUEST, grace_seconds, 0);
+            result = mission_control_power_off();
+        }
+        cache_and_send_ack(frame, result);
         ESP_LOGI(TAG, "Power-off request: grace=%us (A owns deadline)", grace_seconds);
         break;
     }
@@ -274,8 +299,12 @@ static void ab_link_task(void *argument)
                 handle_frame(&frame);
             } else if (result == AB_PARSE_CRC_ERROR) {
                 ESP_LOGW(TAG, "Discarded frame with invalid CRC");
+                (void)measurement_recorder_log_event(
+                    MEASUREMENT_EVENT_PROTOCOL_CRC_ERROR, 0, 0);
             } else if (result == AB_PARSE_TIMEOUT_RESET) {
                 ESP_LOGW(TAG, "Discarded interrupted frame (>100ms gap)");
+                (void)measurement_recorder_log_event(
+                    MEASUREMENT_EVENT_PROTOCOL_TIMEOUT, 0, 0);
             }
         }
         now_us = esp_timer_get_time();

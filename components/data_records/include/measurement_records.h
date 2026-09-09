@@ -23,6 +23,8 @@ extern "C" {
     (DATA_RECORD_WIRE_HEADER_SIZE + 16U + (uint32_t)(sample_count) * 2U + 4U)
 #define REFLECTANCE_RECORD_WIRE_SIZE(sample_count) \
     (DATA_RECORD_WIRE_HEADER_SIZE + 36U + (uint32_t)(sample_count) * 3U + 4U)
+#define GPS_RECORD_WIRE_SIZE \
+    (DATA_RECORD_WIRE_HEADER_SIZE + 34U + 4U)
 
 typedef enum {
     DATA_RECORD_GPS = 1,

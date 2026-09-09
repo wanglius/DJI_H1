@@ -38,10 +38,10 @@ class HardwareReportTests(unittest.TestCase):
         log = self.log + (
             'Segment recorded: raw=52 reflectance=13 dropped=0 rejected=0 '
             'write_errors=0 flushes=8 flush_errors=0 max_flush=12000us '
-            'queue_hwm=3\n'
+            'queue_hwm=3 gps=200 gps_dropped=0 events=3 events_dropped=0\n'
             'Segment recorded: raw=12 reflectance=3 dropped=0 rejected=0 '
             'write_errors=0 flushes=1 flush_errors=0 max_flush=9000us '
-            'queue_hwm=2\n')
+            'queue_hwm=2 gps=50 gps_dropped=0 events=3 events_dropped=0\n')
         self.assertEqual(verify_debug(log, self.report,
                                      require_recording=True), [])
         self.assertTrue(verify_debug(log.replace('dropped=0', 'dropped=1', 1),
@@ -57,10 +57,10 @@ class HardwareReportTests(unittest.TestCase):
             'TEST ONLY: injecting 8000 ms one-shot flush stall\n'
             'Segment recorded: raw=40 reflectance=9 dropped=8 rejected=0 '
             'write_errors=0 flushes=3 flush_errors=0 max_flush=8001000us '
-            'queue_hwm=24\n'
+            'queue_hwm=64 gps=20 gps_dropped=4 events=2 events_dropped=0\n'
             'Segment recorded: raw=12 reflectance=3 dropped=0 rejected=0 '
             'write_errors=0 flushes=2 flush_errors=0 max_flush=2000us '
-            'queue_hwm=2\n')
+            'queue_hwm=2 gps=50 gps_dropped=0 events=3 events_dropped=0\n')
         report = dict(self.report, events=[
             {'event': 'heartbeat', 'state': 2, 'error': 5}])
         self.assertEqual(verify_debug(log, report,
@@ -69,3 +69,15 @@ class HardwareReportTests(unittest.TestCase):
         self.assertTrue(verify_debug(log, self.report,
                                      require_recording=True,
                                      expect_pressure=True))
+
+    def test_four_segment_endurance_report(self):
+        report = {'session_final_counts': {11: 4, 12: 2, 13: 3, 14: 5}}
+        log = (self.log.replace('Shutdown complete',
+                                'H1-A frames OK : 3\nH1-B frames OK : 6\n'
+                                'H1-A frames OK : 5\nH1-B frames OK : 8\n'
+                                'Shutdown complete'))
+        summary = ('Segment recorded: raw=10 reflectance=2 dropped=0 rejected=0 '
+                   'write_errors=0 flushes=3 flush_errors=0 max_flush=2000us '
+                   'queue_hwm=1 gps=20 gps_dropped=0 events=3 events_dropped=0\n')
+        self.assertEqual(verify_debug(log + summary * 4, report,
+                                     require_recording=True), [])

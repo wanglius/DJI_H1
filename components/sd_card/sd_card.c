@@ -358,6 +358,55 @@ esp_err_t sd_card_path_exists(const char *path, bool *exists)
     return result;
 }
 
+esp_err_t sd_card_replace_file(const char *temporary_path,
+                               const char *target_path,
+                               const char *backup_path)
+{
+    if (temporary_path == NULL || target_path == NULL || backup_path == NULL)
+        return ESP_ERR_INVALID_ARG;
+    esp_err_t result = lock_card();
+    if (result != ESP_OK) return result;
+    if (!s_mounted) {
+        unlock_card();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char temporary[SD_CARD_PATH_CAPACITY];
+    char target[SD_CARD_PATH_CAPACITY];
+    char backup[SD_CARD_PATH_CAPACITY];
+    result = make_full_path(temporary_path, temporary);
+    if (result == ESP_OK) result = make_full_path(target_path, target);
+    if (result == ESP_OK) result = make_full_path(backup_path, backup);
+    if (result != ESP_OK) {
+        unlock_card();
+        return result;
+    }
+
+    /* FatFs does not replace an existing destination. Keep the previous JSON
+     * as a recovery copy until the new checkpoint has acquired its final name. */
+    if (remove(backup) != 0 && errno != ENOENT) result = ESP_FAIL;
+    bool had_target = false;
+    struct stat info;
+    if (result == ESP_OK && stat(target, &info) == 0) {
+        had_target = true;
+        if (rename(target, backup) != 0) result = ESP_FAIL;
+    } else if (result == ESP_OK && errno != ENOENT) {
+        result = ESP_FAIL;
+    }
+    if (result == ESP_OK) {
+        if (rename(temporary, target) != 0) {
+            result = ESP_FAIL;
+            if (had_target) (void)rename(backup, target);
+        } else if (had_target && remove(backup) != 0 && errno != ENOENT) {
+            /* The new checkpoint is authoritative; a stale backup is harmless
+             * and preferable to reporting the successful replacement failed. */
+            ESP_LOGW(TAG, "Could not remove stale checkpoint backup %s", backup);
+        }
+    }
+    unlock_card();
+    return result;
+}
+
 esp_err_t sd_card_file_size(sd_card_file_t *file, uint64_t *size_bytes)
 {
     if (file == NULL || file->stream == NULL || size_bytes == NULL)

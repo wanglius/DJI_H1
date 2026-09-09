@@ -33,6 +33,25 @@ class Record:
     body: bytes
 
 
+@dataclass(frozen=True)
+class GpsSample:
+    protocol_sequence: int
+    latitude_e7: int
+    longitude_e7: int
+    altitude_relative_mm: int
+    utc_seconds: int
+    a_monotonic_ms: int
+    utc_milliseconds: int
+    source_flags: int
+    gps_fix: int
+    rtk_solution: int
+    flight_status: int
+    display_mode: int
+    battery_percent: int
+    a_status: int
+    valid_flags: int
+
+
 def decode_file(data: bytes) -> tuple[int, list[Record]]:
     """Decode and CRC-check a complete file, rejecting truncated tails."""
     if len(data) < FILE_HEADER_SIZE:
@@ -75,3 +94,11 @@ def decode_file(data: bytes) -> tuple[int, list[Record]]:
 
 def decode_path(path: str | Path) -> tuple[int, list[Record]]:
     return decode_file(Path(path).read_bytes())
+
+
+def decode_gps(record: Record) -> GpsSample:
+    """Decode the fixed 34-byte body of a v01 GPS_TRACK record."""
+    if record.record_type != 1 or len(record.body) != 34:
+        raise RecordFormatError("invalid GPS record body")
+    fields = struct.unpack("<B3xiiiIIH8B", record.body)
+    return GpsSample(*fields)

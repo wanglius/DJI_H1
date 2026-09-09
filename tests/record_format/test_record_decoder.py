@@ -2,7 +2,7 @@ import struct
 import unittest
 import zlib
 
-from record_decoder import (decode_file, FILE_MAGIC, RECORD_MAGIC,
+from record_decoder import (decode_file, decode_gps, FILE_MAGIC, RECORD_MAGIC,
                             RecordFormatError)
 
 
@@ -39,6 +39,23 @@ class RecordDecoderTests(unittest.TestCase):
     def test_rejects_record_type_mismatch(self):
         with self.assertRaisesRegex(RecordFormatError, "record header"):
             decode_file(self.header + make_record(record_type=3))
+
+    def test_decodes_gps_track_body(self):
+        body = struct.pack("<B3xiiiIIH8B", 0x5A, 399042000, 1164074000,
+                           120000, 1767225600, 123456, 500,
+                           3, 3, 50, 2, 15, 85, 0x1F, 0x0F)
+        gps_header = struct.pack("<IHHII", FILE_MAGIC, 1, 1, 16, 0)
+        _, records = decode_file(gps_header + make_record(
+            record_type=1, body=body))
+        gps = decode_gps(records[0])
+        self.assertEqual(gps.protocol_sequence, 0x5A)
+        self.assertEqual(gps.latitude_e7, 399042000)
+        self.assertEqual(gps.utc_milliseconds, 500)
+        self.assertEqual(gps.rtk_solution, 50)
+
+    def test_rejects_wrong_gps_body_size(self):
+        with self.assertRaisesRegex(RecordFormatError, "GPS record body"):
+            decode_gps(decode_file(self.header + make_record())[1][0])
 
 
 if __name__ == "__main__":

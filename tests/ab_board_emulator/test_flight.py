@@ -93,7 +93,7 @@ class FlightTests(unittest.TestCase):
 
     def mission(self):
         runner = FlightEmulator(self.uart, self.args, self.clock, lambda: 1800000000 + self.clock())
-        for _ in range(10000):
+        for _ in range(int((self.args.duration + self.args.grace + 20) * 100) + 100):
             self.uart.tick()
             runner.step()
             self.clock.now += .01
@@ -124,6 +124,26 @@ class FlightTests(unittest.TestCase):
         self.assertGreaterEqual(len(original_session), 4)
         self.assertNotEqual(original_session[0].sequence, original_session[-1].sequence)
         self.assertNotEqual(starts[0].payload, starts[-1].payload)
+
+    def test_endurance_four_line_mission(self):
+        self.args.duration = 600
+        self.args.scenario = "endurance"
+        self.args.lost_ack = self.args.blackout = self.args.bad_frames = True
+        result = self.mission()
+        self.assertTrue(result["passed"], result["failures"])
+        self.assertEqual(len(result["session_final_counts"]), 4)
+        self.assertEqual(result["reconnections"], 1)
+        self.assertGreater(result["navigation_frames"], 2900)
+        stages = {event["name"]: event for event in result["events"]
+                  if event["event"] == "stage"}
+        self.assertGreater(stages["line-1-stop"]["latitude"],
+                           stages["line-1-start"]["latitude"])
+        self.assertLess(stages["line-2-stop"]["latitude"],
+                        stages["line-2-start"]["latitude"])
+        incidents = {event["event"] for event in result["events"]
+                     if event["event"].startswith("inject")}
+        self.assertIn("injected-link-outage", incidents)
+        self.assertIn("injected-rtk-degradation", incidents)
 
     def test_error_report_fails(self):
         self.uart.error = 1

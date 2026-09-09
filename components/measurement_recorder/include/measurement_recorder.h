@@ -16,7 +16,11 @@ typedef struct {
     bool healthy;
     uint32_t raw_written;
     uint32_t reflectance_written;
+    uint32_t gps_written;
+    uint32_t events_written;
     uint32_t raw_dropped;
+    uint32_t gps_dropped;
+    uint32_t events_dropped;
     uint32_t calculation_rejected;
     uint32_t write_errors;
     uint32_t flush_count;
@@ -25,13 +29,30 @@ typedef struct {
     uint32_t queue_high_watermark;
 } measurement_recorder_status_t;
 
-/** Create the fixed pools, pointer queue, and sole SD writer task. */
+typedef enum {
+    MEASUREMENT_EVENT_HANDSHAKE = 1,
+    MEASUREMENT_EVENT_SEGMENT_START,
+    MEASUREMENT_EVENT_STOP_REQUEST,
+    MEASUREMENT_EVENT_SEGMENT_END,
+    MEASUREMENT_EVENT_POWER_OFF_REQUEST,
+    MEASUREMENT_EVENT_PROTOCOL_CRC_ERROR,
+    MEASUREMENT_EVENT_PROTOCOL_TIMEOUT,
+    MEASUREMENT_EVENT_CLOCK_OBSERVATION_DROP,
+    MEASUREMENT_EVENT_REFLECTANCE_REJECTED,
+    MEASUREMENT_EVENT_CAPTURE_RESULT,
+    MEASUREMENT_EVENT_FLIGHT_CLOSED,
+} measurement_event_t;
+
+/** Create the fixed pools, sole SD writer task, and a new mission directory.
+ * The directory exists before mission_control advertises B ready, so the
+ * handshake and all subsequent idle/active realtime data share one flight.
+ */
 esp_err_t measurement_recorder_init(void);
-/** Open/reuse mission files and start a measurement segment. */
+/** Start a measurement segment. session_id is an opaque A-board value. */
 esp_err_t measurement_recorder_begin(uint32_t session_id, uint16_t segment_id);
-/** Drain all submitted frames and flush both files. Files stay open for restart. */
+/** Drain the segment and flush every file. Safe to retry after a timeout. */
 esp_err_t measurement_recorder_end(void);
-/** Drain, close mission files, and stop accepting records before SD unmount. */
+/** Drain and close the mission before SD unmount. Safe to retry after timeout. */
 esp_err_t measurement_recorder_shutdown(void);
 
 /** Copy a completed H1 frame into a fixed pool buffer and enqueue its pointer.
@@ -43,6 +64,19 @@ esp_err_t measurement_recorder_submit(spectrometer_role_t role,
                                       uint32_t frame_count,
                                       const h1_spectrum_frame_t *frame,
                                       int64_t b_timestamp_us);
+
+/** Queue one synchronized A-board realtime sample for GPS_TRACK.BIN. */
+esp_err_t measurement_recorder_submit_gps(const gps_record_t *record);
+
+/** Queue a structured operation event without blocking its producer. */
+esp_err_t measurement_recorder_log_event(measurement_event_t event,
+                                         uint32_t argument0,
+                                         int32_t argument1);
+
+/** Cache the most recent accepted A-board identity for MISSION.JSON. */
+void measurement_recorder_note_handshake(const uint8_t drone_serial[32],
+                                         uint16_t a_firmware_version,
+                                         uint8_t drone_link);
 
 void measurement_recorder_get_status(measurement_recorder_status_t *out);
 

@@ -96,7 +96,8 @@ void mission_control_get_status(ab_status_report_t *out)
     acquisition_get_status(&acquisition);
     uint8_t error = s_error;
     if (!error && !recorder.healthy) error = 1;
-    if (!error && (recorder.raw_dropped || recorder.calculation_rejected))
+    if (!error && (recorder.raw_dropped || recorder.gps_dropped ||
+                   recorder.events_dropped || recorder.calculation_rejected))
         error = 5;
     if (!error && (acquisition.errors[0] || acquisition.errors[1])) error = 5;
     *out = (ab_status_report_t) {
@@ -176,6 +177,8 @@ static void control_task(void *unused)
                 result = refresh_storage();
                 if (result != ESP_OK) storage_failure = true;
             }
+            (void)measurement_recorder_log_event(
+                MEASUREMENT_EVENT_CAPTURE_RESULT, session, (int32_t)result);
             acquisition_status_t acquisition;
             acquisition_get_status(&acquisition);
             taskENTER_CRITICAL(&s_lock);

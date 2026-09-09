@@ -135,7 +135,12 @@ class ControlProbe:
         self.hold_idle(2, 0)
         self.log('cancelled-session-zero-replay-pass')
 
-        first, second = self.args.session_id, self.args.session_id + 1
+        first = self.args.session_id
+        # Change the high word deliberately. Protocol section 4.9 requires B
+        # to treat the entire session ID as opaque, including after an A reboot.
+        second = first ^ 0x80000000
+        if second == 0:  # Session zero was already completed above.
+            second = 0x40000000
         start_seq = self.command(CMD_START, self.payload(first))
         self.wait(lambda: self.status[1] == 1 and self.status[4] >= 4 and self.status[5] == first,
                   10, 'first real acquisition')
@@ -163,7 +168,7 @@ class ControlProbe:
         self.wait(lambda: self.status[4] > before and self.status[5] == second,
                   4, 'new session survived stale commands')
         self.command(CMD_POWER_OFF, bytes((10,)))
-        self.command(CMD_START, self.payload(second + 1), expected=4)
+        self.command(CMD_START, self.payload((second + 1) & 0xFFFFFFFF), expected=4)
         self.wait(lambda: self.status[6] == 1 and self.status[1] == 0 and self.status[5] == 0,
                   10, 'power-off during active acquisition')
         self.final_counts[second] = self.status[4]

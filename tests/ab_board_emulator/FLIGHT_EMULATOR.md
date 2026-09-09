@@ -5,7 +5,7 @@ runner; the original short `ab_board_emulator.py` remains available unchanged.
 
 ## Run on this workstation
 
-Connect USB-UART TX to ESP32 GPIO18, RX to GPIO17, and common ground (3.3 V TTL).
+Connect USB-UART TX to ESP32 GPIO44, RX to GPIO43, and common ground (3.3 V TTL).
 COM5 is the USB-UART bridge; COM4 is the ESP32 flash/debug port. This program
 opens **only COM5**, does not flash/reset B, and never physically switches power.
 
@@ -25,6 +25,7 @@ python -B tests/ab_board_emulator/flight_emulator.py --scenario low-battery
 python -B tests/ab_board_emulator/flight_emulator.py --scenario manual-abort
 python -B tests/ab_board_emulator/flight_emulator.py --scenario drone-link-loss
 python -B tests/ab_board_emulator/flight_emulator.py --duration 120 --report flight-report.json
+python -B tests/ab_board_emulator/flight_emulator.py --endurance --report endurance-report.json
 ```
 
 Reports are exclusively created, never overwritten. Console output is a JSON
@@ -63,6 +64,31 @@ Alternative scenarios change the return-home stop reason to 3 (low battery),
 6 (manual abort), or 7 (drone link loss). They occur after survey completion in
 this version; they are not mid-survey emergency flight trajectories. Low battery
 changes the battery data, and drone-link loss clears data validity and A-status.
+
+## Ten-minute endurance mission
+
+`--endurance` fixes the duration at 600 seconds and enables a deterministic,
+field-shaped test. It flies four alternating 400 m north/south survey lines,
+spaced 50 m eastward, at 120 m altitude. Every line receives a fresh session ID
+and independent START/STOP pair, producing four recorder segment summaries.
+Latitude and longitude are transmitted at 5 Hz in the normal 30-byte realtime
+payload and interpolated in a local tangent plane around 39.9042 N, 116.4074 E.
+Stage events in the JSON report include decoded coordinates and altitude.
+
+The plan injects lost action ACKs, one bad telemetry CRC, one truncated telemetry
+frame, a 4.5-second UART blackout/reconnect during line 2, and a temporary RTK
+quality degradation during line 3. Navigation continues with a GPS-quality fix
+during the RTK event. Return, landing, recorder shutdown, SD unmount, and the
+safe-power-off heartbeat remain mandatory.
+
+| Mission time | Event |
+|---|---|
+| 0–48 s | Handshake, preflight, takeoff, climb and transit |
+| 72–162 s | Test line 1, south to north |
+| 180–258 s | Test line 2, north to south; link blackout near 184 s |
+| 276–354 s | Test line 3, south to north; RTK degraded at 300–324 s |
+| 372–450 s | Test line 4, north to south |
+| 468–588 s | Return, landing and safe shutdown sequence |
 
 ## Protocol coverage and assumptions
 
@@ -106,6 +132,7 @@ To capture COM4 and compare the real counts while driving COM5:
 python -B tests/ab_board_emulator/run_hardware_flight.py --reset --report-prefix build-review/mission-normal
 python -B tests/ab_board_emulator/run_hardware_flight.py --reset --faults --report-prefix build-review/mission-faults
 python -B tests/ab_board_emulator/run_hardware_flight.py --reset --probe --report-prefix build-review/mission-probe
+python -B tests/ab_board_emulator/run_hardware_flight.py --reset --endurance --report-prefix build-review/mission-endurance
 ```
 
 `--reset` restarts B explicitly, without flashing or power removal. Use a new
