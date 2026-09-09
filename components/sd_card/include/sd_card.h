@@ -54,6 +54,9 @@ esp_err_t sd_card_print_info(FILE *stream);
 esp_err_t sd_card_mkdir(const char *path);
 /** Test whether a validated relative path already exists on the mounted card. */
 esp_err_t sd_card_path_exists(const char *path, bool *exists);
+/** Set a file or directory's FAT modification time from Unix UTC milliseconds.
+ * FAT stores calendar fields with two-second resolution and no timezone. */
+esp_err_t sd_card_set_modified_time(const char *path, uint64_t utc_ms);
 /**
  * Replace target with a fully written temporary file. If target exists it is
  * moved to backup first, so an interrupted checkpoint leaves at least one

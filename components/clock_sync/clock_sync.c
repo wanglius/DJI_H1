@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -57,6 +59,8 @@ static bool s_have_raw;
 static uint32_t s_last_raw;
 static uint64_t s_extended_ms;
 static uint32_t s_queue_drops;
+static uint16_t s_wall_clock_generation;
+static int64_t s_wall_clock_retry_after_us;
 
 const char *clock_sync_state_name(clock_sync_state_t state)
 {
@@ -132,6 +136,52 @@ static bool fit_model(sync_snapshot_t *model)
         model->utc_offset_ms = offsets[utc_count / 2];
     }
     return true;
+}
+
+static bool project_model_time(const sync_snapshot_t *model,
+                               int64_t b_monotonic_us,
+                               uint64_t *a_monotonic_ms,
+                               uint64_t *utc_ms)
+{
+    if (!model->model_valid) return false;
+    double delta_ms = (b_monotonic_us - model->anchor_b_us) /
+                      model->b_us_per_a_ms;
+    int64_t a_ms = (int64_t)model->anchor_a_ms + (int64_t)llround(delta_ms);
+    if (a_ms < 0) return false;
+    if (a_monotonic_ms != NULL) *a_monotonic_ms = (uint64_t)a_ms;
+    if (utc_ms != NULL) {
+        if (!model->utc_valid || a_ms + model->utc_offset_ms < 0) return false;
+        *utc_ms = (uint64_t)(a_ms + model->utc_offset_ms);
+    }
+    return true;
+}
+
+static void update_wall_clock(const sync_snapshot_t *model)
+{
+    /* FatFs get_fattime() reads the POSIX wall clock. Set it only after a
+     * validated A-board clock model locks, and at most once per generation;
+     * repeated 5 Hz settimeofday() calls would turn UART jitter into wall-clock
+     * steps. Monotonic acquisition timing remains based on esp_timer. */
+    if (model->state != CLOCK_SYNC_LOCKED || !model->utc_valid ||
+        s_wall_clock_generation == model->generation) return;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us < s_wall_clock_retry_after_us) return;
+    uint64_t utc_ms;
+    if (!project_model_time(model, now_us, NULL, &utc_ms)) return;
+    struct timeval wall_time = {
+        .tv_sec = (time_t)(utc_ms / 1000ULL),
+        .tv_usec = (suseconds_t)((utc_ms % 1000ULL) * 1000ULL),
+    };
+    if ((uint64_t)wall_time.tv_sec != utc_ms / 1000ULL ||
+        settimeofday(&wall_time, NULL) != 0) {
+        s_wall_clock_retry_after_us = now_us + 5000000LL;
+        ESP_LOGE(TAG, "Could not synchronize POSIX/FatFs wall clock");
+        return;
+    }
+    s_wall_clock_generation = model->generation;
+    s_wall_clock_retry_after_us = 0;
+    ESP_LOGI(TAG, "POSIX/FatFs wall clock synchronized, generation=%u",
+             model->generation);
 }
 
 static void reset_estimator(sync_snapshot_t *model, const char *reason)
@@ -221,6 +271,7 @@ static void clock_sync_task(void *unused)
             process_observation(&model, &observation);
         }
         update_timeout(&model, esp_timer_get_time());
+        update_wall_clock(&model);
         publish(&model);
     }
 }
@@ -228,6 +279,10 @@ static void clock_sync_task(void *unused)
 esp_err_t clock_sync_init(void)
 {
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
+    /* FAT stores calendar fields without a timezone. Persist UTC consistently
+     * so mission media remains unambiguous across deployment locations. */
+    if (setenv("TZ", "UTC0", 1) != 0) return ESP_ERR_NO_MEM;
+    tzset();
     s_queue = xQueueCreate(SYNC_QUEUE_LENGTH, sizeof(sync_observation_t));
     if (s_queue == NULL) return ESP_ERR_NO_MEM;
     if (xTaskCreate(clock_sync_task, "clock_sync", SYNC_TASK_STACK, NULL,
@@ -283,14 +338,12 @@ esp_err_t clock_sync_timestamp(int64_t b_monotonic_us, record_time_t *out)
     out->sync_state = state;
     if (model.model_valid && (state == CLOCK_SYNC_LOCKED ||
                               state == CLOCK_SYNC_HOLDOVER)) {
-        double delta_ms = (b_monotonic_us - model.anchor_b_us) /
-                          model.b_us_per_a_ms;
-        int64_t a_ms = (int64_t)model.anchor_a_ms + (int64_t)llround(delta_ms);
-        if (a_ms >= 0) {
-            out->a_monotonic_ms = (uint64_t)a_ms;
+        uint64_t a_ms, utc_ms;
+        if (project_model_time(&model, b_monotonic_us, &a_ms, NULL)) {
+            out->a_monotonic_ms = a_ms;
             out->valid_flags |= RECORD_TIME_VALID_A_MONOTONIC;
-            if (model.utc_valid && a_ms + model.utc_offset_ms >= 0) {
-                out->utc_ms = (uint64_t)(a_ms + model.utc_offset_ms);
+            if (project_model_time(&model, b_monotonic_us, NULL, &utc_ms)) {
+                out->utc_ms = utc_ms;
                 out->valid_flags |= RECORD_TIME_VALID_UTC;
             }
         }
@@ -311,5 +364,12 @@ esp_err_t clock_sync_self_test(void)
     sync_snapshot_t model = {.utc_valid = true, .utc_offset_ms = 1000000};
     if (utc_discontinuous(&model, 1000, 1001000) ||
         !utc_discontinuous(&model, 1000, 1002500)) return ESP_FAIL;
+    model.model_valid = true;
+    model.anchor_a_ms = 5000;
+    model.anchor_b_us = 2000000;
+    model.b_us_per_a_ms = 1000.0;
+    uint64_t projected_a, projected_utc;
+    if (!project_model_time(&model, 2500000, &projected_a, &projected_utc) ||
+        projected_a != 5500 || projected_utc != 1005500) return ESP_FAIL;
     return ESP_OK;
 }

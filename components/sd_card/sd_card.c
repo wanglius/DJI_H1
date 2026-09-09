@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/utime.h>
+#include <time.h>
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
@@ -350,6 +352,31 @@ esp_err_t sd_card_path_exists(const char *path, bool *exists)
             *exists = true;
         } else if (errno != ENOENT) {
             ESP_LOGE(TAG, "Could not inspect %s: errno=%d (%s)",
+                     full_path, errno, strerror(errno));
+            result = ESP_FAIL;
+        }
+    }
+    unlock_card();
+    return result;
+}
+
+esp_err_t sd_card_set_modified_time(const char *path, uint64_t utc_ms)
+{
+    time_t seconds = (time_t)(utc_ms / 1000ULL);
+    if ((uint64_t)seconds != utc_ms / 1000ULL) return ESP_ERR_INVALID_ARG;
+    esp_err_t result = lock_card();
+    if (result != ESP_OK) return result;
+    if (!s_mounted) {
+        unlock_card();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char full_path[SD_CARD_PATH_CAPACITY];
+    result = make_full_path(path, full_path);
+    if (result == ESP_OK) {
+        const struct utimbuf times = {.actime = seconds, .modtime = seconds};
+        if (utime(full_path, &times) != 0) {
+            ESP_LOGE(TAG, "Could not timestamp %s: errno=%d (%s)",
                      full_path, errno, strerror(errno));
             result = ESP_FAIL;
         }

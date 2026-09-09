@@ -6,7 +6,9 @@ Every GPS, raw-spectrum, calculated-reflectance, operation-log and MQTT record
 must be traceable to a common mission timeline. The B board therefore preserves
 its own monotonic event time and correlates it with the monotonic and UTC time
 reported by the A board. Synchronization does **not** set or step the ESP32
-system clock.
+system clock until the A/B model is both UTC-valid and `LOCKED`. At that point,
+the wall clock is set once for the synchronization generation so FatFs can
+produce useful file modification times. Record ordering never depends on it.
 
 This design keeps record ordering reliable even before UTC becomes available,
 during a temporary A-to-B link interruption, or if the A-board clock restarts.
@@ -37,6 +39,7 @@ clock task consumes the queue and:
 3. Uses the median observed UTC offset to reject individual timing outliers.
 4. Rejects fit residuals over 50 ms and UTC-offset jumps over one second.
 5. Publishes a compact snapshot that record producers can read safely.
+6. Sets the POSIX wall clock once when a UTC-valid generation reaches `LOCKED`.
 
 A backward A timer jump, as opposed to a normal unsigned rollover, resets the
 model and begins a new synchronization generation.
@@ -94,6 +97,16 @@ The original A-board timestamp fields and B receive timestamp should also remain
 in the GPS/navigation record. They provide an audit trail and allow the clock
 relationship to be reconstructed or improved during post-processing.
 
+FatFs obtains modification timestamps from the POSIX wall clock. The firmware
+uses the `UTC0` process timezone because FAT stores calendar fields without any
+timezone marker and has only two-second resolution. At orderly mission shutdown,
+after every handle and the final `MISSION.JSON` checkpoint have closed, the SD
+component applies the final synchronized UTC time to all five mission files and
+their directory. This best-effort metadata update cannot turn a safely flushed
+dataset into a failed shutdown. Original FAT creation times can still show the
+boot fallback because the directory is intentionally allocated before A-board
+time is available; consumers should sort by modification time.
+
 ## Failure behavior
 
 - A missing or invalid UTC flag does not prevent B-monotonic record ordering.
@@ -106,7 +119,7 @@ relationship to be reconstructed or improved during post-processing.
 
 ## Current scope
 
-Clock synchronization is now available to future GPS, spectrum, reflectance,
-operation-log and MQTT producers. This change does not yet alter their record
-structures or write files. Original A timestamps and the B receive time remain
-in the GPS record for offline reconstruction.
+Clock synchronization timestamps GPS, spectrum, reflectance and operation-log
+records and supplies the filesystem wall clock. Original A timestamps and the B
+receive time remain in the GPS record for offline reconstruction. MQTT remains
+a future consumer of the same universal record timestamp.

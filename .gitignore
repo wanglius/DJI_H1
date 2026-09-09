@@ -13,5 +13,9 @@
 .cache/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .DS_Store
 Thumbs.db
+
+# Local service credentials. Commit the matching *.example.json template only.
+/tools/mission_viewer/credentials/*.local.json

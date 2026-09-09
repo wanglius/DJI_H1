@@ -18,3 +18,14 @@ milestone firmware selects them explicitly from `main/CMakeLists.txt`.
 
 Hardware tests may write to the inserted card. Never run them with irreplaceable
 media unless the named test files have been backed up.
+
+## Host-only tests
+
+`mission_viewer/` exercises the Python mission decoder, timestamp-aware GPS
+interpolation, CRC rejection, query service, and read-only localhost HTTP API
+using generated temporary records. It does not require hardware and does not
+access an SD card:
+
+```powershell
+python -m unittest discover -s tests/mission_viewer -v
+```

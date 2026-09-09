@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "calculation.h"
 #include "clock_sync.h"
@@ -98,6 +99,28 @@ static bool s_test_stall_done;
 
 static esp_err_t close_files(void);
 static esp_err_t open_flight_files(void);
+
+static void timestamp_finished_mission(uint64_t utc_ms)
+{
+    static const char *const files[] = {
+        "RAW_SPECTRA.BIN", "REFLECTANCE.BIN", "GPS_TRACK.BIN",
+        "EVENTS.JSONL", "MISSION.JSON",
+    };
+    char path[64];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        int length = snprintf(path, sizeof(path), "%s/%s", s_directory,
+                              files[i]);
+        if (length <= 0 || (size_t)length >= sizeof(path) ||
+            sd_card_set_modified_time(path, utc_ms) != ESP_OK) {
+            /* Timestamp metadata is useful but must never downgrade a safely
+             * flushed scientific dataset or block power-off. */
+            ESP_LOGW(TAG, "Could not update mission timestamp for %s", files[i]);
+        }
+    }
+    if (sd_card_set_modified_time(s_directory, utc_ms) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not update mission directory timestamp");
+    }
+}
 
 static void remember_sky(const raw_spectrum_record_t *sky,
                          size_t *next, size_t *count)
@@ -1058,6 +1081,20 @@ esp_err_t measurement_recorder_shutdown(void)
         if (summary_result != ESP_OK) {
             note_storage_result(summary_result, "Final MISSION.JSON checkpoint");
             if (result == ESP_OK) result = summary_result;
+        }
+        record_time_t finished;
+        (void)clock_sync_timestamp(esp_timer_get_time(), &finished);
+        if (finished.valid_flags & RECORD_TIME_VALID_UTC) {
+            timestamp_finished_mission(finished.utc_ms);
+        } else {
+            /* The POSIX clock remains a useful holdover after a prior lock,
+             * even if the current A link has aged past clock_sync validity. */
+            time_t wall_seconds = time(NULL);
+            if (wall_seconds >= (time_t)1577836800) {
+                timestamp_finished_mission((uint64_t)wall_seconds * 1000ULL);
+            } else {
+                ESP_LOGW(TAG, "Mission timestamps left unchanged: UTC unavailable");
+            }
         }
     }
     taskENTER_CRITICAL(&s_lock);
