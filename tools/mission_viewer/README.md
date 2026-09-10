@@ -31,7 +31,8 @@ The main screen links three views:
 - Clicking a blue measurement point loads its reflectance spectrum into the
   measurement panel. Hovering shows its UTC and interpolated coordinates.
 - The flight panel shows mission identity, duration, segment and record counts,
-  CRC status, and a selectable list of located abnormal events.
+  CRC status, and a selectable list of located abnormal events. The readable
+  serial is display text; `drone_serial_hex` is shown as the canonical identity.
 
 The local metric map deliberately does not download internet map tiles. That
 makes the mission folder fully inspectable on an offline field computer while
@@ -111,7 +112,9 @@ The result includes both bracketing GPS indices, the interpolation fraction,
 gap duration, source sequence numbers, and a quality value of `exact`,
 `interpolated`, or `wide_gap`. It never extrapolates beyond the recorded track.
 Pass `max_gap_ms=...` to reject estimates spanning an outage that is too long
-for a particular analysis.
+for a particular analysis. The measurement panel also displays whether the
+position used synchronized A monotonic time (including its sync generation) or
+the B monotonic fallback.
 
 ## Local HTTP API
 
@@ -147,3 +150,7 @@ From the repository root:
 ```powershell
 python -m unittest discover -s tests/mission_viewer -v
 ```
+
+The suite includes an offscreen application-shell smoke test using a local map
+stub. It loads a synthetic mission and selects a spectrum without starting the
+Chromium map process or making a network request.

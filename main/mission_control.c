@@ -24,7 +24,7 @@ static size_t s_session_count;
 
 /* Error mapping is B-defined: 1 SD, 2 initialization, 3 acquisition/lifecycle,
  * 4 shutdown, 5 measurement-data degradation (decode failures, recorder
- * pressure drops, or rejected calculations; latched for the current session). */
+ * pressure drops, rejected calculations, or conflicting A identities). */
 static bool known_session(uint32_t session)
 {
     size_t count = s_session_count < SESSION_LIMIT ? s_session_count : SESSION_LIMIT;
@@ -97,7 +97,8 @@ void mission_control_get_status(ab_status_report_t *out)
     uint8_t error = s_error;
     if (!error && !recorder.healthy) error = 1;
     if (!error && (recorder.raw_dropped || recorder.gps_dropped ||
-                   recorder.events_dropped || recorder.calculation_rejected))
+                   recorder.events_dropped || recorder.calculation_rejected ||
+                   recorder.identity_mismatches))
         error = 5;
     if (!error && (acquisition.errors[0] || acquisition.errors[1])) error = 5;
     *out = (ab_status_report_t) {

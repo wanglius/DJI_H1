@@ -22,6 +22,8 @@ typedef struct {
     uint32_t gps_dropped;
     uint32_t events_dropped;
     uint32_t calculation_rejected;
+    /** Non-empty A-board serials that disagreed with the first canonical ID. */
+    uint32_t identity_mismatches;
     uint32_t write_errors;
     uint32_t flush_count;
     uint32_t flush_errors;
@@ -41,6 +43,7 @@ typedef enum {
     MEASUREMENT_EVENT_REFLECTANCE_REJECTED,
     MEASUREMENT_EVENT_CAPTURE_RESULT,
     MEASUREMENT_EVENT_FLIGHT_CLOSED,
+    MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH,
 } measurement_event_t;
 
 /** Create the fixed pools, sole SD writer task, and a new mission directory.
@@ -65,7 +68,10 @@ esp_err_t measurement_recorder_submit(spectrometer_role_t role,
                                       const h1_spectrum_frame_t *frame,
                                       int64_t b_timestamp_us);
 
-/** Queue one synchronized A-board realtime sample for GPS_TRACK.BIN. */
+/** Queue one synchronized A-board realtime sample for GPS_TRACK.BIN.
+ * The A/B RX task is the sole GPS producer. A future second producer must add
+ * submission serialization so queue order cannot differ from sequence order.
+ */
 esp_err_t measurement_recorder_submit_gps(const gps_record_t *record);
 
 /** Queue a structured operation event without blocking its producer. */
@@ -73,7 +79,10 @@ esp_err_t measurement_recorder_log_event(measurement_event_t event,
                                          uint32_t argument0,
                                          int32_t argument1);
 
-/** Cache the most recent accepted A-board identity for MISSION.JSON. */
+/** Cache A metadata and latch the first non-empty serial as mission identity.
+ * A later conflicting non-empty serial is counted and logged, never allowed to
+ * silently replace the canonical identity in MISSION.JSON.
+ */
 void measurement_recorder_note_handshake(const uint8_t drone_serial[32],
                                          uint16_t a_firmware_version,
                                          uint8_t drone_link);

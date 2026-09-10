@@ -31,6 +31,8 @@ class MeasurementPoint:
     utc_ms: int
     quality: str
     gps_gap_ms: float
+    time_domain: str
+    sync_generation: int | None
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class MissionMapModel:
 _CRITICAL_NAMES = {
     "protocol_crc_error", "protocol_timeout", "storage_error",
     "write_error", "flush_error", "acquisition_error", "rx_overrun",
+    "drone_identity_mismatch",
 }
 _WARNING_NAMES = {
     "clock_observation_drop", "reflectance_rejected", "frame_drop",
@@ -83,6 +86,11 @@ def event_severity(event: dict[str, Any]) -> str | None:
         return "critical"
     if name in _WARNING_NAMES or "rejected" in name or "drop" in name:
         return "warning"
+    if name == "capture_result":
+        try:
+            return "critical" if int(event.get("argument1", 0)) != 0 else None
+        except (TypeError, ValueError):
+            return "critical"
     if name == "stop_request":
         try:
             reason = int(event.get("argument1", 0))
@@ -90,7 +98,7 @@ def event_severity(event: dict[str, Any]) -> str | None:
             return None
         if reason in (3, 6, 7):  # low battery, manual abort, aircraft link loss
             return "critical"
-        if reason == 4:  # automatic landing
+        if reason in (2, 4):  # return-home or automatic landing
             return "warning"
     return None
 
@@ -128,7 +136,8 @@ def build_mission_map(mission: Mission) -> MissionMapModel:
                 position.latitude_deg, position.longitude_deg,
                 position.altitude_relative_m, index, ref.header.session_id,
                 ref.header.segment_id, info.calculation_count,
-                ref.header.utc_ms, position.quality, position.gap_ms))
+                ref.header.utc_ms, position.quality, position.gap_ms,
+                position.time_domain, position.sync_generation))
 
     events: list[MissionEventPoint] = []
     unlocated_events = 0

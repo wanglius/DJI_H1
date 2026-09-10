@@ -16,6 +16,12 @@ records and compared for command idempotence, but no bits are used for folder
 naming or mission grouping. A B-board reboot allocates another unused directory
 and therefore never appends restarted sequences to an old binary stream.
 
+`/FLIGHT.IDX` is a CRC-protected high-water hint for the next directory. It
+keeps normal boot allocation O(1) as the card accumulates missions. The new
+directory is still checked for existence, so a stale hint cannot overwrite a
+mission. Missing or corrupt index metadata falls back to the full safe scan;
+`FLIGHT.TMP` and `FLIGHT.BAK` support recoverable index replacement.
+
 Each flight directory contains:
 
 - `RAW_SPECTRA.BIN`: ground and sky H1 frames.
@@ -33,8 +39,10 @@ Each flight directory contains:
 
 The protocol intentionally provides no B-readable flight key: section 4.9 says
 that `session_id` is opaque. The B boot-to-poweroff lifecycle therefore defines
-the local flight directory. Handshake identity is cached into `MISSION.JSON`
-and the accepted handshake is the first normal `EVENTS.JSONL` lifecycle event.
+the local flight directory. The first non-empty handshake serial is latched as
+the canonical identity in `MISSION.JSON`; later conflicting serials cannot
+replace it and produce a `drone_identity_mismatch` event plus heartbeat error
+5. The hex serial is canonical, while the sanitized text is display-only.
 
 ## Timestamp
 
@@ -45,6 +53,12 @@ validity flags rather than interpreting a canonical zero as a valid value.
 `HOLDOVER` timestamps are extrapolated from the last accepted clock model.
 Their `sync_age_ms` increases with uncertainty; downstream processing must treat
 them as degraded rather than equivalent to freshly synchronized timestamps.
+
+`MISSION.JSON` freezes the first valid UTC projection of the directory-creation
+B timestamp. It records `started_sync_generation` and `started_sync_state` so a
+later clock-model reset cannot silently reinterpret mission start. The updated
+timestamp has matching generation/state fields and may legitimately belong to
+a later generation.
 
 ## Measurement interpretation and durability
 

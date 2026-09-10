@@ -58,6 +58,16 @@ def _utc_text(utc_ms: int) -> str:
         "%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
 
 
+def _time_domain_text(domain: str, generation: int | None) -> str:
+    if domain == "a_monotonic_ms":
+        suffix = (f", sync generation {generation}"
+                  if generation is not None else "")
+        return f"A monotonic{suffix}"
+    if domain == "b_monotonic_us":
+        return "B monotonic fallback"
+    return domain
+
+
 def _configure_application_font(app: QApplication) -> None:
     """Select a stable UI font, including Qt's headless Windows backend."""
 
@@ -297,7 +307,9 @@ class MissionMap(QWidget):
                 f"Reflectance #{measurement.calculation_count}\n"
                 f"{measurement.latitude_deg:.7f}, "
                 f"{measurement.longitude_deg:.7f}\n"
-                f"{_utc_text(measurement.utc_ms)}", self)
+                f"{_utc_text(measurement.utc_ms)}\n"
+                f"{_time_domain_text(measurement.time_domain, measurement.sync_generation)}",
+                self)
         elif map_event is not None:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             QToolTip.showText(event.globalPosition().toPoint(),
@@ -743,6 +755,8 @@ class MissionViewer(QMainWindow):
             ("Mission", summary.get("directory", mission.path.name)),
             ("State", summary.get("state", "unknown")),
             ("Drone", summary.get("drone_serial", "unknown")),
+            ("Canonical drone ID",
+             summary.get("drone_serial_hex", "unknown")),
             ("Firmware", summary.get("firmware_version", "unknown")),
             ("Started", _utc_text(start)),
             ("Duration", f"{duration:.1f} s"),
@@ -830,7 +844,8 @@ class MissionViewer(QMainWindow):
             position_text = (
                 f"{point.latitude_deg:.7f}, {point.longitude_deg:.7f} · "
                 f"altitude {point.altitude_relative_m:.2f} m · "
-                f"{point.quality}, GPS gap {point.gap_ms:.1f} ms")
+                f"{point.quality}, GPS gap {point.gap_ms:.1f} ms · "
+                f"{_time_domain_text(point.time_domain, point.sync_generation)}")
         self.spectrum_info.setText(
             f"<b>Reflectance calculation {info.calculation_count}</b> · "
             f"session {record.header.session_id}, "

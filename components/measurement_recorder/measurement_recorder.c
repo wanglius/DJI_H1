@@ -25,6 +25,10 @@ static const char *TAG = "MEAS_REC";
 #define FILE_HEADER_SIZE 16U
 #define SKY_HISTORY_COUNT 8U
 #define PERIODIC_FLUSH_MS 1500U
+#define FLIGHT_INDEX_MAGIC UINT32_C(0x31584946) /* little-endian "FIX1" */
+#define FLIGHT_INDEX_VERSION 1U
+#define FLIGHT_INDEX_FILE_SIZE 16U
+#define FLIGHT_INDEX_MAX 9999U
 
 typedef enum {
     MSG_RAW, MSG_GPS, MSG_EVENT, MSG_CHECKPOINT, MSG_BARRIER, MSG_FINALIZE
@@ -58,6 +62,7 @@ typedef struct {
     uint32_t gps_dropped;
     uint32_t events_dropped;
     uint32_t calculation_rejected;
+    uint32_t identity_mismatches;
     uint32_t write_errors;
     uint32_t flush_errors;
     uint32_t max_flush_us;
@@ -85,7 +90,9 @@ static sd_card_file_t *s_raw_file, *s_reflectance_file;
 static sd_card_file_t *s_gps_file, *s_event_file;
 static mission_totals_t s_totals;
 static record_time_t s_flight_started;
+static bool s_flight_start_time_frozen;
 static uint8_t s_drone_serial[32];
+static bool s_have_drone_identity;
 static uint16_t s_a_firmware_version;
 static uint8_t s_drone_link;
 /* Sole writer-task workspaces live in BSS to keep its stack bounded. */
@@ -119,6 +126,9 @@ static void timestamp_finished_mission(uint64_t utc_ms)
     }
     if (sd_card_set_modified_time(s_directory, utc_ms) != ESP_OK) {
         ESP_LOGW(TAG, "Could not update mission directory timestamp");
+    }
+    if (sd_card_set_modified_time("FLIGHT.IDX", utc_ms) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not update FLIGHT.IDX timestamp");
     }
 }
 
@@ -156,6 +166,15 @@ static void put32(uint8_t **p, uint32_t v)
 static void put64(uint8_t **p, uint64_t v)
 { for (unsigned i = 0; i < 8; i++) (*p)[i] = v >> (8 * i); *p += 8; }
 
+static uint16_t get16(const uint8_t *p)
+{ return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+
+static uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 static uint32_t crc32(const uint8_t *data, size_t length)
 {
     uint32_t crc = UINT32_MAX;
@@ -165,6 +184,102 @@ static uint32_t crc32(const uint8_t *data, size_t length)
             crc = (crc >> 1) ^ (0xEDB88320U & (uint32_t)-(int32_t)(crc & 1U));
     }
     return ~crc;
+}
+
+static void encode_flight_index(uint32_t next_index,
+                                uint8_t bytes[FLIGHT_INDEX_FILE_SIZE])
+{
+    uint8_t *p = bytes;
+    put32(&p, FLIGHT_INDEX_MAGIC);
+    put16(&p, FLIGHT_INDEX_VERSION);
+    put16(&p, 0);
+    put32(&p, next_index);
+    put32(&p, crc32(bytes, FLIGHT_INDEX_FILE_SIZE - 4U));
+}
+
+static bool decode_flight_index(const uint8_t bytes[FLIGHT_INDEX_FILE_SIZE],
+                                uint32_t *next_index)
+{
+    if (get32(bytes) != FLIGHT_INDEX_MAGIC ||
+        get16(bytes + 4) != FLIGHT_INDEX_VERSION ||
+        get16(bytes + 6) != 0 ||
+        get32(bytes + 12) != crc32(bytes, FLIGHT_INDEX_FILE_SIZE - 4U)) {
+        return false;
+    }
+    uint32_t candidate = get32(bytes + 8);
+    if (candidate < 1U || candidate > FLIGHT_INDEX_MAX + 1U) return false;
+    *next_index = candidate;
+    return true;
+}
+
+static bool flight_index_codec_self_test(void)
+{
+    uint8_t bytes[FLIGHT_INDEX_FILE_SIZE];
+    uint32_t decoded = 0;
+    encode_flight_index(4321, bytes);
+    if (!decode_flight_index(bytes, &decoded) || decoded != 4321) return false;
+    bytes[8] ^= 0x01;
+    return !decode_flight_index(bytes, &decoded);
+}
+
+static esp_err_t read_flight_index_file(const char *path,
+                                        uint32_t *next_index)
+{
+    bool exists = false;
+    esp_err_t result = sd_card_path_exists(path, &exists);
+    if (result != ESP_OK || !exists)
+        return result == ESP_OK ? ESP_ERR_NOT_FOUND : result;
+
+    sd_card_file_t *file = NULL;
+    result = sd_card_file_open(path, "rb", &file);
+    uint64_t size = 0;
+    if (result == ESP_OK) result = sd_card_file_size(file, &size);
+    uint8_t bytes[FLIGHT_INDEX_FILE_SIZE];
+    size_t read = 0;
+    if (result == ESP_OK && size != sizeof(bytes)) result = ESP_ERR_INVALID_SIZE;
+    if (result == ESP_OK) result = sd_card_file_read(file, bytes, sizeof(bytes), &read);
+    if (result == ESP_OK && read != sizeof(bytes)) result = ESP_ERR_INVALID_SIZE;
+    if (file != NULL) {
+        esp_err_t close_result = sd_card_file_close(file);
+        if (result == ESP_OK) result = close_result;
+    }
+    if (result == ESP_OK && !decode_flight_index(bytes, next_index))
+        result = ESP_ERR_INVALID_CRC;
+    return result;
+}
+
+static esp_err_t load_next_flight_index(uint32_t *next_index)
+{
+    esp_err_t primary = read_flight_index_file("FLIGHT.IDX", next_index);
+    if (primary == ESP_OK) return ESP_OK;
+    esp_err_t backup = read_flight_index_file("FLIGHT.BAK", next_index);
+    if (backup == ESP_OK) {
+        ESP_LOGW(TAG, "Recovered flight index from FLIGHT.BAK");
+        return ESP_OK;
+    }
+    return primary == ESP_ERR_NOT_FOUND ? backup : primary;
+}
+
+static esp_err_t store_next_flight_index(uint32_t next_index)
+{
+    uint8_t bytes[FLIGHT_INDEX_FILE_SIZE];
+    encode_flight_index(next_index, bytes);
+    sd_card_file_t *file = NULL;
+    esp_err_t result = sd_card_file_open("FLIGHT.TMP", "wb", &file);
+    size_t written = 0;
+    if (result == ESP_OK)
+        result = sd_card_file_write(file, bytes, sizeof(bytes), &written);
+    if (result == ESP_OK && written != sizeof(bytes)) result = ESP_FAIL;
+    if (result == ESP_OK) result = sd_card_file_flush(file);
+    if (file != NULL) {
+        esp_err_t close_result = sd_card_file_close(file);
+        if (result == ESP_OK) result = close_result;
+    }
+    if (result == ESP_OK) {
+        result = sd_card_replace_file("FLIGHT.TMP", "FLIGHT.IDX",
+                                      "FLIGHT.BAK");
+    }
+    return result;
 }
 
 static void serialize_time(uint8_t **p, const record_time_t *t)
@@ -263,6 +378,8 @@ static const char *event_name(measurement_event_t event)
     case MEASUREMENT_EVENT_REFLECTANCE_REJECTED: return "reflectance_rejected";
     case MEASUREMENT_EVENT_CAPTURE_RESULT: return "capture_result";
     case MEASUREMENT_EVENT_FLIGHT_CLOSED: return "flight_closed";
+    case MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH:
+        return "drone_identity_mismatch";
     default: return "unknown";
     }
 }
@@ -321,12 +438,27 @@ static esp_err_t write_mission_summary(const char *state)
     a_firmware = s_a_firmware_version;
     serial_strings(drone_serial_text, drone_serial_hex);
     flight_started = s_flight_started;
+    bool start_time_frozen = s_flight_start_time_frozen;
     taskEXIT_CRITICAL(&s_lock);
-    /* The directory is created before A time is available. Re-project its
-     * stable B timestamp once the clock model has locked so the final summary
-     * can still contain an absolute mission-start estimate. */
-    (void)clock_sync_timestamp((int64_t)flight_started.b_monotonic_us,
-                               &flight_started);
+
+    /* The directory precedes A time. Freeze the first valid projection so a
+     * later clock-model reset cannot silently rewrite the mission start UTC. */
+    if (!start_time_frozen) {
+        record_time_t candidate;
+        (void)clock_sync_timestamp((int64_t)flight_started.b_monotonic_us,
+                                   &candidate);
+        if (candidate.valid_flags & RECORD_TIME_VALID_UTC) {
+            taskENTER_CRITICAL(&s_lock);
+            if (!s_flight_start_time_frozen) {
+                s_flight_started = candidate;
+                s_flight_start_time_frozen = true;
+            }
+            flight_started = s_flight_started;
+            taskEXIT_CRITICAL(&s_lock);
+        } else {
+            flight_started = candidate;
+        }
+    }
     (void)clock_sync_timestamp(esp_timer_get_time(), &updated);
     const esp_app_desc_t *app = esp_app_get_description();
     int length = snprintf((char *)s_serial_buffer, sizeof(s_serial_buffer),
@@ -348,15 +480,20 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"started_b_monotonic_us\": %" PRIu64 ",\n"
         "  \"started_utc_ms\": %" PRIu64 ",\n"
         "  \"started_time_valid_flags\": %u,\n"
+        "  \"started_sync_generation\": %u,\n"
+        "  \"started_sync_state\": %u,\n"
         "  \"updated_b_monotonic_us\": %" PRIu64 ",\n"
         "  \"updated_utc_ms\": %" PRIu64 ",\n"
         "  \"updated_time_valid_flags\": %u,\n"
+        "  \"updated_sync_generation\": %u,\n"
+        "  \"updated_sync_state\": %u,\n"
         "  \"segments_completed\": %" PRIu32 ",\n"
         "  \"records\": {\"raw\": %" PRIu32 ", \"reflectance\": %" PRIu32
         ", \"gps\": %" PRIu32 ", \"events\": %" PRIu32 "},\n"
         "  \"drops\": {\"raw\": %" PRIu32 ", \"gps\": %" PRIu32
         ", \"events\": %" PRIu32 "},\n"
         "  \"calculation_rejected\": %" PRIu32 ",\n"
+        "  \"identity_mismatches\": %" PRIu32 ",\n"
         "  \"write_errors\": %" PRIu32 ",\n"
         "  \"flush_errors\": %" PRIu32 ",\n"
         "  \"max_flush_us\": %" PRIu32 "\n"
@@ -365,11 +502,14 @@ static esp_err_t write_mission_summary(const char *state)
         app ? app->version : "unknown", a_firmware, drone_link,
         drone_serial_text, drone_serial_hex, flight_started.b_monotonic_us,
         flight_started.utc_ms, flight_started.valid_flags,
+        flight_started.sync_generation, flight_started.sync_state,
         updated.b_monotonic_us, updated.utc_ms, updated.valid_flags,
+        updated.sync_generation, updated.sync_state,
         totals.segments_completed, totals.raw_written,
         totals.reflectance_written, totals.gps_written, totals.events_written,
         totals.raw_dropped, totals.gps_dropped, totals.events_dropped,
-        totals.calculation_rejected, totals.write_errors,
+        totals.calculation_rejected, totals.identity_mismatches,
+        totals.write_errors,
         totals.flush_errors, totals.max_flush_us);
     if (length <= 0 || (size_t)length >= sizeof(s_serial_buffer))
         return ESP_ERR_INVALID_SIZE;
@@ -648,6 +788,7 @@ periodic_flush:
 esp_err_t measurement_recorder_init(void)
 {
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
+    if (!flight_index_codec_self_test()) return ESP_FAIL;
 #if CONFIG_DJI_H1_TEST_FAULT_INJECTION && \
     CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS > 0
     ESP_LOGW(TAG, "TEST BUILD: recorder flush fault injection enabled (%d ms)",
@@ -720,16 +861,33 @@ static esp_err_t open_flight_files(void)
     /* session_id belongs to A and is opaque to B (protocol section 4.9).
      * Allocate a card-local mission number instead, once per B-board boot. */
     char path[56];
-    bool exists = false;
-    uint32_t flight_index;
-    for (flight_index = 1; flight_index <= 9999; flight_index++) {
+    uint32_t first_candidate = 1;
+    esp_err_t index_result = load_next_flight_index(&first_candidate);
+    if (index_result == ESP_OK) {
+        ESP_LOGI(TAG, "Flight index cache starts at %" PRIu32,
+                 first_candidate);
+    } else if (index_result != ESP_ERR_NOT_FOUND) {
+        /* The cache is only an accelerator. A corrupt/missing cache must never
+         * make an otherwise readable card unusable or overwrite a mission. */
+        ESP_LOGW(TAG, "Flight index cache invalid (%s); scanning from F_0001",
+                 esp_err_to_name(index_result));
+        first_candidate = 1;
+    }
+
+    bool found = false;
+    uint32_t flight_index = first_candidate;
+    for (; flight_index <= FLIGHT_INDEX_MAX; flight_index++) {
         snprintf(s_directory, sizeof(s_directory), "F_%04" PRIu32,
                  flight_index);
+        bool exists = false;
         result = sd_card_path_exists(s_directory, &exists);
         if (result != ESP_OK) return result;
-        if (!exists) break;
+        if (!exists) {
+            found = true;
+            break;
+        }
     }
-    if (exists) return ESP_ERR_NOT_FOUND;
+    if (!found) return ESP_ERR_NOT_FOUND;
     result = sd_card_mkdir(s_directory);
     if (result != ESP_OK) return result;
 
@@ -768,11 +926,23 @@ static esp_err_t open_flight_files(void)
     s_gps_sequence = s_event_sequence = 0;
     memset(&s_totals, 0, sizeof(s_totals));
     s_flight_started = flight_started;
+    s_flight_start_time_frozen =
+        (flight_started.valid_flags & RECORD_TIME_VALID_UTC) != 0;
+    memset(s_drone_serial, 0, sizeof(s_drone_serial));
+    s_have_drone_identity = false;
+    s_a_firmware_version = 0;
+    s_drone_link = 0;
     taskEXIT_CRITICAL(&s_lock);
     result = write_mission_summary("in_progress");
     if (result != ESP_OK) {
         (void)close_files();
         return result;
+    }
+    index_result = store_next_flight_index(flight_index + 1U);
+    if (index_result != ESP_OK) {
+        /* Losing the hint only makes a later boot scan directories again. */
+        ESP_LOGW(TAG, "Could not update FLIGHT.IDX: %s",
+                 esp_err_to_name(index_result));
     }
     taskENTER_CRITICAL(&s_lock);
     s_have_flight = true;
@@ -907,7 +1077,8 @@ esp_err_t measurement_recorder_log_event(measurement_event_t event,
                                          int32_t argument1)
 {
     if (event < MEASUREMENT_EVENT_HANDSHAKE ||
-        event > MEASUREMENT_EVENT_FLIGHT_CLOSED) return ESP_ERR_INVALID_ARG;
+        event > MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH)
+        return ESP_ERR_INVALID_ARG;
     taskENTER_CRITICAL(&s_lock);
     bool available = s_task != NULL && s_have_flight && s_accept_aux &&
                      s_event_file != NULL;
@@ -931,22 +1102,54 @@ esp_err_t measurement_recorder_log_event(measurement_event_t event,
     return ESP_OK;
 }
 
+static bool serial_is_empty(const uint8_t serial[32])
+{
+    for (size_t i = 0; i < 32; i++) {
+        if (serial[i] != 0) return false;
+    }
+    return true;
+}
+
 void measurement_recorder_note_handshake(const uint8_t drone_serial[32],
                                          uint16_t a_firmware_version,
                                          uint8_t drone_link)
 {
     if (drone_serial == NULL) return;
+    bool empty = serial_is_empty(drone_serial);
     taskENTER_CRITICAL(&s_lock);
-    bool changed = memcmp(s_drone_serial, drone_serial,
-                          sizeof(s_drone_serial)) != 0 ||
-                   s_a_firmware_version != a_firmware_version ||
-                   s_drone_link != drone_link;
-    memcpy(s_drone_serial, drone_serial, sizeof(s_drone_serial));
-    s_a_firmware_version = a_firmware_version;
-    s_drone_link = drone_link;
+    bool mismatch = s_have_drone_identity && !empty &&
+                    memcmp(s_drone_serial, drone_serial,
+                           sizeof(s_drone_serial)) != 0;
+    bool changed = false;
+    if (mismatch) {
+        s_totals.identity_mismatches++;
+    } else {
+        /* Protocol 4.1 allows the early handshake to carry an empty serial.
+         * Preserve a later canonical serial across link-down handshakes. */
+        if (!s_have_drone_identity && !empty) {
+            memcpy(s_drone_serial, drone_serial, sizeof(s_drone_serial));
+            s_have_drone_identity = true;
+            changed = true;
+        }
+        if (s_a_firmware_version != a_firmware_version ||
+            s_drone_link != drone_link) {
+            s_a_firmware_version = a_firmware_version;
+            s_drone_link = drone_link;
+            changed = true;
+        }
+    }
     taskEXIT_CRITICAL(&s_lock);
     (void)measurement_recorder_log_event(MEASUREMENT_EVENT_HANDSHAKE,
                                          a_firmware_version, drone_link);
+    if (mismatch) {
+        uint32_t conflicting_id_crc = crc32(drone_serial, 32);
+        (void)measurement_recorder_log_event(
+            MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH,
+            conflicting_id_crc, a_firmware_version);
+        ESP_LOGE(TAG, "Rejected conflicting A-board identity crc32=%08" PRIX32,
+                 conflicting_id_crc);
+        return;
+    }
     if (changed) {
         taskENTER_CRITICAL(&s_lock);
         bool available = s_task != NULL && s_have_flight && s_accept_aux;
@@ -1111,5 +1314,9 @@ esp_err_t measurement_recorder_shutdown(void)
 void measurement_recorder_get_status(measurement_recorder_status_t *out)
 {
     if (!out) return;
-    taskENTER_CRITICAL(&s_lock); *out = s_status; taskEXIT_CRITICAL(&s_lock);
+    taskENTER_CRITICAL(&s_lock);
+    *out = s_status;
+    /* Identity belongs to the boot-to-poweroff mission, not one segment. */
+    out->identity_mismatches = s_totals.identity_mismatches;
+    taskEXIT_CRITICAL(&s_lock);
 }

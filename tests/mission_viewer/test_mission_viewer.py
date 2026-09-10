@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.request import urlopen
 import zlib
 
@@ -76,7 +78,15 @@ def _make_mission(root: Path) -> None:
                 a_monotonic_ms=2_103),
     ])
     (root / "MISSION.JSON").write_text(
-        json.dumps({"schema_version": 1, "flight_index": 42}), encoding="utf-8")
+        json.dumps({
+            "schema_version": 1,
+            "flight_index": 42,
+            "drone_serial": "TEST_DRONE",
+            "drone_serial_hex": (
+                "544553545F44524F4E45" + "00" * (32 - len("TEST_DRONE"))),
+            "started_sync_generation": 3,
+            "updated_sync_generation": 3,
+        }), encoding="utf-8")
     (root / "EVENTS.JSONL").write_text(
         '{"sequence":1,"event":"handshake"}\n'
         '{"sequence":2,"event":"protocol_timeout",'
@@ -185,6 +195,8 @@ class MissionViewerTests(unittest.TestCase):
         self.assertEqual(len(model.measurements), 1)
         self.assertEqual(model.measurements[0].reflectance_index, 0)
         self.assertAlmostEqual(model.measurements[0].latitude_deg, 39.9000075)
+        self.assertEqual(model.measurements[0].time_domain, "a_monotonic_ms")
+        self.assertEqual(model.measurements[0].sync_generation, 3)
         self.assertEqual(len(model.events), 1)
         self.assertEqual(model.events[0].event_name, "protocol_timeout")
         self.assertEqual(model.events[0].severity, "critical")
@@ -198,6 +210,60 @@ class MissionViewerTests(unittest.TestCase):
             {"event": "stop_request", "argument1": 7}), "critical")
         self.assertEqual(event_severity(
             {"event": "stop_request", "argument1": 4}), "warning")
+        self.assertEqual(event_severity(
+            {"event": "stop_request", "argument1": 2}), "warning")
+        self.assertEqual(event_severity(
+            {"event": "capture_result", "argument1": -1}), "critical")
+        self.assertIsNone(event_severity(
+            {"event": "capture_result", "argument1": 0}))
+        self.assertEqual(event_severity(
+            {"event": "drone_identity_mismatch"}), "critical")
+
+    def test_gui_smoke_loads_synthetic_mission_offscreen(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PyQt6.QtCore import pyqtSignal
+            from PyQt6.QtWidgets import QApplication, QWidget
+            from dji_h1_viewer.ui import MissionViewer
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"PyQt GUI runtime unavailable: {exc}")
+
+        class OfflineMapStub(QWidget):
+            """Avoid Chromium: this smoke test covers the Qt application shell."""
+
+            measurement_selected = pyqtSignal(int)
+            event_selected = pyqtSignal(int)
+            status_changed = pyqtSignal(str)
+            status_text = "Offline test map"
+            baidu_available = False
+
+            def set_model(self, model) -> None:
+                self.model = model
+
+            def select_measurement(self, _index: int, **_kwargs) -> None:
+                pass
+
+            def focus_event(self, _index: int) -> None:
+                pass
+
+            def fit_route(self) -> None:
+                pass
+
+        app = QApplication.instance() or QApplication([])
+        with patch("dji_h1_viewer.ui.MissionMapPanel", OfflineMapStub):
+            viewer = MissionViewer(
+                MissionService(open_mission(self.root)), api_port=None)
+        try:
+            app.processEvents()
+            self.assertEqual(len(viewer.map_model.route), 2)
+            self.assertEqual(len(viewer.map_model.measurements), 1)
+            self.assertIn("544553545F44524F4E45", viewer.flight_info.text())
+            self.assertIn("A monotonic, sync generation 3",
+                          viewer.spectrum_info.text())
+            self.assertTrue(viewer.spectrum_plot._values)
+        finally:
+            viewer.close()
+            app.processEvents()
 
     def test_loads_baidu_ak_only_from_a_valid_local_credential(self) -> None:
         credential = self.root / "baidu.local.json"
