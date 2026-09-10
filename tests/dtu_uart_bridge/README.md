@@ -1,0 +1,107 @@
+# DTU UART bridge test firmware
+
+This standalone ESP-IDF application temporarily turns the ESP32-S3 into a
+transparent serial bridge:
+
+```text
+PC COM port <-> native USB Serial/JTAG <-> ESP32-S3 UART1 <-> 4G DTU
+                                               TX GPIO17 -> DTU RX
+                                               RX GPIO18 <- DTU TX
+```
+
+The DTU manual specifies default serial framing of **115200 baud, 8 data bits,
+no parity, 1 stop bit, and no flow control**. All bridge parameters are grouped
+in `main/dtu_bridge_config.h`.
+
+The bridge neither parses nor changes bytes. It emits one startup banner to the
+PC, then disables application logging so text or binary DTU traffic remains
+clean. If the PC closes the COM port, unread PC-bound data may be discarded;
+the firmware never blocks the DTU receive path indefinitely.
+
+## Build and flash
+
+From the repository root, with the ESP-IDF environment loaded:
+
+```powershell
+idf.py -C tests/dtu_uart_bridge -B build-dtu-bridge `
+    -DIDF_TARGET=esp32s3 build
+idf.py -C tests/dtu_uart_bridge -B build-dtu-bridge -p COM6 flash
+```
+
+Open COM6 at 115200 baud with a serial terminal. Commands typed on the PC are
+sent unchanged to the DTU, and bytes returned by the DTU are shown unchanged.
+AT commands normally require CRLF line endings. The DTU boots in transparent
+mode; follow the manual's guarded entry sequence before sending configuration
+AT commands.
+
+For a non-destructive status check, install `pyserial` and run:
+
+```powershell
+python tests/dtu_uart_bridge/probe_dtu.py --port COM6
+```
+
+The probe enters AT mode temporarily, reads cellular and MQTT settings, and
+returns to transparent mode. It intentionally does not query `MQAUTH1`, because
+that response contains the stored MQTT password.
+
+The EMQX endpoint can be checked independently of the DTU without installing an
+MQTT package:
+
+```powershell
+python tests/dtu_uart_bridge/mqtt_broker_probe.py `
+    --host mqtt.example.com --port 1883 --username device_test
+```
+
+This creates two short-lived, unique MQTT 3.1.1 clients, subscribes one client,
+publishes a unique payload from the other, verifies the received bytes, and
+disconnects both clients. It never uses or requests a password.
+
+After validating the broker, copy `dtu_mqtt_config.example.json` to
+`dtu_mqtt_config.local.json` and edit the local copy. The local file holds the
+server, port, device identity, credentials, topics, QoS, transport behavior,
+and MCU UART pin assignment. It is ignored by Git so deployment credentials do
+not enter a commit. The tracked example documents the complete schema without
+containing live settings.
+
+The DTU parser requires a non-empty password field even when the broker permits
+anonymous clients. Supply the real password for an authenticated listener, or
+a literal non-secret placeholder such as `unused` for an anonymous listener.
+The `mcu_uart` object documents the production wiring; this host utility does
+not reconfigure the ESP32 firmware.
+
+Validate the file without opening COM6 or changing the DTU:
+
+```powershell
+python tests/dtu_uart_bridge/configure_dtu_mqtt.py `
+    --config tests/dtu_uart_bridge/dtu_mqtt_config.local.json `
+    --validate-only
+```
+
+When the SIM is registered and the settings are ready to apply, run:
+
+```powershell
+python tests/dtu_uart_bridge/configure_dtu_mqtt.py `
+    --config tests/dtu_uart_bridge/dtu_mqtt_config.local.json
+```
+
+The initializer validates the entire JSON before opening the serial port. It
+then disables Socket A while changing its settings, enables it only after all
+commands succeed, and reboots the DTU because configuration changes take effect
+after restart. It never prints the `MQAUTH1` command or password. If any command
+fails, it stops immediately and exits AT mode without rebooting.
+
+After Socket A reports online, verify the complete transparent path in both
+directions:
+
+```powershell
+python tests/dtu_uart_bridge/verify_dtu_mqtt_path.py `
+    --serial-port COM6 --host mqtt.example.com --mqtt-port 1883 `
+    --username device_test
+```
+
+The verifier sends a unique serial payload through the DTU and confirms it on
+the configured uplink topic. It then publishes a different unique payload to
+the downlink topic and confirms the same bytes arrive on the serial port.
+
+Flashing this diagnostic image replaces the production application until the
+normal project firmware is flashed again.

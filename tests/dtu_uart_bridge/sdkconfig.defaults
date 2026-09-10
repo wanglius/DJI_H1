@@ -1,0 +1,11 @@
+# The PC-facing bridge endpoint is the ESP32-S3 native USB Serial/JTAG port.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Match the production project's 1 ms FreeRTOS tick.
+CONFIG_FREERTOS_HZ=1000
+
+# Keep boot diagnostics available, then the application disables logs before
+# forwarding arbitrary binary traffic.
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

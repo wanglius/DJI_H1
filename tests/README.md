@@ -15,6 +15,9 @@ milestone firmware selects them explicitly from `main/CMakeLists.txt`.
   PC-side A-board emulator. Its mission state and storage percentage are fake.
 - `h1_single_frame_test.c` is the original standalone `app_main` retained for
   regression diagnosis; it is not part of the normal build.
+- `dtu_uart_bridge/` is a standalone temporary firmware that bridges the native
+  USB Serial/JTAG COM port to the 4G DTU on UART1, GPIO17/GPIO18. It does not
+  build into or modify the production application.
 
 Hardware tests may write to the inserted card. Never run them with irreplaceable
 media unless the named test files have been backed up.

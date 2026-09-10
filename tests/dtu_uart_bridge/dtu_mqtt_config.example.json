@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "bridge": {
+    "port": "COM6",
+    "baud_rate": 115200
+  },
+  "mcu_uart": {
+    "controller": 1,
+    "tx_gpio": 17,
+    "rx_gpio": 18,
+    "baud_rate": 115200,
+    "data_bits": 8,
+    "stop_bits": 1,
+    "parity": "NONE",
+    "flow_control": "NONE"
+  },
+  "mqtt": {
+    "socket": "1A",
+    "enabled": true,
+    "host": "mqtt.example.com",
+    "port": 1883,
+    "protocol_version": 4,
+    "clean_session": true,
+    "keepalive_seconds": 120,
+    "mode": "STD",
+    "client_id": "DJI_H1_001",
+    "username": "DJI_H1_001",
+    "password": "replace-with-password-or-unused",
+    "publish": {
+      "enabled": true,
+      "topic": "dji-h1/test/up",
+      "qos": 0,
+      "retain": false
+    },
+    "subscribe": {
+      "enabled": true,
+      "topic": "dji-h1/test/down",
+      "qos": 0
+    }
+  },
+  "transport": {
+    "offline_cache": false,
+    "uplink_conversion": "RAW",
+    "downlink_conversion": "RAW",
+    "registration_mode": "OFF",
+    "heartbeat_mode": "OFF"
+  }
+}
