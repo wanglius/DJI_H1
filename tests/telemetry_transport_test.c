@@ -148,6 +148,13 @@ esp_err_t telemetry_transport_self_test(void)
                                &decoded_ack) == ESP_ERR_INVALID_CRC,
           "cloud acknowledgement CRC rejection");
 
+    expected_ack.status = 7;
+    CHECK(telemetry_ack_encode(&expected_ack, encoded_ack) == ESP_OK &&
+              telemetry_ack_decode(encoded_ack, sizeof(encoded_ack),
+                                   &decoded_ack) == ESP_OK &&
+              decoded_ack.status == 7,
+          "negative cloud acknowledgement round trip");
+
     ESP_LOGI(TAG, "TELEMETRY FRAGMENTATION SELF-TEST PASSED");
     return ESP_OK;
 }

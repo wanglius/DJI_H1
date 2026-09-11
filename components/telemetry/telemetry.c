@@ -144,6 +144,53 @@ static void append_downlink(const uint8_t *bytes, size_t length)
     }
 }
 
+static void note_mismatched_ack(const telemetry_ack_t *ack,
+                                const telemetry_fragment_plan_t *plan)
+{
+    taskENTER_CRITICAL(&s_lock);
+    uint32_t count = ++s_status.acknowledgements_mismatched;
+    s_status.acknowledgement_rejected++;
+    taskEXIT_CRITICAL(&s_lock);
+
+    /* A delayed duplicate ACK is harmless, but retaining both keys in a
+     * rate-limited diagnostic makes it distinguishable from a cloud NACK. */
+    if (count == 1 || count % 100U == 0) {
+        ESP_LOGW(TAG,
+                 "Ignoring mismatched ACK #%lu: got src=%016llX mission=%016llX "
+                 "type=%u seq=%lu crc=%08lX; expected src=%016llX "
+                 "mission=%016llX type=%u seq=%lu crc=%08lX",
+                 (unsigned long)count,
+                 (unsigned long long)ack->source_id,
+                 (unsigned long long)ack->mission_id,
+                 (unsigned)ack->message_type,
+                 (unsigned long)ack->message_sequence,
+                 (unsigned long)ack->message_crc32,
+                 (unsigned long long)plan->source_id,
+                 (unsigned long long)plan->mission_id,
+                 (unsigned)plan->message_type,
+                 (unsigned long)plan->message_sequence,
+                 (unsigned long)plan->payload_crc32);
+    }
+}
+
+static void note_negative_ack(const telemetry_ack_t *ack)
+{
+    taskENTER_CRITICAL(&s_lock);
+    uint32_t count = ++s_status.acknowledgements_negative;
+    s_status.acknowledgement_rejected++;
+    taskEXIT_CRITICAL(&s_lock);
+
+    if (count == 1 || count % 100U == 0) {
+        ESP_LOGW(TAG,
+                 "Cloud rejected message ACK #%lu: status=%u type=%u seq=%lu "
+                 "crc=%08lX",
+                 (unsigned long)count, (unsigned)ack->status,
+                 (unsigned)ack->message_type,
+                 (unsigned long)ack->message_sequence,
+                 (unsigned long)ack->message_crc32);
+    }
+}
+
 static esp_err_t wait_for_ack(const telemetry_fragment_plan_t *plan)
 {
     TickType_t timeout = pdMS_TO_TICKS(s_config.ack_timeout_ms);
@@ -158,15 +205,11 @@ static esp_err_t wait_for_ack(const telemetry_fragment_plan_t *plan)
                 ack.message_sequence == plan->message_sequence &&
                 ack.message_crc32 == plan->payload_crc32;
             if (!matches) {
-                taskENTER_CRITICAL(&s_lock);
-                s_status.acknowledgement_rejected++;
-                taskEXIT_CRITICAL(&s_lock);
+                note_mismatched_ack(&ack, plan);
                 continue;
             }
             if (ack.status != 0) {
-                taskENTER_CRITICAL(&s_lock);
-                s_status.acknowledgement_rejected++;
-                taskEXIT_CRITICAL(&s_lock);
+                note_negative_ack(&ack);
                 return ESP_ERR_INVALID_RESPONSE;
             }
             taskENTER_CRITICAL(&s_lock);
@@ -514,6 +557,27 @@ esp_err_t telemetry_submit_reflectance(const reflectance_record_t *record)
     return result;
 }
 
+static bool mission_queues_drained(void)
+{
+    /* Admission is already closed before this helper is used. Checking the
+     * worker/submitter guards on both sides of the queue snapshot prevents an
+     * empty queue from being mistaken for idle while its item is being moved
+     * into or out of task-local storage. */
+    taskENTER_CRITICAL(&s_lock);
+    bool idle_before = !s_sending && s_submitters == 0;
+    taskEXIT_CRITICAL(&s_lock);
+    if (!idle_before) return false;
+
+    bool empty = uxQueueMessagesWaiting(s_gps_queue) == 0 &&
+                 uxQueueMessagesWaiting(s_reflectance_queue) == 0;
+    if (!empty) return false;
+
+    taskENTER_CRITICAL(&s_lock);
+    bool idle_after = !s_sending && s_submitters == 0;
+    taskEXIT_CRITICAL(&s_lock);
+    return idle_after;
+}
+
 esp_err_t telemetry_finish_mission(uint32_t timeout_ms)
 {
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
@@ -528,14 +592,11 @@ esp_err_t telemetry_finish_mission(uint32_t timeout_ms)
 
     TickType_t started = xTaskGetTickCount();
     while (true) {
-        taskENTER_CRITICAL(&s_lock);
-        bool sending = s_sending;
-        bool submitters = s_submitters != 0;
-        taskEXIT_CRITICAL(&s_lock);
-        bool empty = uxQueueMessagesWaiting(s_gps_queue) == 0 &&
-                     uxQueueMessagesWaiting(s_reflectance_queue) == 0;
-        if (empty && !sending && !submitters) return ESP_OK;
+        if (mission_queues_drained()) return ESP_OK;
         if (xTaskGetTickCount() - started >= timeout_ticks) {
+            /* The worker may have completed between the loop check and the
+             * deadline. Never report a fault from that boundary race. */
+            if (mission_queues_drained()) return ESP_OK;
             taskENTER_CRITICAL(&s_lock);
             s_status.drain_timeouts++;
             taskEXIT_CRITICAL(&s_lock);

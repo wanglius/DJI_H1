@@ -45,7 +45,13 @@ typedef struct {
     uint32_t messages_retried;
     uint32_t acknowledgements_received;
     uint32_t acknowledgement_timeouts;
+    /** Backward-compatible aggregate of mismatched and explicit negative
+     * acknowledgements. Prefer the two diagnostic counters below. */
     uint32_t acknowledgement_rejected;
+    /** Valid DTA1 frames that belong to another/stale logical message. */
+    uint32_t acknowledgements_mismatched;
+    /** Matching DTA1 frames whose application status is nonzero. */
+    uint32_t acknowledgements_negative;
     /** Logical messages that exhausted all delivery attempts. */
     uint32_t messages_failed;
     uint32_t serialization_errors;

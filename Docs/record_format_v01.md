@@ -37,6 +37,11 @@ Each flight directory contains:
   through `MISSION.TMP`; an interrupted replacement may leave `MISSION.BAK` as
   the recoverable prior checkpoint.
 
+Within its `telemetry` object, `acknowledgement_rejected` is retained as the
+backward-compatible total of `acknowledgements_mismatched` (valid ACK for a
+different or stale message key) and `acknowledgements_negative` (matching ACK
+with a nonzero cloud application status).
+
 The protocol intentionally provides no B-readable flight key: section 4.9 says
 that `session_id` is opaque. The B boot-to-poweroff lifecycle therefore defines
 the local flight directory. The first non-empty handshake serial is latched as

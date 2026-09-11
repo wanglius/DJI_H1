@@ -113,6 +113,14 @@ class TelemetryTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(FragmentError, "acknowledgement CRC"):
             decode_acknowledgement(damaged)
 
+    def test_negative_cloud_acknowledgement_preserves_status(self) -> None:
+        fragment, = fragment_message(MESSAGE_GPS, 7, 12, _payload(98))
+        message = TelemetryReassembler().push(fragment)
+        self.assertIsNotNone(message)
+        assert message is not None
+        encoded = encode_acknowledgement(message, status=7)
+        self.assertEqual(decode_acknowledgement(encoded).status, 7)
+
     def test_rejects_corrupt_fragment_crc(self) -> None:
         fragment, = fragment_message(MESSAGE_GPS, 1, 2, _payload(98))
         damaged = bytearray(fragment)

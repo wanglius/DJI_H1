@@ -469,6 +469,8 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"acknowledgements_received\": %" PRIu32
         ", \"acknowledgement_timeouts\": %" PRIu32
         ", \"acknowledgement_rejected\": %" PRIu32
+        ", \"acknowledgements_mismatched\": %" PRIu32
+        ", \"acknowledgements_negative\": %" PRIu32
         ", \"messages_failed\": %" PRIu32
         ", \"serialization_errors\": %" PRIu32
         ", \"uart_errors\": %" PRIu32
@@ -502,6 +504,8 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.messages_retried, telemetry.acknowledgements_received,
         telemetry.acknowledgement_timeouts,
         telemetry.acknowledgement_rejected,
+        telemetry.acknowledgements_mismatched,
+        telemetry.acknowledgements_negative,
         telemetry.messages_failed, telemetry.serialization_errors,
         telemetry.uart_errors, telemetry.drain_timeouts,
         telemetry.downlink_bytes_received, telemetry.source_id,

@@ -108,11 +108,20 @@ for this acknowledgement and retries the entire logical message once on a
 timeout. Identical retransmissions are safe because the receiver deduplicates
 them and repeats the acknowledgement.
 
+Sender diagnostics distinguish a valid but stale/mismatched ACK from a matching
+ACK whose application status is nonzero. `acknowledgement_rejected` remains in
+`MISSION.JSON` as the backward-compatible sum of both cases, while
+`acknowledgements_mismatched` and `acknowledgements_negative` identify the
+cause. Mismatched keys are logged with the received and expected message
+identity at a rate-limited cadence.
+
 At final power-off, recorder admission closes first, then a bounded telemetry
 barrier waits for the latest queued GPS/reflectance records to drain into the
 DTU UART and receive their cloud acknowledgements before the final mission
 summary is written. A timeout is reported as an unsafe shutdown instead of
-claiming that pending bytes were delivered.
+claiming that pending bytes were delivered. The timeout boundary performs one
+final guarded queue/worker check so completion concurrent with the deadline is
+not misreported as a drain failure.
 
 Each encoded fragment should be submitted to the ESP32 UART in one call. After
 the UART drains, the sender leaves the configured conservative gap. This often
