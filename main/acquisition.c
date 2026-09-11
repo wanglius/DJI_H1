@@ -147,7 +147,8 @@ static void acquisition_task(void *arg)
         taskEXIT_CRITICAL(&s_status_lock);
         esp_err_t record_result = measurement_recorder_submit(
             sensor_index == 0 ? SPECTROMETER_GROUND : SPECTROMETER_SKY,
-            ctx->frames_ok, &ctx->frame, now_us);
+            ctx->frames_ok, &ctx->frame, now_us,
+            !__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE));
         if (record_result == ESP_ERR_NO_MEM) {
             /* Preserve the flight: frame_count makes this explicit gap
              * detectable, and recorder status exposes accumulated pressure. */
@@ -341,8 +342,25 @@ static esp_err_t create_tasks(void)
     return ESP_OK;
 }
 
-static esp_err_t stop_acquisition_tasks(void)
+static esp_err_t stop_reader_stream(sensor_context_t *ctx,
+                                    bool *stream_started)
 {
+    if (!*stream_started) return ESP_OK;
+    ESP_LOGI(TAG, "Stopping %s stream after its reader exited", ctx->name);
+    esp_err_t result = h1_stop_stream(&ctx->device);
+    if (result == ESP_OK) {
+        *stream_started = false;
+    } else {
+        ESP_LOGE(TAG, "%s stop failed: %s", ctx->name,
+                 esp_err_to_name(result));
+    }
+    return result;
+}
+
+static esp_err_t stop_acquisition_tasks(bool stream_started[SENSOR_COUNT],
+                                        bool *all_tasks_stopped)
+{
+    *all_tasks_stopped = false;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         __atomic_store_n(&s_sensors[i].run, false, __ATOMIC_RELEASE);
         if (s_sensors[i].task_created && !s_sensors[i].gate_released) {
@@ -351,19 +369,60 @@ static esp_err_t stop_acquisition_tasks(void)
         }
     }
 
-    esp_err_t result = ESP_OK;
+    bool waiting[SENSOR_COUNT] = {false, false};
+    size_t pending = 0;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
-        if (!s_sensors[i].task_created) continue;
-        if (xSemaphoreTake(s_sensors[i].done,
-                           pdMS_TO_TICKS(6000)) != pdTRUE) {
-            ESP_LOGE(TAG, "%s did not stop within 6 seconds; task retained",
-                     s_sensors[i].name);
-            result = ESP_ERR_TIMEOUT;
-        } else {
+        waiting[i] = s_sensors[i].task_created;
+        if (waiting[i]) pending++;
+    }
+
+    esp_err_t result = ESP_OK;
+    int64_t deadline_us = esp_timer_get_time() + 6000000;
+    while (pending != 0) {
+        for (size_t i = 0; i < SENSOR_COUNT; i++) {
+            if (!waiting[i] ||
+                xSemaphoreTake(s_sensors[i].done, 0) != pdTRUE) {
+                continue;
+            }
+            waiting[i] = false;
+            pending--;
             s_sensors[i].task = NULL;
             s_sensors[i].task_created = false;
+
+            /* Stop a completed reader's device immediately. With asymmetric
+             * exposures, waiting for the other task can otherwise fill this
+             * channel's abandoned software buffer. */
+            esp_err_t stop_result = stop_reader_stream(
+                &s_sensors[i], &stream_started[i]);
+            if (stop_result != ESP_OK && result == ESP_OK) {
+                result = stop_result;
+            }
+        }
+        if (pending == 0) break;
+        if (esp_timer_get_time() >= deadline_us) {
+            for (size_t i = 0; i < SENSOR_COUNT; i++) {
+                if (waiting[i]) {
+                    ESP_LOGE(TAG,
+                             "%s did not stop within 6 seconds; task retained",
+                             s_sensors[i].name);
+                }
+            }
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1);
+    }
+
+    /* Any remaining stream has no reader: either task setup was partial or
+     * the first stop attempt failed after its reader exited. Retry safely. */
+    for (size_t i = 0; i < SENSOR_COUNT; i++) {
+        if (!stream_started[i]) continue;
+        esp_err_t stop_result = stop_reader_stream(
+            &s_sensors[i], &stream_started[i]);
+        if (stop_result != ESP_OK && result == ESP_OK) {
+            result = stop_result;
         }
     }
+    *all_tasks_stopped = true;
     return result;
 }
 
@@ -514,27 +573,20 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
         vTaskDelay(1);
     }
 
-    ESP_LOGI(TAG, "Requesting both acquisition tasks to stop");
-    result = stop_acquisition_tasks();
-    if (result != ESP_OK) goto cleanup;
-    tasks_stopped = true;
-
     uint32_t acquisition_overruns[SENSOR_COUNT], shutdown_overruns[SENSOR_COUNT];
     uint32_t acquisition_drops[SENSOR_COUNT], shutdown_drops[SENSOR_COUNT];
+    /* Snapshot while both reader tasks still own their live streams. Bytes
+     * received after this point are shutdown traffic, not acquisition loss. */
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         acquisition_overruns[i] = sc16_get_channel_rx_overrun_count(s_sensors[i].channel);
         acquisition_drops[i] = sc16_get_software_rx_drop_count(s_sensors[i].channel);
     }
-    for (size_t i = 0; i < SENSOR_COUNT; i++) {
-        ESP_LOGI(TAG, "Stopping %s stream", s_sensors[i].name);
-        esp_err_t stop_ret = h1_stop_stream(&s_sensors[i].device);
-        if (stop_ret != ESP_OK) {
-            ESP_LOGE(TAG, "%s stop failed: %s", s_sensors[i].name,
-                     esp_err_to_name(stop_ret));
-            if (result == ESP_OK) result = stop_ret;
-        }
-        if (stop_ret == ESP_OK) stream_started[i] = false;
-    }
+    ESP_LOGI(TAG, "Requesting both acquisition tasks to stop");
+    /* Also covers duration-based test stops, ensuring any frame that completes
+     * during coordinated teardown is recorded raw without reflectance pairing. */
+    acquisition_request_stop();
+    result = stop_acquisition_tasks(stream_started, &tasks_stopped);
+    if (result != ESP_OK) goto cleanup;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         uint32_t total = sc16_get_channel_rx_overrun_count(s_sensors[i].channel);
         shutdown_overruns[i] = total - acquisition_overruns[i];
@@ -560,10 +612,9 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
 
 cleanup:
     if (!tasks_stopped) {
-        esp_err_t stop_ret = stop_acquisition_tasks();
-        if (stop_ret == ESP_OK) {
-            tasks_stopped = true;
-        } else if (result == ESP_OK) {
+        esp_err_t stop_ret = stop_acquisition_tasks(stream_started,
+                                                    &tasks_stopped);
+        if (stop_ret != ESP_OK && result == ESP_OK) {
             result = stop_ret;
         }
     }

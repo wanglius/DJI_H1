@@ -38,7 +38,8 @@ class HardwareReportTests(unittest.TestCase):
         log = self.log + (
             'Segment recorded: raw=52 reflectance=13 dropped=0 rejected=0 '
             'write_errors=0 flushes=8 flush_errors=0 max_flush=12000us '
-            'queue_hwm=3 gps=200 gps_dropped=0 events=3 events_dropped=0\n'
+            'queue_hwm=3 gps=200 gps_dropped=0 events=3 events_dropped=0 '
+            'shutdown_skipped=1\n'
             'Segment recorded: raw=12 reflectance=3 dropped=0 rejected=0 '
             'write_errors=0 flushes=1 flush_errors=0 max_flush=9000us '
             'queue_hwm=2 gps=50 gps_dropped=0 events=3 events_dropped=0\n')

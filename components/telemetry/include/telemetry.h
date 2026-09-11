@@ -29,6 +29,8 @@ typedef struct {
 
 typedef struct {
     bool initialized;
+    /** False only after a local infrastructure/software fault. Delivery
+     * pressure and exhausted cloud retries are tracked separately below. */
     bool healthy;
     uint64_t source_id;
     uint64_t mission_id;
@@ -44,8 +46,11 @@ typedef struct {
     uint32_t acknowledgements_received;
     uint32_t acknowledgement_timeouts;
     uint32_t acknowledgement_rejected;
+    /** Logical messages that exhausted all delivery attempts. */
     uint32_t messages_failed;
+    uint32_t serialization_errors;
     uint32_t uart_errors;
+    uint32_t drain_timeouts;
     uint32_t downlink_bytes_received;
 } telemetry_status_t;
 
@@ -61,7 +66,8 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id);
 
 /** GPS is a nonblocking latest-value submission at the configured rate.
  * Reflectance uses a bounded FIFO: it never silently overwrites an older
- * result, and a full queue returns ESP_ERR_NO_MEM and latches unhealthy.
+ * result, and a full queue returns ESP_ERR_NO_MEM and counts a dropped live
+ * telemetry record without stopping later submissions or SD recording.
  */
 esp_err_t telemetry_submit_gps(const gps_record_t *record);
 esp_err_t telemetry_submit_reflectance(

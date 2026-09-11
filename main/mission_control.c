@@ -25,8 +25,8 @@ static size_t s_session_count;
 
 /* Error mapping is B-defined: 1 SD, 2 initialization, 3 acquisition/lifecycle,
  * 4 shutdown, 5 measurement-data degradation (decode failures, recorder
- * pressure drops, rejected calculations, telemetry UART failure, or
- * conflicting A identities). */
+ * pressure drops, rejected calculations, telemetry delivery degradation or
+ * infrastructure failure, or conflicting A identities). */
 static bool known_session(uint32_t session)
 {
     size_t count = s_session_count < SESSION_LIMIT ? s_session_count : SESSION_LIMIT;
@@ -105,7 +105,12 @@ void mission_control_get_status(ab_status_report_t *out)
                    recorder.identity_mismatches))
         error = 5;
     if (!error && (acquisition.errors[0] || acquisition.errors[1])) error = 5;
-    if (!error && telemetry.initialized && !telemetry.healthy) error = 5;
+    /* Delivery loss is mission degradation, not a recorder stop condition.
+     * Keep it visible to A while later SD and telemetry submissions continue. */
+    if (!error && telemetry.initialized &&
+        (!telemetry.healthy || telemetry.messages_failed ||
+         telemetry.reflectance_queue_overflows))
+        error = 5;
     *out = (ab_status_report_t) {
         .b_state = error ? 2 : (s_initialized ? 1 : 0),
         .actual_capture = acquisition.capturing,

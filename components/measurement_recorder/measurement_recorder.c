@@ -47,6 +47,7 @@ typedef struct {
 } operation_event_t;
 typedef struct {
     message_type_t type;
+    bool allow_reflectance;
     union {
         raw_spectrum_record_t *raw;
         gps_record_t gps;
@@ -64,6 +65,7 @@ typedef struct {
     uint32_t gps_dropped;
     uint32_t events_dropped;
     uint32_t calculation_rejected;
+    uint32_t reflectance_skipped_shutdown;
     uint32_t identity_mismatches;
     uint32_t write_errors;
     uint32_t flush_errors;
@@ -396,6 +398,10 @@ static esp_err_t write_mission_summary(const char *state)
     bool start_time_frozen = s_flight_start_time_frozen;
     taskEXIT_CRITICAL(&s_lock);
     telemetry_get_status(&telemetry);
+    bool telemetry_delivery_degraded =
+        telemetry.messages_failed != 0 ||
+        telemetry.reflectance_queue_overflows != 0 ||
+        telemetry.drain_timeouts != 0;
 
     /* The directory precedes A time. Freeze the first valid projection so a
      * later clock-model reset cannot silently rewrite the mission start UTC. */
@@ -450,7 +456,10 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"drops\": {\"raw\": %" PRIu32 ", \"gps\": %" PRIu32
         ", \"events\": %" PRIu32 "},\n"
         "  \"calculation_rejected\": %" PRIu32 ",\n"
-        "  \"telemetry\": {\"gps_submitted\": %" PRIu32
+        "  \"reflectance_skipped_shutdown\": %" PRIu32 ",\n"
+        "  \"telemetry\": {\"infrastructure_healthy\": %s"
+        ", \"delivery_degraded\": %s"
+        ", \"gps_submitted\": %" PRIu32
         ", \"gps_sent\": %" PRIu32 ", \"gps_superseded\": %" PRIu32
         ", \"reflectance_submitted\": %" PRIu32
         ", \"reflectance_sent\": %" PRIu32
@@ -460,7 +469,10 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"acknowledgements_received\": %" PRIu32
         ", \"acknowledgement_timeouts\": %" PRIu32
         ", \"acknowledgement_rejected\": %" PRIu32
-        ", \"messages_failed\": %" PRIu32 ", \"uart_errors\": %" PRIu32
+        ", \"messages_failed\": %" PRIu32
+        ", \"serialization_errors\": %" PRIu32
+        ", \"uart_errors\": %" PRIu32
+        ", \"drain_timeouts\": %" PRIu32
         ", \"downlink_bytes\": %" PRIu32
         ", \"source_id\": \"%016" PRIX64 "\""
         "},\n"
@@ -480,7 +492,9 @@ static esp_err_t write_mission_summary(const char *state)
         totals.segments_completed, totals.raw_written,
         totals.reflectance_written, totals.gps_written, totals.events_written,
         totals.raw_dropped, totals.gps_dropped, totals.events_dropped,
-        totals.calculation_rejected,
+        totals.calculation_rejected, totals.reflectance_skipped_shutdown,
+        telemetry.healthy ? "true" : "false",
+        telemetry_delivery_degraded ? "true" : "false",
         telemetry.gps_submitted, telemetry.gps_sent,
         telemetry.gps_superseded, telemetry.reflectance_submitted,
         telemetry.reflectance_sent, telemetry.reflectance_queue_overflows,
@@ -488,7 +502,8 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.messages_retried, telemetry.acknowledgements_received,
         telemetry.acknowledgement_timeouts,
         telemetry.acknowledgement_rejected,
-        telemetry.messages_failed, telemetry.uart_errors,
+        telemetry.messages_failed, telemetry.serialization_errors,
+        telemetry.uart_errors, telemetry.drain_timeouts,
         telemetry.downlink_bytes_received, telemetry.source_id,
         totals.identity_mismatches,
         totals.write_errors,
@@ -707,13 +722,26 @@ static void writer_task(void *unused)
         raw_spectrum_record_t *raw = message.data.raw;
         esp_err_t result = write_raw(raw);
         note_write_result(result, false);
-        if (result == ESP_OK && raw->spectrometer_role == SPECTROMETER_SKY) {
+        if (result == ESP_OK && raw->spectrometer_role == SPECTROMETER_SKY &&
+            message.allow_reflectance) {
             /* Producers run independently, so queue arrival order is not
              * guaranteed to match acquisition timestamps. Keep enough recent
              * references to find the true predecessor of each ground frame. */
             remember_sky(raw, &sky_next, &sky_count);
         } else if (result == ESP_OK &&
                    raw->spectrometer_role == SPECTROMETER_GROUND) {
+            if (!message.allow_reflectance) {
+                /* A stop may arrive while a long ground exposure is already
+                 * in flight. Preserve that scientifically valid raw frame,
+                 * but do not diagnose its deliberately stopped sky reference
+                 * as a calculation failure. */
+                taskENTER_CRITICAL(&s_lock);
+                s_status.reflectance_skipped_shutdown++;
+                s_totals.reflectance_skipped_shutdown++;
+                taskEXIT_CRITICAL(&s_lock);
+                xQueueSend(s_free_queue, &raw, portMAX_DELAY);
+                continue;
+            }
             const raw_spectrum_record_t *sky =
                 find_sky_for_ground(raw, sky_count);
             if (sky == NULL) {
@@ -734,7 +762,10 @@ static void writer_task(void *unused)
                 note_write_result(write_reflectance(&s_calculated), true);
                 esp_err_t telemetry_result = telemetry_submit_reflectance(
                     &s_calculated);
-                if (telemetry_result != ESP_OK) {
+                /* Queue pressure is counted and rate-limited inside telemetry;
+                 * avoid turning a recoverable DTU slowdown into log flooding. */
+                if (telemetry_result != ESP_OK &&
+                    telemetry_result != ESP_ERR_NO_MEM) {
                     ESP_LOGW(TAG, "Reflectance telemetry rejected: %s",
                              esp_err_to_name(telemetry_result));
                 }
@@ -984,7 +1015,8 @@ esp_err_t measurement_recorder_begin(uint32_t session_id, uint16_t segment_id)
 esp_err_t measurement_recorder_submit(spectrometer_role_t role,
                                       uint32_t frame_count,
                                       const h1_spectrum_frame_t *frame,
-                                      int64_t b_timestamp_us)
+                                      int64_t b_timestamp_us,
+                                      bool allow_reflectance)
 {
     if (frame == NULL || frame->sample_count == 0 ||
         frame->sample_count > H1_MAX_SPECTRUM_SAMPLES) return ESP_ERR_INVALID_ARG;
@@ -1025,7 +1057,11 @@ esp_err_t measurement_recorder_submit(spectrometer_role_t role,
     if (frame->exposure_status == H1_EXPOSURE_STATUS_UNDER)
         raw->frame_quality |= RAW_QUALITY_UNDEREXPOSED;
     memcpy(raw->samples, frame->spectrum, frame->sample_count * sizeof(uint16_t));
-    message_t message = {.type = MSG_RAW, .data.raw = raw};
+    message_t message = {
+        .type = MSG_RAW,
+        .allow_reflectance = allow_reflectance,
+        .data.raw = raw,
+    };
     if (xQueueSend(s_writer_queue, &message, 0) != pdTRUE) {
         xQueueSend(s_free_queue, &raw, 0);
         taskENTER_CRITICAL(&s_lock);
@@ -1223,7 +1259,7 @@ esp_err_t measurement_recorder_end(void)
     ESP_LOGI(TAG, "Segment recorded: raw=%lu reflectance=%lu dropped=%lu "
                   "rejected=%lu write_errors=%lu flushes=%lu flush_errors=%lu "
                   "max_flush=%luus queue_hwm=%lu gps=%lu gps_dropped=%lu "
-                  "events=%lu events_dropped=%lu",
+                   "events=%lu events_dropped=%lu shutdown_skipped=%lu",
              (unsigned long)status.raw_written,
              (unsigned long)status.reflectance_written,
              (unsigned long)status.raw_dropped,
@@ -1236,7 +1272,8 @@ esp_err_t measurement_recorder_end(void)
              (unsigned long)status.gps_written,
              (unsigned long)status.gps_dropped,
              (unsigned long)status.events_written,
-             (unsigned long)status.events_dropped);
+             (unsigned long)status.events_dropped,
+             (unsigned long)status.reflectance_skipped_shutdown);
     return status.healthy ? ESP_OK : ESP_FAIL;
 }
 

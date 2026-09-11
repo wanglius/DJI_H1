@@ -76,6 +76,10 @@ of the flight can still be recovered.
 Reflectance values are stored in 0.01 percent units and deliberately clamped to
 0–100%. Per-sample flags preserve whether clamping or an invalid denominator
 occurred, while the raw spectra retain the original signal for offline science.
+If STOP arrives during an exposure, its completed raw frame is retained but is
+not paired after shutdown begins. `MISSION.JSON` and the segment diagnostic
+report this as `reflectance_skipped_shutdown`; it is intentionally separate
+from `calculation_rejected`, which remains an operational data-quality fault.
 The current exposure/scale normalization is an engineering assumption pending
 a controlled same-target, multiple-exposure validation of the H1 response.
 

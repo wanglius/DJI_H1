@@ -65,10 +65,11 @@ The `telemetry` component owns UART1 on GPIO17/GPIO18 and is the only task that
 writes application data to the DTU. The measurement recorder gives it finalized
 v01 GPS and reflectance records through independent bounded queues. GPS is an
 explicit 1 Hz latest-value product. Reflectance is FIFO and is never silently
-overwritten: queue exhaustion returns an error, latches telemetry unhealthy,
-and is reported to the A board. Every scientific record remains authoritative
-on SD. A future SD-backed replay service is required if every record must reach
-the broker through an arbitrarily long outage.
+overwritten: queue exhaustion drops and counts only the new live-telemetry
+copy, then accepts later records. It does not latch infrastructure health or
+affect the authoritative SD write. The loss remains visible to the A board as
+mission-level data degradation. A future SD-backed replay service is required
+if every record must reach the broker through an arbitrarily long outage.
 
 The task serializes records with the same `data_records` functions used for SD,
 calls `telemetry_fragment_plan_init()` once, then
@@ -84,8 +85,17 @@ Initial conservative policy:
   second;
 - reflectance uses an eight-record FIFO and queue exhaustion is a visible,
   heartbeat-degrading fault rather than a silent overwrite;
-- UART, serialization, acknowledgement, and reflectance-queue failures latch
-  telemetry unhealthy and degrade the B-board heartbeat error code.
+- exhausted acknowledgement retries increment `messages_failed` and degrade
+  the heartbeat, but do not stop later transmissions;
+- only local infrastructure faults (UART or internal serialization/framing)
+  latch telemetry unhealthy. Delivery-pressure counters do not control
+  telemetry or recorder admission.
+
+At 460800 baud, the current 100 ms gap limits a four-fragment reflectance
+message to roughly two messages per second even before broker latency. A faster
+calculation cadence can therefore produce deliberate FIFO drops on a healthy
+link. Reducing this gap requires a dedicated sustained hardware test; it is not
+changed as part of the failure-policy correction.
 
 ## Cloud acknowledgement
 

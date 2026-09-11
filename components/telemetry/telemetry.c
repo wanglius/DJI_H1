@@ -40,19 +40,26 @@ static uint8_t s_fragment_buffer[TELEMETRY_FRAGMENT_WIRE_MAX_SIZE];
 static uint8_t s_ack_stream[TELEMETRY_ACK_WIRE_SIZE * 2U];
 static size_t s_ack_stream_length;
 
-static void note_failure(bool uart_failure)
+static void note_message_failure(void)
 {
     taskENTER_CRITICAL(&s_lock);
-    s_status.healthy = false;
     s_status.messages_failed++;
-    if (uart_failure) s_status.uart_errors++;
     taskEXIT_CRITICAL(&s_lock);
 }
 
-static void note_uart_error(void)
+static void note_uart_fault(void)
 {
     taskENTER_CRITICAL(&s_lock);
+    s_status.healthy = false;
     s_status.uart_errors++;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+static void note_serialization_fault(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_status.healthy = false;
+    s_status.serialization_errors++;
     taskEXIT_CRITICAL(&s_lock);
 }
 
@@ -61,16 +68,18 @@ static esp_err_t emit_fragment(const uint8_t *fragment, size_t length,
 {
     (void)index;
     (void)count;
-    (void)context;
+    bool *uart_failed = context;
     int written = uart_write_bytes(s_config.uart_port, fragment, length);
     if (written != (int)length) {
-        note_uart_error();
+        *uart_failed = true;
+        note_uart_fault();
         return ESP_FAIL;
     }
     esp_err_t result = uart_wait_tx_done(
         s_config.uart_port, pdMS_TO_TICKS(TELEMETRY_UART_TX_TIMEOUT_MS));
     if (result != ESP_OK) {
-        note_uart_error();
+        *uart_failed = true;
+        note_uart_fault();
         return result;
     }
 
@@ -173,6 +182,10 @@ static esp_err_t wait_for_ack(const telemetry_fragment_plan_t *plan)
         int count = uart_read_bytes(s_config.uart_port, incoming,
                                     sizeof(incoming), wait);
         if (count > 0) append_downlink(incoming, (size_t)count);
+        if (count < 0) {
+            note_uart_fault();
+            return ESP_FAIL;
+        }
     }
     taskENTER_CRITICAL(&s_lock);
     s_status.acknowledgement_timeouts++;
@@ -188,11 +201,16 @@ static esp_err_t send_serialized(uint8_t message_type, uint64_t mission_id,
         &plan, message_type, s_config.source_id, mission_id,
         message_sequence, 0,
         s_record_buffer, length);
-    if (result != ESP_OK) return result;
+    if (result != ESP_OK) {
+        note_serialization_fault();
+        return result;
+    }
     for (unsigned attempt = 0; attempt <= s_config.max_retries; attempt++) {
+        bool uart_failed = false;
         result = telemetry_fragment_emit_all(
             &plan, s_fragment_buffer, sizeof(s_fragment_buffer),
-            emit_fragment, NULL);
+            emit_fragment, &uart_failed);
+        if (result != ESP_OK && !uart_failed) note_serialization_fault();
         if (result == ESP_OK) result = wait_for_ack(&plan);
         if (result == ESP_OK) return ESP_OK;
         if (attempt < s_config.max_retries) {
@@ -209,6 +227,7 @@ static esp_err_t send_gps(const gps_record_t *record, uint64_t mission_id)
     size_t length = 0;
     esp_err_t result = data_record_serialize_gps(
         record, s_record_buffer, sizeof(s_record_buffer), &length);
+    if (result != ESP_OK) note_serialization_fault();
     if (result == ESP_OK) {
         result = send_serialized(
             TELEMETRY_MESSAGE_GPS, mission_id,
@@ -228,6 +247,7 @@ static esp_err_t send_reflectance(const reflectance_record_t *record,
     size_t length = 0;
     esp_err_t result = data_record_serialize_reflectance(
         record, s_record_buffer, sizeof(s_record_buffer), &length);
+    if (result != ESP_OK) note_serialization_fault();
     if (result == ESP_OK) {
         result = send_serialized(
             TELEMETRY_MESSAGE_REFLECTANCE, mission_id,
@@ -271,7 +291,7 @@ static void telemetry_task(void *unused)
             last_gps = xTaskGetTickCount();
             gps_sent_once = true;
             if (result != ESP_OK) {
-                note_failure(false);
+                note_message_failure();
                 ESP_LOGE(TAG, "GPS transmission failed: %s",
                          esp_err_to_name(result));
             }
@@ -286,7 +306,7 @@ static void telemetry_task(void *unused)
             s_sending = false;
             taskEXIT_CRITICAL(&s_lock);
             if (result != ESP_OK) {
-                note_failure(false);
+                note_message_failure();
                 ESP_LOGE(TAG, "Reflectance transmission failed: %s",
                          esp_err_to_name(result));
             }
@@ -296,6 +316,7 @@ static void telemetry_task(void *unused)
         int count = uart_read_bytes(s_config.uart_port, incoming,
                                     sizeof(incoming), 0);
         if (count > 0) append_downlink(incoming, (size_t)count);
+        if (count < 0) note_uart_fault();
         taskENTER_CRITICAL(&s_lock);
         s_sending = false;
         taskEXIT_CRITICAL(&s_lock);
@@ -314,14 +335,16 @@ static esp_err_t overwrite_gps(const gps_record_t *record)
     return ESP_OK;
 }
 
-static esp_err_t overwrite_reflectance(const reflectance_record_t *record)
+static esp_err_t enqueue_reflectance(const reflectance_record_t *record)
 {
     if (xQueueSend(s_reflectance_queue, record, 0) != pdPASS) {
         taskENTER_CRITICAL(&s_lock);
-        s_status.reflectance_queue_overflows++;
-        s_status.healthy = false;
-        s_status.messages_failed++;
+        uint32_t dropped = ++s_status.reflectance_queue_overflows;
         taskEXIT_CRITICAL(&s_lock);
+        if (dropped == 1 || dropped % 100U == 0) {
+            ESP_LOGW(TAG, "Reflectance telemetry queue full; dropped=%lu",
+                     (unsigned long)dropped);
+        }
         return ESP_ERR_NO_MEM;
     }
     taskENTER_CRITICAL(&s_lock);
@@ -438,9 +461,15 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     xQueueReset(s_reflectance_queue);
     taskENTER_CRITICAL(&s_lock);
     bool healthy = s_status.healthy;
+    uint32_t serialization_errors = s_status.serialization_errors;
+    uint32_t uart_errors = s_status.uart_errors;
     memset(&s_status, 0, sizeof(s_status));
     s_status.initialized = true;
     s_status.healthy = healthy;
+    /* Preserve infrastructure evidence detected by the idle UART owner before
+     * the recorder allocates and binds the flight. Mission counters start at 0. */
+    s_status.serialization_errors = serialization_errors;
+    s_status.uart_errors = uart_errors;
     s_status.source_id = s_config.source_id;
     s_status.mission_id = mission_id;
     s_accepting = true;
@@ -478,7 +507,7 @@ esp_err_t telemetry_submit_reflectance(const reflectance_record_t *record)
     if (active) s_submitters++;
     taskEXIT_CRITICAL(&s_lock);
     if (!active) return ESP_ERR_INVALID_STATE;
-    esp_err_t result = overwrite_reflectance(record);
+    esp_err_t result = enqueue_reflectance(record);
     taskENTER_CRITICAL(&s_lock);
     s_submitters--;
     taskEXIT_CRITICAL(&s_lock);
@@ -507,7 +536,9 @@ esp_err_t telemetry_finish_mission(uint32_t timeout_ms)
                      uxQueueMessagesWaiting(s_reflectance_queue) == 0;
         if (empty && !sending && !submitters) return ESP_OK;
         if (xTaskGetTickCount() - started >= timeout_ticks) {
-            note_failure(false);
+            taskENTER_CRITICAL(&s_lock);
+            s_status.drain_timeouts++;
+            taskEXIT_CRITICAL(&s_lock);
             return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(1);

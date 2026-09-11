@@ -32,6 +32,7 @@ _RECORD_HEADER = struct.Struct("<IHHIIIHHIQQQIHBB")
 _GPS_BODY = struct.Struct("<B3xiiiIIH8B")
 _REFLECTANCE_PREFIX = struct.Struct("<IIIQIHHHHHH")
 MAX_ACK_CACHE = 4096
+PING_INTERVAL_SECONDS = 10.0
 
 
 def disconnect(connection) -> None:
@@ -104,11 +105,19 @@ def main() -> int:
         subscribe(connection, args.topic, 1)
         connection.settimeout(1.0)
         deadline = time.monotonic() + args.duration
+        last_ping = time.monotonic()
         while time.monotonic() < deadline:
             try:
                 topic, mqtt_payload, qos = receive_publish(connection)
             except socket.timeout:
                 reassembler.expire()
+                now = time.monotonic()
+                if now - last_ping >= PING_INTERVAL_SECONDS:
+                    # MQTT 3.1.1 keepalive is based on client-to-broker
+                    # traffic. After B shuts down there are no QoS-1 PUBACKs,
+                    # so keep the validator subscribed through its budget.
+                    send_packet(connection, 0xC0, b"")
+                    last_ping = now
                 continue
             if topic != args.topic:
                 continue

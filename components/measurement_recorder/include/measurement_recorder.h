@@ -22,6 +22,8 @@ typedef struct {
     uint32_t gps_dropped;
     uint32_t events_dropped;
     uint32_t calculation_rejected;
+    /** Ground frames retained during shutdown without a reflectance attempt. */
+    uint32_t reflectance_skipped_shutdown;
     /** Non-empty A-board serials that disagreed with the first canonical ID. */
     uint32_t identity_mismatches;
     uint32_t write_errors;
@@ -59,6 +61,9 @@ esp_err_t measurement_recorder_end(void);
 esp_err_t measurement_recorder_shutdown(void);
 
 /** Copy a completed H1 frame into a fixed pool buffer and enqueue its pointer.
+ * Set allow_reflectance false for a frame completed after capture stop was
+ * requested. The raw frame is still recorded, but a stale/missing sky pair is
+ * then counted as an intentional shutdown skip instead of a calculation fault.
  * Never blocks acquisition. ESP_ERR_NO_MEM means this frame was deliberately
  * dropped and counted because the bounded writer queue was under pressure;
  * callers should continue acquisition. Other errors indicate recorder failure.
@@ -66,7 +71,8 @@ esp_err_t measurement_recorder_shutdown(void);
 esp_err_t measurement_recorder_submit(spectrometer_role_t role,
                                       uint32_t frame_count,
                                       const h1_spectrum_frame_t *frame,
-                                      int64_t b_timestamp_us);
+                                      int64_t b_timestamp_us,
+                                      bool allow_reflectance);
 
 /** Queue one synchronized A-board realtime sample for GPS_TRACK.BIN.
  * The A/B RX task is the sole GPS producer. A future second producer must add
