@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -11,7 +12,7 @@
 
 #include "dtu_bridge_config.h"
 
-#define BRIDGE_CHUNK_SIZE 256
+#define BRIDGE_CHUNK_SIZE 1024
 #define BRIDGE_TASK_STACK_SIZE 4096
 #define BRIDGE_TASK_PRIORITY 10
 
@@ -50,10 +51,18 @@ static void bridge_task(void *context)
     uint8_t pc_to_dtu[BRIDGE_CHUNK_SIZE];
     uint8_t dtu_to_pc[BRIDGE_CHUNK_SIZE];
 
-    static const char banner[] =
-        "\r\n[DJI_H1 DTU bridge: USB <-> UART1, GPIO17 TX, GPIO18 RX, "
-        "115200 8N1]\r\n";
-    write_usb_all((const uint8_t *)banner, strlen(banner));
+    char banner[160];
+    int banner_length = snprintf(
+        banner, sizeof(banner),
+        "\r\n[DJI_H1 DTU bridge: USB <-> UART%u, GPIO%u TX, GPIO%u RX, "
+        "%u 8N1]\r\n",
+        (unsigned)DJI_DTU_UART_PORT,
+        (unsigned)DJI_DTU_UART_TX_GPIO,
+        (unsigned)DJI_DTU_UART_RX_GPIO,
+        (unsigned)DJI_DTU_UART_BAUD_RATE);
+    if (banner_length > 0 && (size_t)banner_length < sizeof(banner)) {
+        write_usb_all((const uint8_t *)banner, (size_t)banner_length);
+    }
 
     for (;;) {
         int pc_length = usb_serial_jtag_read_bytes(

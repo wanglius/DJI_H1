@@ -14,8 +14,10 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_app_desc.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "sd_card.h"
+#include "telemetry.h"
 
 static const char *TAG = "MEAS_REC";
 
@@ -78,6 +80,7 @@ static uint32_t s_session, s_raw_sequence, s_calculation_sequence;
 static uint32_t s_gps_sequence, s_event_sequence;
 static uint16_t s_segment;
 static uint32_t s_flight_index;
+static uint64_t s_telemetry_mission_id;
 static bool s_have_flight, s_accept_aux;
 /* Lifecycle transitions retain their progress after a timeout. A retry waits
  * for the already-enqueued marker instead of closing files underneath it. */
@@ -163,9 +166,6 @@ static void put16(uint8_t **p, uint16_t v)
 { (*p)[0] = v; (*p)[1] = v >> 8; *p += 2; }
 static void put32(uint8_t **p, uint32_t v)
 { for (unsigned i = 0; i < 4; i++) (*p)[i] = v >> (8 * i); *p += 4; }
-static void put64(uint8_t **p, uint64_t v)
-{ for (unsigned i = 0; i < 8; i++) (*p)[i] = v >> (8 * i); *p += 8; }
-
 static uint16_t get16(const uint8_t *p)
 { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
@@ -282,86 +282,38 @@ static esp_err_t store_next_flight_index(uint32_t next_index)
     return result;
 }
 
-static void serialize_time(uint8_t **p, const record_time_t *t)
+static esp_err_t write_serialized(sd_card_file_t *file, size_t length)
 {
-    put64(p, t->b_monotonic_us); put64(p, t->a_monotonic_ms);
-    put64(p, t->utc_ms); put32(p, t->sync_age_ms);
-    put16(p, t->sync_generation); *(*p)++ = t->sync_state;
-    *(*p)++ = t->valid_flags;
-}
-
-static void serialize_header(uint8_t **p, const measurement_record_header_t *h,
-                             uint32_t wire_size)
-{
-    put32(p, DATA_RECORD_MAGIC); put16(p, DATA_RECORD_FORMAT_VERSION);
-    put16(p, h->record_type); put32(p, DATA_RECORD_WIRE_HEADER_SIZE);
-    put32(p, wire_size); put32(p, h->session_id); put16(p, h->segment_id);
-    put16(p, h->flags); put32(p, h->record_sequence);
-    serialize_time(p, &h->timestamp);
-}
-
-static esp_err_t write_block(sd_card_file_t *file, uint8_t *buffer, size_t length)
-{
-    uint8_t *tail = buffer + length;
-    put32(&tail, crc32(buffer, length));
     size_t written = 0;
-    return sd_card_file_write(file, buffer, length + 4, &written);
+    esp_err_t result = sd_card_file_write(file, s_serial_buffer, length,
+                                          &written);
+    if (result == ESP_OK && written != length) result = ESP_FAIL;
+    return result;
 }
 
 static esp_err_t write_raw(const raw_spectrum_record_t *r)
 {
-    uint8_t *p = s_serial_buffer;
-    uint32_t size = RAW_RECORD_WIRE_SIZE(r->sample_count);
-    serialize_header(&p, &r->header, size);
-    put32(&p, r->frame_count); put32(&p, r->exposure_us);
-    put16(&p, r->sample_count); put16(&p, (uint16_t)r->spectrum_scale);
-    *p++ = r->spectrometer_role; *p++ = r->exposure_status;
-    *p++ = r->frame_quality; *p++ = 0;
-    for (uint16_t i = 0; i < r->sample_count; i++) put16(&p, r->samples[i]);
-    return write_block(s_raw_file, s_serial_buffer,
-                       (size_t)(p - s_serial_buffer));
+    size_t length = 0;
+    esp_err_t result = data_record_serialize_raw(
+        r, s_serial_buffer, sizeof(s_serial_buffer), &length);
+    return result == ESP_OK ? write_serialized(s_raw_file, length) : result;
 }
 
 static esp_err_t write_reflectance(const reflectance_record_t *r)
 {
-    uint8_t *p = s_serial_buffer;
-    uint32_t size = REFLECTANCE_RECORD_WIRE_SIZE(r->sample_count);
-    serialize_header(&p, &r->header, size);
-    put32(&p, r->calculation_count); put32(&p, r->ground_frame_count);
-    put32(&p, r->sky_frame_count); put64(&p, r->sky_b_monotonic_us);
-    put32(&p, r->sky_age_us); put16(&p, r->sample_count);
-    put16(&p, r->valid_sample_count); put16(&p, r->clamped_low_count);
-    put16(&p, r->clamped_high_count); put16(&p, r->invalid_denominator_count);
-    put16(&p, r->input_quality_flags);
-    for (uint16_t i = 0; i < r->sample_count; i++)
-        put16(&p, r->reflectance_0p01_percent[i]);
-    memcpy(p, r->sample_flags, r->sample_count); p += r->sample_count;
-    return write_block(s_reflectance_file, s_serial_buffer,
-                       (size_t)(p - s_serial_buffer));
+    size_t length = 0;
+    esp_err_t result = data_record_serialize_reflectance(
+        r, s_serial_buffer, sizeof(s_serial_buffer), &length);
+    return result == ESP_OK ? write_serialized(s_reflectance_file, length)
+                            : result;
 }
 
 static esp_err_t write_gps(const gps_record_t *r)
 {
-    uint8_t *p = s_serial_buffer;
-    serialize_header(&p, &r->header, GPS_RECORD_WIRE_SIZE);
-    *p++ = r->protocol_sequence;
-    *p++ = 0; *p++ = 0; *p++ = 0;
-    put32(&p, (uint32_t)r->data.latitude_e7);
-    put32(&p, (uint32_t)r->data.longitude_e7);
-    put32(&p, (uint32_t)r->data.altitude_relative_mm);
-    put32(&p, r->data.utc_seconds);
-    put32(&p, r->data.a_monotonic_ms);
-    put16(&p, r->data.utc_milliseconds);
-    *p++ = r->data.source_flags;
-    *p++ = r->data.gps_fix;
-    *p++ = r->data.rtk_solution;
-    *p++ = r->data.flight_status;
-    *p++ = r->data.display_mode;
-    *p++ = r->data.battery_percent;
-    *p++ = r->data.a_status;
-    *p++ = r->data.valid_flags;
-    return write_block(s_gps_file, s_serial_buffer,
-                       (size_t)(p - s_serial_buffer));
+    size_t length = 0;
+    esp_err_t result = data_record_serialize_gps(
+        r, s_serial_buffer, sizeof(s_serial_buffer), &length);
+    return result == ESP_OK ? write_serialized(s_gps_file, length) : result;
 }
 
 static const char *event_name(measurement_event_t event)
@@ -427,19 +379,23 @@ static void serial_strings(char text[33], char hex_output[65])
 static esp_err_t write_mission_summary(const char *state)
 {
     mission_totals_t totals;
+    telemetry_status_t telemetry;
     record_time_t flight_started, updated;
     uint8_t drone_link;
     uint16_t a_firmware;
+    uint64_t telemetry_mission_id;
     char drone_serial_text[33];
     char drone_serial_hex[65];
     taskENTER_CRITICAL(&s_lock);
     totals = s_totals;
     drone_link = s_drone_link;
     a_firmware = s_a_firmware_version;
+    telemetry_mission_id = s_telemetry_mission_id;
     serial_strings(drone_serial_text, drone_serial_hex);
     flight_started = s_flight_started;
     bool start_time_frozen = s_flight_start_time_frozen;
     taskEXIT_CRITICAL(&s_lock);
+    telemetry_get_status(&telemetry);
 
     /* The directory precedes A time. Freeze the first valid projection so a
      * later clock-model reset cannot silently rewrite the mission start UTC. */
@@ -469,6 +425,7 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"state\": \"%s\",\n"
         "  \"directory\": \"%s\",\n"
         "  \"flight_index\": %" PRIu32 ",\n"
+        "  \"telemetry_mission_id\": \"%016" PRIX64 "\",\n"
         "  \"firmware_version\": \"%s\",\n"
         "  \"a_firmware_version\": %u,\n"
         "  \"drone_link\": %u,\n"
@@ -493,12 +450,27 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"drops\": {\"raw\": %" PRIu32 ", \"gps\": %" PRIu32
         ", \"events\": %" PRIu32 "},\n"
         "  \"calculation_rejected\": %" PRIu32 ",\n"
+        "  \"telemetry\": {\"gps_submitted\": %" PRIu32
+        ", \"gps_sent\": %" PRIu32 ", \"gps_superseded\": %" PRIu32
+        ", \"reflectance_submitted\": %" PRIu32
+        ", \"reflectance_sent\": %" PRIu32
+        ", \"reflectance_queue_overflows\": %" PRIu32
+        ", \"fragments_sent\": %" PRIu32 ", \"bytes_sent\": %" PRIu32
+        ", \"messages_retried\": %" PRIu32
+        ", \"acknowledgements_received\": %" PRIu32
+        ", \"acknowledgement_timeouts\": %" PRIu32
+        ", \"acknowledgement_rejected\": %" PRIu32
+        ", \"messages_failed\": %" PRIu32 ", \"uart_errors\": %" PRIu32
+        ", \"downlink_bytes\": %" PRIu32
+        ", \"source_id\": \"%016" PRIX64 "\""
+        "},\n"
         "  \"identity_mismatches\": %" PRIu32 ",\n"
         "  \"write_errors\": %" PRIu32 ",\n"
         "  \"flush_errors\": %" PRIu32 ",\n"
         "  \"max_flush_us\": %" PRIu32 "\n"
         "}\n",
         DATA_RECORD_FORMAT_VERSION, state, s_directory, s_flight_index,
+        telemetry_mission_id,
         app ? app->version : "unknown", a_firmware, drone_link,
         drone_serial_text, drone_serial_hex, flight_started.b_monotonic_us,
         flight_started.utc_ms, flight_started.valid_flags,
@@ -508,7 +480,17 @@ static esp_err_t write_mission_summary(const char *state)
         totals.segments_completed, totals.raw_written,
         totals.reflectance_written, totals.gps_written, totals.events_written,
         totals.raw_dropped, totals.gps_dropped, totals.events_dropped,
-        totals.calculation_rejected, totals.identity_mismatches,
+        totals.calculation_rejected,
+        telemetry.gps_submitted, telemetry.gps_sent,
+        telemetry.gps_superseded, telemetry.reflectance_submitted,
+        telemetry.reflectance_sent, telemetry.reflectance_queue_overflows,
+        telemetry.fragments_sent, telemetry.bytes_sent,
+        telemetry.messages_retried, telemetry.acknowledgements_received,
+        telemetry.acknowledgement_timeouts,
+        telemetry.acknowledgement_rejected,
+        telemetry.messages_failed, telemetry.uart_errors,
+        telemetry.downlink_bytes_received, telemetry.source_id,
+        totals.identity_mismatches,
         totals.write_errors,
         totals.flush_errors, totals.max_flush_us);
     if (length <= 0 || (size_t)length >= sizeof(s_serial_buffer))
@@ -750,6 +732,12 @@ static void writer_task(void *unused)
                                              &s_calculated);
             if (result == ESP_OK) {
                 note_write_result(write_reflectance(&s_calculated), true);
+                esp_err_t telemetry_result = telemetry_submit_reflectance(
+                    &s_calculated);
+                if (telemetry_result != ESP_OK) {
+                    ESP_LOGW(TAG, "Reflectance telemetry rejected: %s",
+                             esp_err_to_name(telemetry_result));
+                }
             } else {
                 ESP_LOGW(TAG, "Reflectance rejected ground=%lu sky=%lu "
                               "ground_t=%llu sky_t=%llu age=%lldus "
@@ -918,8 +906,16 @@ static esp_err_t open_flight_files(void)
 
     record_time_t flight_started;
     (void)clock_sync_timestamp(esp_timer_get_time(), &flight_started);
+    uint64_t telemetry_mission_id;
+    do {
+        /* The card-local F_#### index can repeat after card replacement or
+         * formatting. A fresh transport ID prevents a delayed MQTT fragment
+         * or acknowledgement from being mistaken for this flight. */
+        telemetry_mission_id = ((uint64_t)esp_random() << 32) | esp_random();
+    } while (telemetry_mission_id == 0);
     taskENTER_CRITICAL(&s_lock);
     s_flight_index = flight_index;
+    s_telemetry_mission_id = telemetry_mission_id;
     s_session = 0;
     s_segment = 0;
     s_raw_sequence = s_calculation_sequence = 0;
@@ -934,6 +930,14 @@ static esp_err_t open_flight_files(void)
     s_drone_link = 0;
     taskEXIT_CRITICAL(&s_lock);
     result = write_mission_summary("in_progress");
+    if (result != ESP_OK) {
+        (void)close_files();
+        return result;
+    }
+    /* Start telemetry only after every fallible initial file/checkpoint step.
+     * From here onward failures are advisory, so no mission rollback API is
+     * needed and telemetry cannot outlive a failed recorder open. */
+    result = telemetry_begin_mission(telemetry_mission_id);
     if (result != ESP_OK) {
         (void)close_files();
         return result;
@@ -1057,6 +1061,11 @@ esp_err_t measurement_recorder_submit_gps(const gps_record_t *record)
     data_record_header_init(&message.data.gps.header, DATA_RECORD_GPS,
                             GPS_RECORD_WIRE_SIZE, sequence, session, segment,
                             &record->header.timestamp);
+    esp_err_t telemetry_result = telemetry_submit_gps(&message.data.gps);
+    if (telemetry_result != ESP_OK) {
+        ESP_LOGW(TAG, "GPS telemetry rejected: %s",
+                 esp_err_to_name(telemetry_result));
+    }
     bool queued = xQueueSend(s_writer_queue, &message, 0) == pdTRUE;
     taskENTER_CRITICAL(&s_lock);
     s_aux_submitters--;
@@ -1272,6 +1281,13 @@ esp_err_t measurement_recorder_shutdown(void)
     if (xSemaphoreTake(s_barrier, pdMS_TO_TICKS(10000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
+    esp_err_t telemetry_result = telemetry_finish_mission(8000);
+    if (telemetry_result != ESP_OK) {
+        ESP_LOGE(TAG, "Telemetry drain failed: %s",
+                 esp_err_to_name(telemetry_result));
+        if (result == ESP_OK) result = telemetry_result;
+    }
+
     esp_err_t close_result = close_files();
     if (result == ESP_OK) result = close_result;
     if (close_result != ESP_OK) note_storage_result(close_result, "Flight file close");
@@ -1306,6 +1322,7 @@ esp_err_t measurement_recorder_shutdown(void)
     s_finalize_queued = false;
     s_session = 0;
     s_segment = 0;
+    s_telemetry_mission_id = 0;
     s_directory[0] = '\0';
     taskEXIT_CRITICAL(&s_lock);
     return result;

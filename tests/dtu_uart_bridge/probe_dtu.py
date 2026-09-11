@@ -14,6 +14,8 @@ QUERIES = (
     "AT+CGATT",
     "AT+IP",
     "AT+CCLK",
+    "AT+UART1",
+    "AT+UARTTL1",
     "AT+SOCKEN1A",
     "AT+SOCK1A",
     "AT+SOCKLK=1A",

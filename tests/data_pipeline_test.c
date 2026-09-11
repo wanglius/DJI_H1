@@ -6,6 +6,7 @@
 #include "drone_data.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "telemetry_transport.h"
 
 static const char *TAG = "DATA_TEST";
 
@@ -15,6 +16,12 @@ static const char *TAG = "DATA_TEST";
         return ESP_FAIL;                   \
     }                                     \
 } while (0)
+
+static uint32_t read_le32(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
 
 esp_err_t data_pipeline_self_test(void)
 {
@@ -96,6 +103,54 @@ esp_err_t data_pipeline_self_test(void)
               record.data.battery_percent == 0,
           "invalid fields canonicalized");
 
+    /* SD and MQTT consume the same canonical serializer. In-place renewal is
+     * explicitly supported because recorder callers may retain the timestamp
+     * inside the header being rebuilt. */
+    const uint64_t expected_b_time = record.header.timestamp.b_monotonic_us;
+    data_record_header_init(&record.header, DATA_RECORD_GPS,
+                            GPS_RECORD_WIRE_SIZE, 3, 42, 3,
+                            &record.header.timestamp);
+    CHECK(record.header.timestamp.b_monotonic_us == expected_b_time,
+          "in-place header timestamp preservation");
+    uint8_t gps_wire[GPS_RECORD_WIRE_SIZE];
+    size_t gps_wire_length = 0;
+    CHECK(data_record_serialize_gps(
+              &record, gps_wire, sizeof(gps_wire), &gps_wire_length) == ESP_OK,
+          "GPS serialization");
+    CHECK(gps_wire_length == GPS_RECORD_WIRE_SIZE &&
+              read_le32(gps_wire) == DATA_RECORD_MAGIC &&
+              read_le32(gps_wire + gps_wire_length - 4) ==
+                  telemetry_crc32(gps_wire, gps_wire_length - 4),
+          "GPS serialized size/magic/CRC");
+
+    /* A full reflectance record is about 3 KiB.  Keep this boot-only test
+     * fixture out of app_main's deliberately small task stack. */
+    static reflectance_record_t reflectance;
+    memset(&reflectance, 0, sizeof(reflectance));
+    reflectance.sample_count = 3;
+    reflectance.valid_sample_count = 3;
+    reflectance.reflectance_0p01_percent[0] = 1000;
+    reflectance.reflectance_0p01_percent[1] = 5000;
+    reflectance.reflectance_0p01_percent[2] = 10000;
+    reflectance.sample_flags[0] = REFLECTANCE_SAMPLE_VALID;
+    reflectance.sample_flags[1] = REFLECTANCE_SAMPLE_VALID;
+    reflectance.sample_flags[2] = REFLECTANCE_SAMPLE_VALID;
+    data_record_header_init(
+        &reflectance.header, DATA_RECORD_REFLECTANCE,
+        REFLECTANCE_RECORD_WIRE_SIZE(reflectance.sample_count), 4, 42, 3,
+        &record.header.timestamp);
+    uint8_t reflectance_wire[REFLECTANCE_RECORD_WIRE_SIZE(3)];
+    size_t reflectance_wire_length = 0;
+    CHECK(data_record_serialize_reflectance(
+              &reflectance, reflectance_wire, sizeof(reflectance_wire),
+              &reflectance_wire_length) == ESP_OK,
+          "reflectance serialization");
+    CHECK(reflectance_wire_length == sizeof(reflectance_wire) &&
+              read_le32(reflectance_wire + reflectance_wire_length - 4) ==
+                  telemetry_crc32(reflectance_wire,
+                                  reflectance_wire_length - 4),
+          "reflectance serialized size/CRC");
+
     record_time_t raw_time = {
         .b_monotonic_us = 1000,
         .valid_flags = RECORD_TIME_VALID_B_MONOTONIC,
@@ -111,6 +166,26 @@ esp_err_t data_pipeline_self_test(void)
               raw_header.segment_id == 3 &&
               raw_header.timestamp.b_monotonic_us == 1000,
           "raw spectral header initialization");
+
+    static raw_spectrum_record_t raw;
+    memset(&raw, 0, sizeof(raw));
+    raw.sample_count = 3;
+    raw.frame_count = 9;
+    raw.exposure_us = 1000;
+    raw.spectrometer_role = SPECTROMETER_GROUND;
+    raw.frame_quality = RAW_QUALITY_VALID;
+    raw.samples[0] = 11; raw.samples[1] = 22; raw.samples[2] = 33;
+    data_record_header_init(&raw.header, DATA_RECORD_RAW_SPECTRUM,
+                            RAW_RECORD_WIRE_SIZE(raw.sample_count), 9, 42, 3,
+                            &raw_time);
+    uint8_t raw_wire[RAW_RECORD_WIRE_SIZE(3)];
+    size_t raw_wire_length = 0;
+    CHECK(data_record_serialize_raw(&raw, raw_wire, sizeof(raw_wire),
+                                    &raw_wire_length) == ESP_OK &&
+              raw_wire_length == sizeof(raw_wire) &&
+              read_le32(raw_wire + raw_wire_length - 4) ==
+                  telemetry_crc32(raw_wire, raw_wire_length - 4),
+          "raw spectrum serialized size/CRC");
 
     data_record_header_t reflectance_header = {0};
     data_record_header_init(&reflectance_header, DATA_RECORD_REFLECTANCE,

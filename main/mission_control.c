@@ -8,6 +8,7 @@
 #include "measurement_recorder.h"
 #include "sc16is752.h"
 #include "sd_card.h"
+#include "telemetry.h"
 
 static const char *TAG = "MISSION";
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -24,7 +25,8 @@ static size_t s_session_count;
 
 /* Error mapping is B-defined: 1 SD, 2 initialization, 3 acquisition/lifecycle,
  * 4 shutdown, 5 measurement-data degradation (decode failures, recorder
- * pressure drops, rejected calculations, or conflicting A identities). */
+ * pressure drops, rejected calculations, telemetry UART failure, or
+ * conflicting A identities). */
 static bool known_session(uint32_t session)
 {
     size_t count = s_session_count < SESSION_LIMIT ? s_session_count : SESSION_LIMIT;
@@ -91,7 +93,9 @@ void mission_control_get_status(ab_status_report_t *out)
 {
     acquisition_status_t acquisition;
     measurement_recorder_status_t recorder;
+    telemetry_status_t telemetry;
     measurement_recorder_get_status(&recorder);
+    telemetry_get_status(&telemetry);
     taskENTER_CRITICAL(&s_lock);
     acquisition_get_status(&acquisition);
     uint8_t error = s_error;
@@ -101,6 +105,7 @@ void mission_control_get_status(ab_status_report_t *out)
                    recorder.identity_mismatches))
         error = 5;
     if (!error && (acquisition.errors[0] || acquisition.errors[1])) error = 5;
+    if (!error && telemetry.initialized && !telemetry.healthy) error = 5;
     *out = (ab_status_report_t) {
         .b_state = error ? 2 : (s_initialized ? 1 : 0),
         .actual_capture = acquisition.capturing,

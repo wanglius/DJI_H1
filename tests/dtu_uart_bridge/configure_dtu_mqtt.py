@@ -94,8 +94,9 @@ def load_config(path: Path) -> dict[str, Any]:
     require_string(bridge, "port", "root.bridge", max_length=32)
     require_int(bridge, "baud_rate", "root.bridge", 1200, 921600)
 
-    # These values document the production-board connection in the same source
-    # of truth. The host provisioning script does not configure the ESP32 UART.
+    # These values document the production-board connection and configure the
+    # DTU-side UART. The host tool cannot reconfigure the running ESP32 bridge;
+    # its firmware must use the same baud rate before the next communication.
     uart = require_object(config.get("mcu_uart"), "root.mcu_uart")
     require_int(uart, "controller", "root.mcu_uart", 0, 2)
     tx_gpio = require_int(uart, "tx_gpio", "root.mcu_uart", 0, 48)
@@ -106,7 +107,11 @@ def load_config(path: Path) -> dict[str, Any]:
     require_choice(uart, "data_bits", "root.mcu_uart", (8,))
     require_choice(uart, "stop_bits", "root.mcu_uart", (1,))
     require_choice(uart, "parity", "root.mcu_uart", ("NONE",))
-    require_choice(uart, "flow_control", "root.mcu_uart", ("NONE",))
+    # The manual documents NFC, while the tested DTU firmware reports and
+    # accepts the interface-specific value 485. Preserve that working mode.
+    require_choice(uart, "flow_control", "root.mcu_uart", ("NFC", "485"))
+    require_int(uart, "packet_gap_ms", "root.mcu_uart", 1, 300)
+    require_int(uart, "packet_length", "root.mcu_uart", 64, 1024)
 
     mqtt = require_object(config.get("mqtt"), "root.mqtt")
     require_choice(mqtt, "socket", "root.mqtt", ("1A",))
@@ -175,6 +180,7 @@ def build_settings(config: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     publication = mqtt["publish"]
     subscription = mqtt["subscribe"]
     transport = config["transport"]
+    uart = config["mcu_uart"]
     socket = mqtt["socket"]
     channel = socket[0]
     conversion = (
@@ -216,6 +222,17 @@ def build_settings(config: dict[str, Any]) -> tuple[tuple[str, str], ...]:
         ("registration packet", f"AT+REGMD{channel}={transport['registration_mode']}"),
         ("heartbeat packet", f"AT+HEARTMD{channel}={transport['heartbeat_mode']}"),
         ("enable Socket A", f"AT+SOCKEN{socket}={'ON' if mqtt['enabled'] else 'OFF'}"),
+        (
+            "DTU UART packetizer",
+            f"AT+UARTTL{uart['controller']}={uart['packet_gap_ms']},"
+            f"{uart['packet_length']}",
+        ),
+        (
+            "DTU UART",
+            f"AT+UART{uart['controller']}={uart['baud_rate']},"
+            f"{uart['data_bits']},{uart['stop_bits']},{uart['parity']},"
+            f"{uart['flow_control']}",
+        ),
     )
 
 
@@ -229,6 +246,8 @@ def print_summary(path: Path, config: dict[str, Any]) -> None:
     print(f"Configuration valid: {path}")
     print(f"DTU UART: UART{uart['controller']} TX=GPIO{uart['tx_gpio']} "
           f"RX=GPIO{uart['rx_gpio']} at {uart['baud_rate']} baud")
+    print(f"DTU packetizer: {uart['packet_gap_ms']} ms or "
+          f"{uart['packet_length']} bytes")
     print(f"MQTT endpoint: {mqtt['host']}:{mqtt['port']}")
     print(f"MQTT client: {mqtt['client_id']} (password redacted)")
     print(f"Publish topic: {mqtt['publish']['topic']}")

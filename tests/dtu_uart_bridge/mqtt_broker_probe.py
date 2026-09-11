@@ -72,9 +72,11 @@ def connect_client(host: str, port: int, client_id: str,
     return connection
 
 
-def subscribe(connection: socket.socket, topic: str) -> None:
+def subscribe(connection: socket.socket, topic: str, qos: int = 0) -> None:
+    if qos not in (0, 1, 2):
+        raise ValueError("subscription QoS must be 0, 1, or 2")
     packet_id = 1
-    body = packet_id.to_bytes(2, "big") + mqtt_string(topic) + b"\x00"
+    body = packet_id.to_bytes(2, "big") + mqtt_string(topic) + bytes((qos,))
     send_packet(connection, 0x82, body)
     first, response = read_packet(connection)
     if first != 0x90 or len(response) != 3 or response[:2] != body[:2]:
@@ -83,11 +85,21 @@ def subscribe(connection: socket.socket, topic: str) -> None:
         raise ConnectionError("broker rejected the MQTT subscription")
 
 
-def publish(connection: socket.socket, topic: str, payload: bytes) -> None:
-    send_packet(connection, 0x30, mqtt_string(topic) + payload)
+def publish(connection: socket.socket, topic: str, payload: bytes,
+            qos: int = 0, packet_id: int = 1) -> None:
+    if qos not in (0, 1):
+        raise ValueError("the probe publisher supports QoS 0 or 1")
+    body = mqtt_string(topic)
+    if qos == 1:
+        body += packet_id.to_bytes(2, "big")
+    send_packet(connection, 0x30 | (qos << 1), body + payload)
+    if qos == 1:
+        first, response = read_packet(connection)
+        if first != 0x40 or response != packet_id.to_bytes(2, "big"):
+            raise ConnectionError("invalid MQTT PUBACK")
 
 
-def receive_publish(connection: socket.socket) -> tuple[str, bytes]:
+def receive_publish(connection: socket.socket) -> tuple[str, bytes, int]:
     while True:
         first, body = read_packet(connection)
         if first >> 4 != 3:
@@ -99,7 +111,18 @@ def receive_publish(connection: socket.socket) -> tuple[str, bytes]:
         if topic_end > len(body):
             raise ValueError("truncated MQTT PUBLISH topic")
         topic = body[2:topic_end].decode("utf-8")
-        return topic, body[topic_end:]
+        qos = (first >> 1) & 0x03
+        payload_start = topic_end
+        if qos:
+            if payload_start + 2 > len(body):
+                raise ValueError("truncated MQTT PUBLISH packet identifier")
+            packet_id = body[payload_start:payload_start + 2]
+            payload_start += 2
+            if qos == 1:
+                send_packet(connection, 0x40, packet_id)
+            else:
+                raise ValueError(f"the probe receiver does not support QoS {qos}")
+        return topic, body[payload_start:], qos
 
 
 def main() -> int:
@@ -109,6 +132,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=1883)
     parser.add_argument("--username", default="")
     parser.add_argument("--topic", default="dji-h1/test/up")
+    parser.add_argument("--qos", type=int, choices=(0, 1), default=1)
     args = parser.parse_args()
 
     suffix = str(int(time.time() * 1000))[-8:]
@@ -117,18 +141,20 @@ def main() -> int:
         args.host, args.port, f"DJI_H1_001_probe_sub_{suffix}", args.username)
     publisher = None
     try:
-        subscribe(subscriber, args.topic)
+        subscribe(subscriber, args.topic, args.qos)
         publisher = connect_client(
             args.host, args.port, f"DJI_H1_001_probe_pub_{suffix}", args.username)
-        publish(publisher, args.topic, payload)
+        publish(publisher, args.topic, payload, args.qos)
         deadline = time.monotonic() + 5.0
         while True:
-            received_topic, received_payload = receive_publish(subscriber)
-            if received_topic == args.topic and received_payload == payload:
+            received_topic, received_payload, received_qos = receive_publish(subscriber)
+            if (received_topic == args.topic and received_payload == payload and
+                    received_qos == args.qos):
                 break
             if time.monotonic() >= deadline:
                 raise TimeoutError("matching MQTT probe message was not received")
-        print(f"MQTT PASS host={args.host}:{args.port} topic={args.topic}")
+        print(f"MQTT PASS host={args.host}:{args.port} topic={args.topic} "
+              f"qos={args.qos}")
         print(f"payload={payload.decode('ascii')}")
     finally:
         for connection in (publisher, subscriber):

@@ -8,11 +8,13 @@
     "controller": 1,
     "tx_gpio": 17,
     "rx_gpio": 18,
-    "baud_rate": 115200,
+    "baud_rate": 460800,
     "data_bits": 8,
     "stop_bits": 1,
     "parity": "NONE",
-    "flow_control": "NONE"
+    "flow_control": "485",
+    "packet_gap_ms": 5,
+    "packet_length": 1024
   },
   "mqtt": {
     "socket": "1A",
@@ -29,17 +31,17 @@
     "publish": {
       "enabled": true,
       "topic": "dji-h1/test/up",
-      "qos": 0,
+      "qos": 1,
       "retain": false
     },
     "subscribe": {
       "enabled": true,
       "topic": "dji-h1/test/down",
-      "qos": 0
+      "qos": 1
     }
   },
   "transport": {
-    "offline_cache": false,
+    "offline_cache": true,
     "uplink_conversion": "RAW",
     "downlink_conversion": "RAW",
     "registration_mode": "OFF",
