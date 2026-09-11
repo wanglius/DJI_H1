@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_psram.h"
 #include "data_pipeline_test.h"
 #include "telemetry_transport_test.h"
 #include "ab_protocol_test.h"
@@ -12,9 +15,39 @@
 #include "telemetry.h"
 #include "telemetry_transport.h"
 
+static const char *TAG = "DJI_H1";
+
+static esp_err_t verify_board_psram(void)
+{
+#if CONFIG_SPIRAM
+    if (!esp_psram_is_initialized()) return ESP_ERR_NOT_FOUND;
+
+    size_t detected = esp_psram_get_size();
+    size_t heap_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG,
+             "PSRAM initialized: detected=%u bytes (%u MiB), "
+             "heap_total=%u bytes, heap_free=%u bytes",
+             (unsigned)detected, (unsigned)(detected / (1024U * 1024U)),
+             (unsigned)heap_total, (unsigned)heap_free);
+    if (detected != DJI_BOARD_EXPECTED_PSRAM_BYTES) {
+        ESP_LOGE(TAG, "Expected %u PSRAM bytes for N16R8, detected %u",
+                 (unsigned)DJI_BOARD_EXPECTED_PSRAM_BYTES,
+                 (unsigned)detected);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (heap_total == 0 || heap_free == 0) return ESP_ERR_NO_MEM;
+    return ESP_OK;
+#else
+    ESP_LOGE(TAG, "Production N16R8 build has PSRAM disabled");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
 void app_main(void)
 {
     printf("\nDJI_H1 - A-BOARD CONTROLLED DUAL ACQUISITION\n");
+    ESP_ERROR_CHECK(verify_board_psram());
     ESP_ERROR_CHECK(data_pipeline_self_test());
     ESP_ERROR_CHECK(telemetry_transport_self_test());
     ESP_ERROR_CHECK(ab_protocol_self_test());

@@ -9,5 +9,5 @@ idf_component_register(
     REQUIRES sc16is752 h1 sd_card data_records drone_data ab_protocol clock_sync
              calculation measurement_recorder
              telemetry telemetry_transport
-             esp_timer esp_system esp_driver_uart
+             esp_timer esp_system esp_driver_uart esp_psram heap
 )
