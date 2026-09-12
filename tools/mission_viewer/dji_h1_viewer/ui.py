@@ -743,16 +743,36 @@ class MissionViewer(QMainWindow):
                     if start and end else max(
                         item["duration_seconds"] for item in files.values()))
         product_errors = overview["product_errors"]
-        crc_text = ("failed" if product_errors else
+        binary_errors = [item for item in product_errors
+                         if item["filename"].upper().endswith(".BIN")]
+        fatal_binary_errors = [item for item in binary_errors
+                               if item.get("fatal", True)]
+        recovered_binary = any(item["recovered_prefix"]
+                               for item in files.values())
+        all_present_crc_checked = all(
+            not item["present"] or item["crc_verified"]
+            for item in files.values())
+        crc_text = ("failed" if fatal_binary_errors else
+                    ("recovered verified prefix" if all_present_crc_checked
+                     else "recovered prefix (CRC skipped)")
+                    if recovered_binary else
                     "passed" if all(not item["present"] or
                                     item["crc_verified"]
                                     for item in files.values()) else
                     "not verified")
+        def format_product_error(item: dict) -> str:
+            text = f"{item['filename']}: {item['message']}"
+            if item.get("file_offset") is not None and not item.get(
+                    "fatal", True):
+                text += (f"; recovered {item['recovered_records']} record(s), "
+                         f"discarded {item['discarded_tail_bytes']} tail byte(s)")
+            return text
+
         product_error_text = ("none" if not product_errors else "; ".join(
-            f"{item['filename']}: {item['message']}"
-            for item in product_errors))
+            format_product_error(item) for item in product_errors))
         rows = (
             ("Mission", summary.get("directory", mission.path.name)),
+            ("Summary source", overview.get("summary_source") or "none"),
             ("State", summary.get("state", "unknown")),
             ("Drone", summary.get("drone_serial", "unknown")),
             ("Canonical drone ID",
@@ -841,9 +861,12 @@ class MissionViewer(QMainWindow):
             position_text = "position unavailable"
         else:
             point = located.position
+            altitude_text = (f"altitude {point.altitude_relative_m:.2f} m"
+                             if point.altitude_relative_m is not None else
+                             "altitude unavailable")
             position_text = (
                 f"{point.latitude_deg:.7f}, {point.longitude_deg:.7f} · "
-                f"altitude {point.altitude_relative_m:.2f} m · "
+                f"{altitude_text} · "
                 f"{point.quality}, GPS gap {point.gap_ms:.1f} ms · "
                 f"{_time_domain_text(point.time_domain, point.sync_generation)}")
         self.spectrum_info.setText(

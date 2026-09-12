@@ -51,6 +51,16 @@ def _write_file(path: Path, record_type: int, records: list[bytes]) -> None:
                      + b"".join(records))
 
 
+def _gps_body(protocol_sequence: int, latitude_e7: int, longitude_e7: int,
+              altitude_relative_mm: int, a_monotonic_ms: int,
+              *, valid_flags: int = 15) -> bytes:
+    return struct.pack(
+        "<B3xiiiIIH8B", protocol_sequence, latitude_e7, longitude_e7,
+        altitude_relative_mm, 1_725_000_000, a_monotonic_ms,
+        321 + (a_monotonic_ms - 2_000), 3, 4, 2, 1, 6, 88, 0,
+        valid_flags)
+
+
 def _make_mission(root: Path) -> None:
     raw_prefix = struct.pack("<IIHhBBBB", 7, 5000, 4, 0, GROUND, 0, 1, 0)
     raw = _record(2, raw_prefix + struct.pack("<4H", 10, 20, 30, 40),
@@ -65,12 +75,10 @@ def _make_mission(root: Path) -> None:
         a_monotonic_ms=2_075)
     _write_file(root / "REFLECTANCE.BIN", 3, [reflectance])
 
-    gps_before = struct.pack(
-        "<B3xiiiIIH8B", 11, 399_000_000, 1_164_000_000, 100_000,
-        1_725_000_000, 2_000, 321, 3, 4, 2, 1, 6, 88, 0, 15)
-    gps_after = struct.pack(
-        "<B3xiiiIIH8B", 12, 399_000_100, 1_164_000_200, 120_000,
-        1_725_000_000, 2_100, 421, 3, 4, 2, 1, 6, 87, 0, 15)
+    gps_before = _gps_body(
+        11, 399_000_000, 1_164_000_000, 100_000, 2_000)
+    gps_after = _gps_body(
+        12, 399_000_100, 1_164_000_200, 120_000, 2_100)
     _write_file(root / "GPS_TRACK.BIN", 1, [
         _record(1, gps_before, sequence=1, b_monotonic_us=1_010_000,
                 a_monotonic_ms=2_003),
@@ -114,16 +122,62 @@ class MissionViewerTests(unittest.TestCase):
         self.assertEqual(mission.events[0]["event"], "handshake")
         self.assertEqual(mission.event_errors[0].line_number, 3)
 
-    def test_isolates_crc_corruption_to_the_damaged_product(self) -> None:
+    def test_salvages_verified_prefix_at_crc_corruption(self) -> None:
         path = self.root / "RAW_SPECTRA.BIN"
+        first_record = path.read_bytes()[FILE_HEADER.size:]
+        raw_prefix = struct.pack(
+            "<IIHhBBBB", 8, 5000, 4, 0, GROUND, 0, 1, 0)
+        second_record = _record(
+            2, raw_prefix + struct.pack("<4H", 50, 60, 70, 80),
+            sequence=2, b_monotonic_us=1_060_000,
+            a_monotonic_ms=2_060)
+        _write_file(path, 2, [first_record, second_record])
         damaged = bytearray(path.read_bytes())
         damaged[-5] ^= 0x40
         path.write_bytes(damaged)
         mission = open_mission(self.root)
-        self.assertIsNone(mission.raw)
+        self.assertIsNotNone(mission.raw)
+        assert mission.raw is not None
+        self.assertEqual(len(mission.raw), 1)
+        self.assertEqual(mission.raw.raw_spectrum(0).samples,
+                         (10, 20, 30, 40))
         self.assertIsNotNone(mission.reflectance)
-        self.assertEqual(mission.product_errors[0].filename, "RAW_SPECTRA.BIN")
-        self.assertIn("CRC mismatch", mission.product_errors[0].message)
+        issue = next(item for item in mission.product_errors
+                     if item.filename == "RAW_SPECTRA.BIN")
+        self.assertIn("CRC mismatch", issue.message)
+        self.assertEqual(issue.recovered_records, 1)
+        self.assertGreater(issue.discarded_tail_bytes, 0)
+        self.assertFalse(issue.fatal)
+        strict = open_mission(self.root, strict_products=True)
+        self.assertIsNone(strict.raw)
+        self.assertTrue(next(item for item in strict.product_errors
+                             if item.filename == "RAW_SPECTRA.BIN").fatal)
+
+    def test_salvages_verified_prefix_at_truncated_tail(self) -> None:
+        path = self.root / "RAW_SPECTRA.BIN"
+        path.write_bytes(path.read_bytes() + b"\x44\x48")
+        mission = open_mission(self.root)
+        self.assertIsNotNone(mission.raw)
+        assert mission.raw is not None
+        self.assertEqual(len(mission.raw), 1)
+        self.assertIsNotNone(mission.raw.scan_issue)
+        assert mission.raw.scan_issue is not None
+        self.assertIn("truncated record header",
+                      mission.raw.scan_issue.message)
+        self.assertEqual(mission.raw.scan_issue.discarded_tail_bytes, 2)
+
+    def test_recovers_invalid_primary_summary_from_backup(self) -> None:
+        (self.root / "MISSION.JSON").write_text(
+            '{"flight_index":', encoding="utf-8")
+        (self.root / "MISSION.BAK").write_text(
+            '{"schema_version":1,"flight_index":41}', encoding="utf-8")
+        mission = open_mission(self.root)
+        self.assertEqual(mission.summary["flight_index"], 41)
+        self.assertEqual(mission.summary_source, "MISSION.BAK")
+        issue = next(item for item in mission.product_errors
+                     if item.filename == "MISSION.JSON")
+        self.assertFalse(issue.fatal)
+        self.assertIn("recovered summary", issue.message)
 
     def test_lazy_read_rechecks_crc_and_scan_identity(self) -> None:
         mission = open_mission(self.root)
@@ -188,6 +242,28 @@ class MissionViewerTests(unittest.TestCase):
         assert position is not None
         self.assertEqual(position.time_domain, "b_monotonic_us")
         self.assertAlmostEqual(position.interpolation_fraction, 1.0 / 3.0)
+
+    def test_position_survives_independently_invalid_altitude(self) -> None:
+        _write_file(self.root / "GPS_TRACK.BIN", 1, [
+            _record(1, _gps_body(
+                11, 399_000_000, 1_164_000_000, 100_000, 2_000),
+                sequence=1, b_monotonic_us=1_010_000,
+                a_monotonic_ms=2_003),
+            _record(1, _gps_body(
+                12, 399_000_100, 1_164_000_200, 999_999, 2_100,
+                valid_flags=13),
+                sequence=2, b_monotonic_us=1_130_000,
+                a_monotonic_ms=2_103),
+        ])
+        mission = open_mission(self.root)
+        position = mission.located_raw_spectrum(0).position
+        self.assertIsNotNone(position)
+        assert position is not None
+        self.assertAlmostEqual(position.latitude_deg, 39.900005)
+        self.assertIsNone(position.altitude_relative_m)
+        model = build_mission_map(mission)
+        self.assertIsNone(model.route[1].altitude_relative_m)
+        self.assertIsNone(model.measurements[0].altitude_relative_m)
 
     def test_builds_linked_map_layers_without_loading_spectrum_arrays(self) -> None:
         model = build_mission_map(open_mission(self.root))

@@ -25,6 +25,10 @@ class EventReadError:
 class ProductReadError:
     filename: str
     message: str
+    file_offset: int | None = None
+    recovered_records: int = 0
+    discarded_tail_bytes: int = 0
+    fatal: bool = True
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,7 @@ class Mission:
 
     path: Path
     summary: dict[str, Any]
+    summary_source: str | None
     events: list[dict[str, Any]]
     event_errors: list[EventReadError]
     product_errors: list[ProductReadError]
@@ -59,16 +64,52 @@ class Mission:
             self._positions = PositionInterpolator(self.gps.records)
 
     @classmethod
-    def open(cls, path: str | Path, *, verify_crc: bool = True) -> "Mission":
+    def open(cls, path: str | Path, *, verify_crc: bool = True,
+             strict_products: bool = False) -> "Mission":
         root = Path(path).expanduser().resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"mission directory not found: {root}")
 
+        product_errors: list[ProductReadError] = []
         summary: dict[str, Any] = {}
+        summary_source: str | None = None
+        primary_error: Exception | None = None
         summary_path = root / "MISSION.JSON"
+        backup_path = root / "MISSION.BAK"
+
+        def read_summary(candidate: Path) -> dict[str, Any]:
+            with candidate.open("r", encoding="utf-8") as stream:
+                value = json.load(stream)
+            if not isinstance(value, dict):
+                raise ValueError("mission summary is not a JSON object")
+            return value
+
         if summary_path.exists():
-            with summary_path.open("r", encoding="utf-8") as stream:
-                summary = json.load(stream)
+            try:
+                summary = read_summary(summary_path)
+                summary_source = summary_path.name
+            except (OSError, UnicodeError, json.JSONDecodeError,
+                    ValueError) as exc:
+                primary_error = exc
+        if summary_source is None and backup_path.exists():
+            try:
+                summary = read_summary(backup_path)
+                summary_source = backup_path.name
+            except (OSError, UnicodeError, json.JSONDecodeError,
+                    ValueError) as exc:
+                product_errors.append(ProductReadError(
+                    backup_path.name, str(exc)))
+        if primary_error is not None:
+            message = str(primary_error)
+            if summary_source == backup_path.name:
+                message += "; recovered summary from MISSION.BAK"
+            product_errors.append(ProductReadError(
+                summary_path.name, message,
+                fatal=summary_source is None))
+        elif not summary_path.exists() and summary_source == backup_path.name:
+            product_errors.append(ProductReadError(
+                summary_path.name,
+                "missing; recovered summary from MISSION.BAK", fatal=False))
 
         events: list[dict[str, Any]] = []
         event_errors: list[EventReadError] = []
@@ -88,18 +129,24 @@ class Mission:
                         # earlier valid events and report damaged lines.
                         event_errors.append(EventReadError(line_number, str(exc)))
 
-        product_errors: list[ProductReadError] = []
-
         def optional_file(name: str, expected_type: int) -> RecordFile | None:
             candidate = root / name
             if not candidate.exists():
                 return None
             try:
-                record_file = RecordFile.open(candidate, verify_crc=verify_crc)
+                record_file = RecordFile.open(
+                    candidate, verify_crc=verify_crc,
+                    strict=strict_products)
                 if record_file.header.record_type != expected_type:
                     raise RecordFormatError(
                         f"contains record type {record_file.header.record_type}, "
                         f"expected {expected_type}")
+                if record_file.scan_issue is not None:
+                    issue = record_file.scan_issue
+                    product_errors.append(ProductReadError(
+                        name, issue.message, issue.file_offset,
+                        issue.recovered_records, issue.discarded_tail_bytes,
+                        fatal=False))
                 return record_file
             except (OSError, RecordFormatError) as exc:
                 # Mission products are independent. A damaged spectrum file
@@ -108,7 +155,7 @@ class Mission:
                 return None
 
         mission = cls(
-            root, summary, events, event_errors, product_errors,
+            root, summary, summary_source, events, event_errors, product_errors,
             optional_file("RAW_SPECTRA.BIN", RECORD_RAW_SPECTRUM),
             optional_file("REFLECTANCE.BIN", RECORD_REFLECTANCE),
             optional_file("GPS_TRACK.BIN", RECORD_GPS),
@@ -138,10 +185,14 @@ class Mission:
             ("gps", self.gps)):
             files[key] = {
                 "present": record_file is not None,
-                "records": len(record_file) if record_file else 0,
-                "bytes": record_file.path.stat().st_size if record_file else 0,
+                "records": len(record_file) if record_file is not None else 0,
+                "bytes": (record_file.path.stat().st_size
+                          if record_file is not None else 0),
                 "duration_seconds": self._duration_seconds(record_file),
-                "crc_verified": bool(record_file and record_file.crc_verified),
+                "crc_verified": bool(record_file is not None and
+                                     record_file.crc_verified),
+                "recovered_prefix": bool(record_file is not None and
+                                         record_file.scan_issue is not None),
             }
         sessions = sorted({
             (ref.header.session_id, ref.header.segment_id)
@@ -153,6 +204,7 @@ class Mission:
         return {
             "path": str(self.path),
             "summary": self.summary,
+            "summary_source": self.summary_source,
             "files": files,
             "event_count": len(self.events),
             "event_errors": [asdict(item) for item in self.event_errors],
@@ -253,10 +305,12 @@ class Mission:
                 max_gap_ms=max_gap_ms))
 
 
-def open_mission(path: str | Path, *, verify_crc: bool = True) -> Mission:
+def open_mission(path: str | Path, *, verify_crc: bool = True,
+                 strict_products: bool = False) -> Mission:
     """Open a mission directory. This is the primary public API entry point."""
 
-    return Mission.open(path, verify_crc=verify_crc)
+    return Mission.open(path, verify_crc=verify_crc,
+                        strict_products=strict_products)
 
 
 GROUND = ROLE_GROUND

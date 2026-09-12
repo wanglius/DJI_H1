@@ -131,6 +131,16 @@ class ReflectanceSpectrum:
     sample_flags: bytes
 
 
+@dataclass(frozen=True)
+class RecordScanIssue:
+    """Damage that terminated a scan after a usable record prefix."""
+
+    file_offset: int
+    message: str
+    recovered_records: int
+    discarded_tail_bytes: int
+
+
 def _record_info(record_type: int, body: bytes, offset: int):
     if record_type == RECORD_RAW_SPECTRUM:
         if len(body) < _RAW_PREFIX.size:
@@ -162,16 +172,29 @@ class RecordFile:
     """
 
     def __init__(self, path: Path, header: FileHeader,
-                 records: tuple[RecordRef, ...], crc_verified: bool):
+                 records: tuple[RecordRef, ...], crc_verified: bool,
+                 scan_issue: RecordScanIssue | None = None):
         self.path = path
         self.header = header
         self.records = records
         self.crc_verified = crc_verified
+        self.scan_issue = scan_issue
 
     @classmethod
-    def open(cls, path: str | Path, *, verify_crc: bool = True) -> "RecordFile":
+    def open(cls, path: str | Path, *, verify_crc: bool = True,
+             strict: bool = True) -> "RecordFile":
+        """Index a record file.
+
+        Strict mode rejects any damaged record. Recovery mode stops at the
+        first invalid record and exposes the structurally valid, CRC-verified
+        prefix plus a :class:`RecordScanIssue`. File-header damage is always
+        fatal because no DJI H1 stream identity can then be established.
+        """
+
         source = Path(path)
         records: list[RecordRef] = []
+        scan_issue: RecordScanIssue | None = None
+        file_size = source.stat().st_size
         with source.open("rb") as stream:
             file_bytes = stream.read(FILE_HEADER_SIZE)
             if len(file_bytes) != FILE_HEADER_SIZE:
@@ -188,43 +211,59 @@ class RecordFile:
                 encoded_header = stream.read(RECORD_HEADER_SIZE)
                 if not encoded_header:
                     break
-                if len(encoded_header) != RECORD_HEADER_SIZE:
-                    raise RecordFormatError(f"truncated record header at {offset}")
-                fields = _RECORD_HEADER.unpack(encoded_header)
-                (record_magic, record_version, item_type, item_header_size,
-                 record_size, session_id, segment_id, flags, sequence,
-                 b_us, a_ms, utc_ms, sync_age, sync_generation, sync_state,
-                 valid_flags) = fields
-                if record_magic != RECORD_MAGIC or record_version != FORMAT_VERSION:
-                    raise RecordFormatError(
-                        f"invalid record signature/version at {offset}")
-                if item_header_size != RECORD_HEADER_SIZE or item_type != record_type:
-                    raise RecordFormatError(f"invalid record header at {offset}")
-                if record_size > MAX_RECORD_SIZE:
-                    raise RecordFormatError(f"record is unreasonably large at {offset}")
-                body_size = record_size - RECORD_HEADER_SIZE - 4
-                if body_size < 0:
-                    raise RecordFormatError(f"invalid record size at {offset}")
-                body = stream.read(body_size)
-                crc_bytes = stream.read(4)
-                if len(body) != body_size or len(crc_bytes) != 4:
-                    raise RecordFormatError(f"truncated record at {offset}")
-                expected_crc, = struct.unpack("<I", crc_bytes)
-                if verify_crc:
-                    actual_crc = zlib.crc32(encoded_header)
-                    actual_crc = zlib.crc32(body, actual_crc) & 0xFFFFFFFF
-                    if actual_crc != expected_crc:
-                        raise RecordFormatError(f"CRC mismatch at {offset}")
-                header = RecordHeader(
-                    item_type, record_size, session_id, segment_id, flags,
-                    sequence, b_us, a_ms, utc_ms, sync_age, sync_generation,
-                    sync_state, valid_flags)
-                records.append(RecordRef(
-                    header, offset, offset + RECORD_HEADER_SIZE, body_size,
-                    _record_info(item_type, body, offset), expected_crc))
-                offset += record_size
+                try:
+                    if len(encoded_header) != RECORD_HEADER_SIZE:
+                        raise RecordFormatError(
+                            f"truncated record header at {offset}")
+                    fields = _RECORD_HEADER.unpack(encoded_header)
+                    (record_magic, record_version, item_type, item_header_size,
+                     record_size, session_id, segment_id, flags, sequence,
+                     b_us, a_ms, utc_ms, sync_age, sync_generation, sync_state,
+                     valid_flags) = fields
+                    if (record_magic != RECORD_MAGIC or
+                            record_version != FORMAT_VERSION):
+                        raise RecordFormatError(
+                            f"invalid record signature/version at {offset}")
+                    if (item_header_size != RECORD_HEADER_SIZE or
+                            item_type != record_type):
+                        raise RecordFormatError(
+                            f"invalid record header at {offset}")
+                    if record_size > MAX_RECORD_SIZE:
+                        raise RecordFormatError(
+                            f"record is unreasonably large at {offset}")
+                    body_size = record_size - RECORD_HEADER_SIZE - 4
+                    if body_size < 0:
+                        raise RecordFormatError(
+                            f"invalid record size at {offset}")
+                    body = stream.read(body_size)
+                    crc_bytes = stream.read(4)
+                    if len(body) != body_size or len(crc_bytes) != 4:
+                        raise RecordFormatError(
+                            f"truncated record at {offset}")
+                    expected_crc, = struct.unpack("<I", crc_bytes)
+                    if verify_crc:
+                        actual_crc = zlib.crc32(encoded_header)
+                        actual_crc = zlib.crc32(body, actual_crc) & 0xFFFFFFFF
+                        if actual_crc != expected_crc:
+                            raise RecordFormatError(
+                                f"CRC mismatch at {offset}")
+                    header = RecordHeader(
+                        item_type, record_size, session_id, segment_id, flags,
+                        sequence, b_us, a_ms, utc_ms, sync_age,
+                        sync_generation, sync_state, valid_flags)
+                    records.append(RecordRef(
+                        header, offset, offset + RECORD_HEADER_SIZE, body_size,
+                        _record_info(item_type, body, offset), expected_crc))
+                    offset += record_size
+                except RecordFormatError as exc:
+                    if strict:
+                        raise
+                    scan_issue = RecordScanIssue(
+                        offset, str(exc), len(records),
+                        max(0, file_size - offset))
+                    break
         return cls(source, FileHeader(record_type, version), tuple(records),
-                   verify_crc)
+                   verify_crc, scan_issue)
 
     def __len__(self) -> int:
         return len(self.records)

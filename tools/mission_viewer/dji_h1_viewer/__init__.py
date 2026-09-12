@@ -2,13 +2,14 @@
 
 from .decoder import (
     FORMAT_VERSION, GpsSample, RawRecordInfo, RawSpectrum, RecordFile,
-    RecordFormatError, RecordHeader, ReflectanceRecordInfo,
+    RecordFormatError, RecordHeader, RecordScanIssue, ReflectanceRecordInfo,
     ReflectanceSpectrum, RECORD_GPS, RECORD_RAW_SPECTRUM,
     RECORD_REFLECTANCE, ROLE_GROUND, ROLE_SKY,
 )
 from .api import MissionHttpServer, MissionService, start_http_api
 from .geolocation import (
-    DEFAULT_WIDE_GAP_MS, InterpolatedPosition, PositionInterpolator, TimeDomain,
+    DEFAULT_WIDE_GAP_MS, DRONE_VALID_ALTITUDE, DRONE_VALID_POSITION,
+    InterpolatedPosition, PositionInterpolator, TimeDomain,
 )
 from .mission import (
     GROUND, SKY, LocatedRawSpectrum, LocatedReflectanceSpectrum, Mission,
@@ -29,7 +30,8 @@ from .telemetry import (
 )
 
 __all__ = [
-    "DEFAULT_REASSEMBLY_MESSAGE_MAX", "DEFAULT_WIDE_GAP_MS", "FORMAT_VERSION",
+    "DEFAULT_REASSEMBLY_MESSAGE_MAX", "DEFAULT_WIDE_GAP_MS",
+    "DRONE_VALID_ALTITUDE", "DRONE_VALID_POSITION", "FORMAT_VERSION",
     "FRAGMENT_PAYLOAD_MAX",
     "FRAGMENT_WIRE_MAX_SIZE", "FragmentError", "GROUND", "SKY", "GpsSample",
     "InterpolatedPosition", "LocatedRawSpectrum", "LocatedReflectanceSpectrum",
@@ -38,6 +40,7 @@ __all__ = [
     "MissionMapModel", "MissionService", "PositionInterpolator",
     "ProductReadError", "RoutePoint",
     "RawRecordInfo", "RawSpectrum", "RecordFile", "RecordFormatError",
+    "RecordScanIssue",
     "RecordHeader", "RECORD_GPS", "RECORD_RAW_SPECTRUM",
     "RECORD_REFLECTANCE", "ReflectanceRecordInfo", "ReflectanceSpectrum",
     "ROLE_GROUND", "ROLE_SKY", "ReassembledTelemetry",

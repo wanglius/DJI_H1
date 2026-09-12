@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .decoder import GpsSample, ReflectanceRecordInfo
-from .geolocation import DRONE_VALID_POSITION
+from .geolocation import DRONE_VALID_ALTITUDE, DRONE_VALID_POSITION
 from .mission import Mission
 
 
@@ -14,7 +14,7 @@ from .mission import Mission
 class RoutePoint:
     latitude_deg: float
     longitude_deg: float
-    altitude_relative_m: float
+    altitude_relative_m: float | None
     b_monotonic_us: int
     gps_index: int
 
@@ -23,7 +23,7 @@ class RoutePoint:
 class MeasurementPoint:
     latitude_deg: float
     longitude_deg: float
-    altitude_relative_m: float
+    altitude_relative_m: float | None
     reflectance_index: int
     session_id: int
     segment_id: int
@@ -118,7 +118,8 @@ def build_mission_map(mission: Mission) -> MissionMapModel:
                 continue
             route.append(RoutePoint(
                 sample.latitude_e7 / 1e7, sample.longitude_e7 / 1e7,
-                sample.altitude_relative_mm / 1000.0,
+                (sample.altitude_relative_mm / 1000.0
+                 if sample.valid_flags & DRONE_VALID_ALTITUDE else None),
                 ref.header.b_monotonic_us, index))
 
     measurements: list[MeasurementPoint] = []

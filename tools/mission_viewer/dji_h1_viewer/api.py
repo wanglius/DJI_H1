@@ -33,9 +33,11 @@ class MissionService:
         with self._lock:
             return self._mission
 
-    def load(self, path: str | Path, *, verify_crc: bool = True) -> dict[str, Any]:
+    def load(self, path: str | Path, *, verify_crc: bool = True,
+             strict_products: bool = False) -> dict[str, Any]:
         # Decode first so a bad selection does not discard the current mission.
-        candidate = open_mission(path, verify_crc=verify_crc)
+        candidate = open_mission(path, verify_crc=verify_crc,
+                                 strict_products=strict_products)
         with self._lock:
             self._mission = candidate
             return candidate.overview()

@@ -99,9 +99,16 @@ print(result["position"])
 ```
 
 Opening a mission verifies every record CRC by default, and selected spectra
-are revalidated when lazily read. A damaged product is reported independently
-so it cannot hide usable GPS, events, metadata, or the other spectrum file.
-The viewer never writes to the mission folder.
+are revalidated when lazily read. If a power loss leaves a truncated or
+CRC-damaged tail, the normal viewer/API path exposes every verified record
+before that tail and reports the recovery offset, record count, and discarded
+byte count. Pass `strict_products=True` to `open_mission()` or
+`MissionService.load()` when batch validation should reject the whole damaged
+product instead. A damaged product is reported independently so it cannot hide
+usable GPS, events, metadata, or the other spectrum file. If `MISSION.JSON` is
+missing or invalid, the loader tries the recorder's previous atomic checkpoint
+in `MISSION.BAK` and reports which summary was used. The viewer never writes to
+the mission folder.
 
 Spectrum locations are interpolated between the valid GPS points immediately
 before and after the spectrum timestamp. The default `auto` time domain uses
@@ -111,6 +118,9 @@ to B-board monotonic receive time when synchronized A time is unavailable.
 The result includes both bracketing GPS indices, the interpolation fraction,
 gap duration, source sequence numbers, and a quality value of `exact`,
 `interpolated`, or `wide_gap`. It never extrapolates beyond the recorded track.
+Latitude/longitude and relative altitude use their independent protocol
+validity bits: a usable horizontal position may therefore carry
+`altitude_relative_m=None` instead of a fabricated altitude.
 Pass `max_gap_ms=...` to reject estimates spanning an outage that is too long
 for a particular analysis. The measurement panel also displays whether the
 position used synchronized A monotonic time (including its sync generation) or

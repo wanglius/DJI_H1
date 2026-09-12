@@ -12,6 +12,7 @@ from .decoder import GpsSample, RecordHeader, RecordRef
 
 RECORD_TIME_VALID_A_MONOTONIC = 1 << 1
 DRONE_VALID_POSITION = 1 << 0
+DRONE_VALID_ALTITUDE = 1 << 1
 DEFAULT_WIDE_GAP_MS = 500.0
 _U32_MODULUS = 1 << 32
 _U32_HALF_RANGE = 1 << 31
@@ -25,7 +26,7 @@ class InterpolatedPosition:
 
     latitude_deg: float
     longitude_deg: float
-    altitude_relative_m: float
+    altitude_relative_m: float | None
     time_domain: str
     target_time: int
     before_time: int
@@ -180,9 +181,16 @@ class PositionInterpolator:
                     (right.latitude_e7 - left.latitude_e7) * fraction) / 1e7
         longitude = _longitude_lerp(left.longitude_e7 / 1e7,
                                     right.longitude_e7 / 1e7, fraction)
-        altitude = (left.altitude_relative_mm +
-                    (right.altitude_relative_mm - left.altitude_relative_mm) *
-                    fraction) / 1000.0
+        # Position and relative altitude have independent protocol validity
+        # bits. Never turn an invalid placeholder altitude into plausible
+        # interpolated flight data.
+        if ((left.valid_flags & DRONE_VALID_ALTITUDE) and
+                (right.valid_flags & DRONE_VALID_ALTITUDE)):
+            altitude = (left.altitude_relative_mm +
+                        (right.altitude_relative_mm -
+                         left.altitude_relative_mm) * fraction) / 1000.0
+        else:
+            altitude = None
         quality = "exact" if before.gps_index == after.gps_index else (
             "wide_gap" if gap_ms > wide_gap_ms else "interpolated")
         return InterpolatedPosition(
