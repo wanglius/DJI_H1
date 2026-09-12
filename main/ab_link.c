@@ -257,7 +257,7 @@ static void handle_frame(const ab_frame_t *frame)
         if (s_state.linked) {
             (void)measurement_recorder_log_event(
                 MEASUREMENT_EVENT_POWER_OFF_REQUEST, grace_seconds, 0);
-            result = mission_control_power_off();
+            result = mission_control_power_off(grace_seconds);
         }
         cache_and_send_ack(frame, result);
         ESP_LOGI(TAG, "Power-off request: grace=%us (A owns deadline)", grace_seconds);

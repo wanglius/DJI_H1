@@ -112,6 +112,23 @@ static bool s_test_stall_done;
 static esp_err_t close_files(void);
 static esp_err_t open_flight_files(void);
 
+static int64_t earlier_deadline(int64_t first, int64_t second)
+{
+    return first < second ? first : second;
+}
+
+static TickType_t wait_ticks_before(int64_t deadline_us, uint32_t cap_ms)
+{
+    TickType_t cap_ticks = pdMS_TO_TICKS(cap_ms);
+    if (deadline_us == INT64_MAX) return cap_ticks;
+    int64_t remaining_us = deadline_us - esp_timer_get_time();
+    if (remaining_us <= 0) return 0;
+    uint64_t remaining_ms = ((uint64_t)remaining_us + 999U) / 1000U;
+    TickType_t remaining_ticks = pdMS_TO_TICKS(remaining_ms);
+    if (remaining_ticks == 0) remaining_ticks = 1;
+    return remaining_ticks < cap_ticks ? remaining_ticks : cap_ticks;
+}
+
 static void timestamp_finished_mission(uint64_t utc_ms)
 {
     static const char *const files[] = {
@@ -459,6 +476,7 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"reflectance_skipped_shutdown\": %" PRIu32 ",\n"
         "  \"telemetry\": {\"infrastructure_healthy\": %s"
         ", \"delivery_degraded\": %s"
+        ", \"shutdown_aborted\": %s"
         ", \"gps_submitted\": %" PRIu32
         ", \"gps_sent\": %" PRIu32 ", \"gps_superseded\": %" PRIu32
         ", \"reflectance_submitted\": %" PRIu32
@@ -497,6 +515,7 @@ static esp_err_t write_mission_summary(const char *state)
         totals.calculation_rejected, totals.reflectance_skipped_shutdown,
         telemetry.healthy ? "true" : "false",
         telemetry_delivery_degraded ? "true" : "false",
+        telemetry.shutdown_aborted ? "true" : "false",
         telemetry.gps_submitted, telemetry.gps_sent,
         telemetry.gps_superseded, telemetry.reflectance_submitted,
         telemetry.reflectance_sent, telemetry.reflectance_queue_overflows,
@@ -769,7 +788,8 @@ static void writer_task(void *unused)
                 /* Queue pressure is counted and rate-limited inside telemetry;
                  * avoid turning a recoverable DTU slowdown into log flooding. */
                 if (telemetry_result != ESP_OK &&
-                    telemetry_result != ESP_ERR_NO_MEM) {
+                    telemetry_result != ESP_ERR_NO_MEM &&
+                    telemetry_result != ESP_ERR_INVALID_STATE) {
                     ESP_LOGW(TAG, "Reflectance telemetry rejected: %s",
                              esp_err_to_name(telemetry_result));
                 }
@@ -1102,7 +1122,8 @@ esp_err_t measurement_recorder_submit_gps(const gps_record_t *record)
                             GPS_RECORD_WIRE_SIZE, sequence, session, segment,
                             &record->header.timestamp);
     esp_err_t telemetry_result = telemetry_submit_gps(&message.data.gps);
-    if (telemetry_result != ESP_OK) {
+    if (telemetry_result != ESP_OK &&
+        telemetry_result != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "GPS telemetry rejected: %s",
                  esp_err_to_name(telemetry_result));
     }
@@ -1219,7 +1240,7 @@ void measurement_recorder_note_handshake(const uint8_t drone_serial[32],
     }
 }
 
-esp_err_t measurement_recorder_end(void)
+static esp_err_t measurement_recorder_end_until(int64_t deadline_us)
 {
     taskENTER_CRITICAL(&s_lock);
     if (s_status.active) {
@@ -1233,7 +1254,8 @@ esp_err_t measurement_recorder_end(void)
     taskEXIT_CRITICAL(&s_lock);
     if (!pending) return healthy ? ESP_OK : ESP_FAIL;
 
-    int64_t submit_deadline = esp_timer_get_time() + 100000;
+    int64_t submit_deadline = earlier_deadline(
+        deadline_us, esp_timer_get_time() + 100000);
     while (true) {
         taskENTER_CRITICAL(&s_lock);
         bool raw_drained = s_raw_submitters == 0;
@@ -1245,14 +1267,15 @@ esp_err_t measurement_recorder_end(void)
     if (!barrier_queued) {
         message_t barrier = {.type = MSG_BARRIER};
         if (xQueueSend(s_writer_queue, &barrier,
-                       pdMS_TO_TICKS(2000)) != pdTRUE) {
+                       wait_ticks_before(deadline_us, 2000)) != pdTRUE) {
             return ESP_ERR_TIMEOUT;
         }
         taskENTER_CRITICAL(&s_lock);
         s_end_barrier_queued = true;
         taskEXIT_CRITICAL(&s_lock);
     }
-    if (xSemaphoreTake(s_barrier, pdMS_TO_TICKS(10000)) != pdTRUE)
+    if (xSemaphoreTake(s_barrier,
+                       wait_ticks_before(deadline_us, 10000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
     taskENTER_CRITICAL(&s_lock);
     s_end_pending = false;
@@ -1281,9 +1304,21 @@ esp_err_t measurement_recorder_end(void)
     return status.healthy ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t measurement_recorder_shutdown(void)
+esp_err_t measurement_recorder_end(void)
 {
-    esp_err_t result = measurement_recorder_end();
+    return measurement_recorder_end_until(INT64_MAX);
+}
+
+void measurement_recorder_prepare_shutdown(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_accept_aux = false;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+esp_err_t measurement_recorder_shutdown(int64_t deadline_us)
+{
+    esp_err_t result = measurement_recorder_end_until(deadline_us);
     /* A timeout means the writer may still own a FILE. Closing or unmounting
      * underneath it would turn a recoverable fault into memory corruption. */
     if (result == ESP_ERR_TIMEOUT) return result;
@@ -1300,35 +1335,32 @@ esp_err_t measurement_recorder_shutdown(void)
     taskEXIT_CRITICAL(&s_lock);
     if (!had_flight) return result;
 
-    int64_t deadline = esp_timer_get_time() + 100000;
+    int64_t submit_deadline = earlier_deadline(
+        deadline_us, esp_timer_get_time() + 100000);
     while (true) {
         taskENTER_CRITICAL(&s_lock);
         bool drained = s_aux_submitters == 0 && s_raw_submitters == 0;
         taskEXIT_CRITICAL(&s_lock);
         if (drained) break;
-        if (esp_timer_get_time() >= deadline) return ESP_ERR_TIMEOUT;
+        if (esp_timer_get_time() >= submit_deadline) return ESP_ERR_TIMEOUT;
         vTaskDelay(1);
     }
     if (!finalize_queued) {
         message_t finalize = {.type = MSG_FINALIZE};
         if (xQueueSend(s_writer_queue, &finalize,
-                       pdMS_TO_TICKS(2000)) != pdTRUE) {
+                       wait_ticks_before(deadline_us, 2000)) != pdTRUE) {
             return ESP_ERR_TIMEOUT;
         }
         taskENTER_CRITICAL(&s_lock);
         s_finalize_queued = true;
         taskEXIT_CRITICAL(&s_lock);
     }
-    if (xSemaphoreTake(s_barrier, pdMS_TO_TICKS(10000)) != pdTRUE)
+    if (xSemaphoreTake(s_barrier,
+                       wait_ticks_before(deadline_us, 10000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
-    esp_err_t telemetry_result = telemetry_finish_mission(8000);
-    if (telemetry_result != ESP_OK) {
-        ESP_LOGE(TAG, "Telemetry drain failed: %s",
-                 esp_err_to_name(telemetry_result));
-        if (result == ESP_OK) result = telemetry_result;
-    }
-
+    /* Telemetry was already cancelled synchronously when the power-off
+     * forecast arrived. Nothing outside the SD writer may delay this close. */
     esp_err_t close_result = close_files();
     if (result == ESP_OK) result = close_result;
     if (close_result != ESP_OK) note_storage_result(close_result, "Flight file close");

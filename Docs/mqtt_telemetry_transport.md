@@ -115,13 +115,19 @@ ACK whose application status is nonzero. `acknowledgement_rejected` remains in
 cause. Mismatched keys are logged with the received and expected message
 identity at a rate-limited cadence.
 
-At final power-off, recorder admission closes first, then a bounded telemetry
-barrier waits for the latest queued GPS/reflectance records to drain into the
-DTU UART and receive their cloud acknowledgements before the final mission
-summary is written. A timeout is reported as an unsafe shutdown instead of
-claiming that pending bytes were delivered. The timeout boundary performs one
-final guarded queue/worker check so completion concurrent with the deadline is
-not misreported as a drain failure.
+At final power-off, telemetry is deliberately abandoned as soon as the B board
+receives the `0x30` forecast. Admission closes, queued GPS/reflectance copies are
+purged, and an in-progress fragment/ACK/retry sequence observes a cancellation
+flag. Cloud delivery never delays authoritative SD finalization. The final
+`MISSION.JSON` records `telemetry.shutdown_aborted=true`; this is intentional
+shutdown policy, not an infrastructure failure or delivery-pressure fault.
+
+The `grace_sec` value becomes an absolute B-monotonic cleanup deadline. Reader
+and recorder barrier waits are bounded by that deadline, with time reserved for
+the final synchronous FAT operations. A FAT flush/close already in progress is
+allowed to return because interrupting it could damage the filesystem. The B
+board sets `safe_power_off=1` only after all files close and the card unmounts;
+deadline expiry alone never claims safety.
 
 Each encoded fragment should be submitted to the ESP32 UART in one call. After
 the UART drains, the sender leaves the configured conservative gap. This often

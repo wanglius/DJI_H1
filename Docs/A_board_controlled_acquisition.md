@@ -29,10 +29,13 @@ is retained for that standalone bench harness; duration zero is command-driven.
 - Boot-local history suppresses the 64 most recently accepted session IDs.
   Older IDs are evicted, so A must not reuse IDs within a flight. History is
   lost on reset; it is not persistent replay protection across power cycles.
-- Prepare-power-off is terminal until reset. It cancels acquisition and
-  unmounts SD. Safe=1 requires successful cleanup, no latched lifecycle failure,
-  and successful unmount. A owns the grace deadline and physical power switch.
-  Software never claims safety merely because the grace period expired.
+- Prepare-power-off is terminal until reset. It immediately abandons queued and
+  in-progress telemetry, cancels acquisition, drains/closes the authoritative SD
+  files, and unmounts SD. The received grace value is enforced as an absolute
+  monotonic deadline for task/barrier waits; repeated requests cannot extend it.
+  Safe=1 requires successful cleanup, no latched lifecycle failure, and
+  successful unmount. A owns the physical power switch. Software never claims
+  safety merely because the grace period expired.
 - Raw and reflectance files drain, synchronize, and close before unmount.
 
 ## Heartbeat meaning

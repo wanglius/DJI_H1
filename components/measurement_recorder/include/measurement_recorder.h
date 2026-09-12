@@ -57,8 +57,15 @@ esp_err_t measurement_recorder_init(void);
 esp_err_t measurement_recorder_begin(uint32_t session_id, uint16_t segment_id);
 /** Drain the segment and flush every file. Safe to retry after a timeout. */
 esp_err_t measurement_recorder_end(void);
-/** Drain and close the mission before SD unmount. Safe to retry after timeout. */
-esp_err_t measurement_recorder_shutdown(void);
+/** Nonblocking power-off forecast hook. Stops new GPS/event submissions while
+ * allowing already-admitted records and final in-flight raw frames to drain. */
+void measurement_recorder_prepare_shutdown(void);
+/** Drain and close the mission before SD unmount. Safe to retry after timeout.
+ * deadline_us is an absolute esp_timer deadline. Queue/barrier waits never
+ * extend beyond it; synchronous FAT flush/close operations, once begun, are
+ * allowed to finish because interrupting them would risk filesystem damage.
+ */
+esp_err_t measurement_recorder_shutdown(int64_t deadline_us);
 
 /** Copy a completed H1 frame into a fixed pool buffer and enqueue its pointer.
  * Set allow_reflectance false for a frame completed after capture stop was

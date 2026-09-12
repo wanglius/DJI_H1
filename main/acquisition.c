@@ -67,6 +67,7 @@ static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static acquisition_status_t s_status;
 static bool s_stop_requested;
 static bool s_read_failed;
+static int64_t s_stop_deadline_us = INT64_MAX;
 
 void acquisition_get_status(acquisition_status_t *out)
 {
@@ -79,6 +80,7 @@ void acquisition_arm(void)
 {
     taskENTER_CRITICAL(&s_status_lock);
     memset(&s_status, 0, sizeof(s_status));
+    s_stop_deadline_us = INT64_MAX;
     taskEXIT_CRITICAL(&s_status_lock);
     __atomic_store_n(&s_read_failed, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_stop_requested, false, __ATOMIC_RELEASE);
@@ -87,6 +89,14 @@ void acquisition_arm(void)
 void acquisition_request_stop(void)
 {
     __atomic_store_n(&s_stop_requested, true, __ATOMIC_RELEASE);
+}
+
+void acquisition_request_stop_before(int64_t deadline_us)
+{
+    taskENTER_CRITICAL(&s_status_lock);
+    if (deadline_us < s_stop_deadline_us) s_stop_deadline_us = deadline_us;
+    taskEXIT_CRITICAL(&s_status_lock);
+    acquisition_request_stop();
 }
 
 static const char *status_name(uint8_t status)
@@ -399,11 +409,16 @@ static esp_err_t stop_acquisition_tasks(bool stream_started[SENSOR_COUNT],
             }
         }
         if (pending == 0) break;
+        taskENTER_CRITICAL(&s_status_lock);
+        int64_t requested_deadline_us = s_stop_deadline_us;
+        taskEXIT_CRITICAL(&s_status_lock);
+        if (requested_deadline_us < deadline_us)
+            deadline_us = requested_deadline_us;
         if (esp_timer_get_time() >= deadline_us) {
             for (size_t i = 0; i < SENSOR_COUNT; i++) {
                 if (waiting[i]) {
                     ESP_LOGE(TAG,
-                             "%s did not stop within 6 seconds; task retained",
+                             "%s did not stop before cleanup deadline; task retained",
                              s_sensors[i].name);
                 }
             }

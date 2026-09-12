@@ -3,6 +3,7 @@
 #include "acquisition.h"
 #include "calculation.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "measurement_recorder.h"
@@ -14,14 +15,24 @@ static const char *TAG = "MISSION";
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_task;
 static bool s_initialized, s_busy, s_pending, s_power_off, s_safe;
+static int64_t s_shutdown_deadline_us = INT64_MAX;
 static uint32_t s_session;
 static uint16_t s_segment;
 static uint8_t s_error, s_free_percent;
+#define SHUTDOWN_ACQUISITION_RESERVE_US 2000000LL
+#define SHUTDOWN_FINAL_IO_RESERVE_US     500000LL
 /* Recent completed IDs suppress delayed stale commands. The ring never blocks
  * a healthy flight after an arbitrary number of capture intervals. */
 #define SESSION_LIMIT 64
 static uint32_t s_sessions[SESSION_LIMIT];
 static size_t s_session_count;
+
+static int64_t reserve_shutdown_time(int64_t deadline_us, int64_t reserve_us)
+{
+    int64_t now_us = esp_timer_get_time();
+    return deadline_us - now_us > reserve_us ? deadline_us - reserve_us
+                                              : deadline_us;
+}
 
 /* Error mapping is B-defined: 1 SD, 2 initialization, 3 acquisition/lifecycle,
  * 4 shutdown, 5 measurement-data degradation (decode failures, recorder
@@ -71,11 +82,29 @@ uint8_t mission_control_stop(uint32_t session)
     return result;
 }
 
-uint8_t mission_control_power_off(void)
+uint8_t mission_control_power_off(uint8_t grace_seconds)
 {
+    int64_t requested_deadline = esp_timer_get_time() +
+        (int64_t)grace_seconds * 1000000LL;
+    /* This call is deliberately nonblocking. It closes telemetry admission,
+     * purges queued cloud work and makes any ACK wait/retry exit promptly. */
+    esp_err_t telemetry_result = telemetry_abort_mission();
+    if (telemetry_result != ESP_OK) {
+        ESP_LOGW(TAG, "Could not abort telemetry at power-off: %s",
+                 esp_err_to_name(telemetry_result));
+    }
+    /* The power-off event was queued by ab_link before this call. Refuse new
+     * GPS/external events now so the SD queue becomes finite while the last
+     * in-flight spectra complete. */
+    measurement_recorder_prepare_shutdown();
     taskENTER_CRITICAL(&s_lock);
-    s_power_off = true; /* Terminal until reset; no new starts after shutdown. */
-    acquisition_request_stop();
+    /* A repeated request must never extend the original physical power-cut
+     * deadline. Prepare-power-off remains terminal until reset. */
+    if (!s_power_off || requested_deadline < s_shutdown_deadline_us)
+        s_shutdown_deadline_us = requested_deadline;
+    s_power_off = true;
+    acquisition_request_stop_before(reserve_shutdown_time(
+        s_shutdown_deadline_us, SHUTDOWN_ACQUISITION_RESERVE_US));
     taskEXIT_CRITICAL(&s_lock);
     xTaskNotifyGive(s_task);
     return 0;
@@ -181,10 +210,16 @@ static void control_task(void *unused)
             result = measurement_recorder_begin(session, segment);
             bool storage_failure = result != ESP_OK;
             if (result == ESP_OK) result = acquisition_run_dual(0);
-            esp_err_t recorder_result = measurement_recorder_end();
+            taskENTER_CRITICAL(&s_lock);
+            bool power_off = s_power_off;
+            taskEXIT_CRITICAL(&s_lock);
+            /* On prepare-power-off, the terminal shutdown path below drains
+             * the segment and finalizes the mission under one shared deadline. */
+            esp_err_t recorder_result = power_off ? ESP_OK :
+                measurement_recorder_end();
             if (recorder_result != ESP_OK) storage_failure = true;
             if (result == ESP_OK) result = recorder_result;
-            if (result == ESP_OK) {
+            if (result == ESP_OK && !power_off) {
                 result = refresh_storage();
                 if (result != ESP_OK) storage_failure = true;
             }
@@ -210,9 +245,12 @@ static void control_task(void *unused)
          * Retained active resources on failure must never qualify as safe. */
         bool shutdown = s_power_off && !s_pending && !s_busy && !s_safe;
         bool healthy = s_error == 0;
+        int64_t shutdown_deadline_us = s_shutdown_deadline_us;
         taskEXIT_CRITICAL(&s_lock);
         if (shutdown) {
-            result = measurement_recorder_shutdown();
+            int64_t recorder_wait_deadline = reserve_shutdown_time(
+                shutdown_deadline_us, SHUTDOWN_FINAL_IO_RESERVE_US);
+            result = measurement_recorder_shutdown(recorder_wait_deadline);
             if (result == ESP_OK && sd_card_is_mounted())
                 result = sd_card_unmount();
             taskENTER_CRITICAL(&s_lock);

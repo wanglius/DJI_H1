@@ -21,3 +21,10 @@ CONFIG_SPIRAM_MEMTEST=y
 # reserved for explicit large allocations until each workload is qualified.
 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=n
 CONFIG_FATFS_ALLOC_PREFER_EXTRAM=n
+
+# ESP32-S3-WROOM-1U-N16R8 flash. DIO at 80 MHz is already qualified on the
+# production board; the custom table reserves factory/recovery and two OTA
+# images without enabling OTA or rollback policy prematurely.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

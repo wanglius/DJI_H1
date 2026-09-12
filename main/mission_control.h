@@ -11,7 +11,9 @@ esp_err_t mission_control_init(void);
  */
 uint8_t mission_control_start(uint32_t session);
 uint8_t mission_control_stop(uint32_t session);
-uint8_t mission_control_power_off(void);
+/** Begin terminal shutdown. grace_seconds comes directly from A and bounds
+ * cleanup; telemetry is abandoned immediately in favor of SD finalization. */
+uint8_t mission_control_power_off(uint8_t grace_seconds);
 bool mission_control_ready(void);
 /** Snapshot only: never performs sensor or SD I/O on the UART task. */
 void mission_control_get_status(ab_status_report_t *out);

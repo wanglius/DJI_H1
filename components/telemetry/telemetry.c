@@ -31,6 +31,7 @@ static QueueHandle_t s_reflectance_queue;
 static TaskHandle_t s_task;
 static bool s_accepting;
 static bool s_sending;
+static bool s_abort_requested;
 static uint32_t s_submitters;
 
 /* Sole task workspaces are static: a full reflectance record and its encoded
@@ -63,12 +64,21 @@ static void note_serialization_fault(void)
     taskEXIT_CRITICAL(&s_lock);
 }
 
+static bool abort_requested(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    bool requested = s_abort_requested;
+    taskEXIT_CRITICAL(&s_lock);
+    return requested;
+}
+
 static esp_err_t emit_fragment(const uint8_t *fragment, size_t length,
                                uint16_t index, uint16_t count, void *context)
 {
     (void)index;
     (void)count;
     bool *uart_failed = context;
+    if (abort_requested()) return ESP_ERR_INVALID_STATE;
     int written = uart_write_bytes(s_config.uart_port, fragment, length);
     if (written != (int)length) {
         *uart_failed = true;
@@ -82,6 +92,7 @@ static esp_err_t emit_fragment(const uint8_t *fragment, size_t length,
         note_uart_fault();
         return result;
     }
+    if (abort_requested()) return ESP_ERR_INVALID_STATE;
 
     taskENTER_CRITICAL(&s_lock);
     s_status.fragments_sent++;
@@ -197,6 +208,7 @@ static esp_err_t wait_for_ack(const telemetry_fragment_plan_t *plan)
     TickType_t started = xTaskGetTickCount();
     uint8_t incoming[TELEMETRY_UART_DRAIN_SIZE];
     while (xTaskGetTickCount() - started < timeout) {
+        if (abort_requested()) return ESP_ERR_INVALID_STATE;
         telemetry_ack_t ack;
         while (take_next_ack(&ack)) {
             bool matches = ack.source_id == plan->source_id &&
@@ -249,13 +261,17 @@ static esp_err_t send_serialized(uint8_t message_type, uint64_t mission_id,
         return result;
     }
     for (unsigned attempt = 0; attempt <= s_config.max_retries; attempt++) {
+        if (abort_requested()) return ESP_ERR_INVALID_STATE;
         bool uart_failed = false;
         result = telemetry_fragment_emit_all(
             &plan, s_fragment_buffer, sizeof(s_fragment_buffer),
             emit_fragment, &uart_failed);
-        if (result != ESP_OK && !uart_failed) note_serialization_fault();
+        if (result != ESP_OK && !uart_failed && !abort_requested())
+            note_serialization_fault();
+        if (abort_requested()) return ESP_ERR_INVALID_STATE;
         if (result == ESP_OK) result = wait_for_ack(&plan);
         if (result == ESP_OK) return ESP_OK;
+        if (abort_requested()) return ESP_ERR_INVALID_STATE;
         if (attempt < s_config.max_retries) {
             taskENTER_CRITICAL(&s_lock);
             s_status.messages_retried++;
@@ -315,6 +331,18 @@ static void telemetry_task(void *unused)
         pdMS_TO_TICKS(s_config.gps_min_interval_ms);
 
     while (true) {
+        if (abort_requested()) {
+            /* A submitter may have passed admission just before abort set the
+             * flag and enqueue after the first reset. Keep the terminal queues
+             * empty; this boot cannot start another telemetry mission. */
+            xQueueReset(s_gps_queue);
+            xQueueReset(s_reflectance_queue);
+            taskENTER_CRITICAL(&s_lock);
+            s_sending = false;
+            taskEXIT_CRITICAL(&s_lock);
+            vTaskDelay(pdMS_TO_TICKS(TELEMETRY_POLL_MS));
+            continue;
+        }
         /* Mark the entire dequeue/send phase active before removing a queued
          * item, so finish_mission cannot observe an empty queue in the tiny
          * interval before physical transmission begins. */
@@ -333,7 +361,7 @@ static void telemetry_task(void *unused)
             taskEXIT_CRITICAL(&s_lock);
             last_gps = xTaskGetTickCount();
             gps_sent_once = true;
-            if (result != ESP_OK) {
+            if (result != ESP_OK && !abort_requested()) {
                 note_message_failure();
                 ESP_LOGE(TAG, "GPS transmission failed: %s",
                          esp_err_to_name(result));
@@ -348,7 +376,7 @@ static void telemetry_task(void *unused)
             taskENTER_CRITICAL(&s_lock);
             s_sending = false;
             taskEXIT_CRITICAL(&s_lock);
-            if (result != ESP_OK) {
+            if (result != ESP_OK && !abort_requested()) {
                 note_message_failure();
                 ESP_LOGE(TAG, "Reflectance transmission failed: %s",
                          esp_err_to_name(result));
@@ -457,6 +485,7 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     s_status.source_id = config->source_id;
     s_accepting = false;
     s_sending = false;
+    s_abort_requested = false;
     s_submitters = 0;
     s_ack_stream_length = 0;
     taskEXIT_CRITICAL(&s_lock);
@@ -517,6 +546,7 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     s_status.mission_id = mission_id;
     s_accepting = true;
     s_sending = false;
+    s_abort_requested = false;
     s_submitters = 0;
     taskEXIT_CRITICAL(&s_lock);
     return ESP_OK;
@@ -583,7 +613,7 @@ esp_err_t telemetry_finish_mission(uint32_t timeout_ms)
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
     if (timeout_ms == 0 || timeout_ticks == 0) return ESP_ERR_INVALID_ARG;
     taskENTER_CRITICAL(&s_lock);
-    if (s_task == NULL || s_status.mission_id == 0) {
+    if (s_task == NULL || s_status.mission_id == 0 || s_abort_requested) {
         taskEXIT_CRITICAL(&s_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -604,6 +634,26 @@ esp_err_t telemetry_finish_mission(uint32_t timeout_ms)
         }
         vTaskDelay(1);
     }
+}
+
+esp_err_t telemetry_abort_mission(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    if (s_task == NULL || s_status.mission_id == 0) {
+        taskEXIT_CRITICAL(&s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Set cancellation before touching either queue. A submitter already in
+     * flight may enqueue after these resets, but the sole worker observes the
+     * flag before every send attempt and continuously purges while aborted. */
+    s_accepting = false;
+    s_abort_requested = true;
+    s_status.shutdown_aborted = true;
+    taskEXIT_CRITICAL(&s_lock);
+    xQueueReset(s_gps_queue);
+    xQueueReset(s_reflectance_queue);
+    ESP_LOGI(TAG, "Telemetry abandoned for power-off; SD finalization has priority");
+    return ESP_OK;
 }
 
 void telemetry_get_status(telemetry_status_t *out)

@@ -3,8 +3,9 @@
 #include "driver/uart.h"
 
 /* Fixed memory population of the production module. Boot validation catches
- * a wrong module variant or failed PSRAM initialization before mission-ready. */
+ * a wrong module variant or unusable external memory before mission-ready. */
 #define DJI_BOARD_EXPECTED_PSRAM_BYTES (8U * 1024U * 1024U)
+#define DJI_BOARD_EXPECTED_FLASH_BYTES (16U * 1024U * 1024U)
 
 /* A-board UART wiring on the ESP32-S3 native UART0 pins. The application
  * console remains on USB Serial/JTAG, so UART0 is dedicated to this link.

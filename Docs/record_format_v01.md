@@ -40,7 +40,9 @@ Each flight directory contains:
 Within its `telemetry` object, `acknowledgement_rejected` is retained as the
 backward-compatible total of `acknowledgements_mismatched` (valid ACK for a
 different or stale message key) and `acknowledgements_negative` (matching ACK
-with a nonzero cloud application status).
+with a nonzero cloud application status). `shutdown_aborted=true` means live
+telemetry was intentionally cancelled by the prepare-power-off policy so SD
+files could be finalized first; it is not itself a telemetry fault.
 
 The protocol intentionally provides no B-readable flight key: section 4.9 says
 that `session_id` is opaque. The B boot-to-poweroff lifecycle therefore defines

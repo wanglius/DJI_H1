@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_psram.h"
@@ -44,9 +45,37 @@ static esp_err_t verify_board_psram(void)
 #endif
 }
 
+static esp_err_t verify_board_flash(void)
+{
+    uint32_t configured = 0;
+    uint32_t physical = 0;
+    esp_err_t err = esp_flash_get_size(NULL, &configured);
+    if (err != ESP_OK) return err;
+    err = esp_flash_get_physical_size(NULL, &physical);
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG,
+             "Flash initialized: configured=%u bytes (%u MiB), "
+             "physical=%u bytes (%u MiB)",
+             (unsigned)configured,
+             (unsigned)(configured / (1024U * 1024U)),
+             (unsigned)physical,
+             (unsigned)(physical / (1024U * 1024U)));
+    if (configured != DJI_BOARD_EXPECTED_FLASH_BYTES ||
+        physical != DJI_BOARD_EXPECTED_FLASH_BYTES) {
+        ESP_LOGE(TAG,
+                 "Expected %u flash bytes for N16R8; configured=%u physical=%u",
+                 (unsigned)DJI_BOARD_EXPECTED_FLASH_BYTES,
+                 (unsigned)configured, (unsigned)physical);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     printf("\nDJI_H1 - A-BOARD CONTROLLED DUAL ACQUISITION\n");
+    ESP_ERROR_CHECK(verify_board_flash());
     ESP_ERROR_CHECK(verify_board_psram());
     ESP_ERROR_CHECK(data_pipeline_self_test());
     ESP_ERROR_CHECK(telemetry_transport_self_test());

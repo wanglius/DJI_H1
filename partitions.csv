@@ -1,0 +1,15 @@
+# DJI_H1 production 16 MB flash layout.
+# The factory offset remains 0x10000 so migration from the former single-app
+# layout does not require erasing NVS or leaving stale application bytes in a
+# newly-created OTA-data partition.
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xF000,   0x1000,
+factory,    app,  factory, 0x10000,  0x300000,
+ota_0,      app,  ota_0,   0x310000, 0x300000,
+ota_1,      app,  ota_1,   0x610000, 0x300000,
+otadata,    data, ota,     0x910000, 0x2000,
+coredump,   data, coredump,0x912000, 0x40000,
+# Reserved for a future bounded cache/configuration filesystem. Mission data
+# remains on the removable SD card to avoid internal-flash wear.
+storage,    data, spiffs,  0x952000, 0x6AE000,

@@ -58,6 +58,9 @@ typedef struct {
     uint32_t uart_errors;
     uint32_t drain_timeouts;
     uint32_t downlink_bytes_received;
+    /** True when prepare-power-off deliberately cancelled cloud delivery so
+     * the shutdown budget could be reserved for durable SD finalization. */
+    bool shutdown_aborted;
 } telemetry_status_t;
 
 /** Start the sole DTU UART owner and its paced transmit task. The DTU must
@@ -83,6 +86,12 @@ esp_err_t telemetry_submit_reflectance(
  * received matching cloud application acknowledgements.
  */
 esp_err_t telemetry_finish_mission(uint32_t timeout_ms);
+
+/** Immediately close admission and cancel queued/in-progress delivery.
+ * This is the prepare-power-off path: it is nonblocking and intentionally
+ * sacrifices telemetry so SD recording can be finalized before power loss.
+ */
+esp_err_t telemetry_abort_mission(void);
 
 /** Lock-bounded status snapshot suitable for heartbeat health evaluation. */
 void telemetry_get_status(telemetry_status_t *out);
