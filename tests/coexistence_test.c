@@ -129,8 +129,8 @@ esp_err_t coexistence_test_run(uint32_t duration_ms)
 
     ESP_LOGI(TAG, "Starting simultaneous acquisition and SD writes for %.1fs",
              duration_ms / 1000.0);
-    acquisition_arm(); /* Standalone bench mode must reset cancellation/status too. */
-    result = acquisition_run_dual(duration_ms);
+    result = acquisition_arm(); /* Standalone bench mode owns this lifecycle. */
+    if (result == ESP_OK) result = acquisition_run_dual(duration_ms);
 
 cleanup:
     if (writer_started) {

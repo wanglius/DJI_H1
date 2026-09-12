@@ -1,0 +1,3 @@
+# Merge with sdkconfig.defaults for the retained acquisition cleanup test.
+CONFIG_DJI_H1_TEST_FAULT_INJECTION=y
+CONFIG_DJI_H1_TEST_LOGGER_STOP_STALL_MS=1500

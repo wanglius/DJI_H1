@@ -12,6 +12,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_app_desc.h"
 #include "esp_random.h"
@@ -26,6 +27,9 @@ static const char *TAG = "MEAS_REC";
 #define SERIAL_BUFFER_SIZE 4096
 #define FILE_HEADER_SIZE 16U
 #define SKY_HISTORY_COUNT 8U
+#define PENDING_GROUND_COUNT 128U
+#define REJECT_NO_CAUSAL_SKY INT32_C(-1)
+#define REJECT_PENDING_FULL INT32_C(-2)
 #define PERIODIC_FLUSH_MS 1500U
 #define FLIGHT_INDEX_MAGIC UINT32_C(0x31584946) /* little-endian "FIX1" */
 #define FLIGHT_INDEX_VERSION 1U
@@ -103,6 +107,10 @@ static uint8_t s_drone_link;
 /* Sole writer-task workspaces live in BSS to keep its stack bounded. */
 static uint8_t s_serial_buffer[SERIAL_BUFFER_SIZE];
 static raw_spectrum_record_t s_sky_history[SKY_HISTORY_COUNT];
+/* Ground frames wait until the processed sky timestamp has advanced past
+ * them, proving that every causal sky frame is already in history. This fixed
+ * boot allocation lives in PSRAM; the writer performs no per-frame malloc. */
+static raw_spectrum_record_t *s_pending_grounds;
 static reflectance_record_t s_calculated;
 #if CONFIG_DJI_H1_TEST_FAULT_INJECTION && \
     CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS > 0
@@ -239,6 +247,39 @@ static bool flight_index_codec_self_test(void)
     if (!decode_flight_index(bytes, &decoded) || decoded != 4321) return false;
     bytes[8] ^= 0x01;
     return !decode_flight_index(bytes, &decoded);
+}
+
+static bool should_resolve_ground(const raw_spectrum_record_t *ground,
+                                  uint64_t sky_watermark_us,
+                                  bool resolve_all)
+{
+    return resolve_all ||
+           ground->header.timestamp.b_monotonic_us <= sky_watermark_us;
+}
+
+static bool pairing_policy_self_test(void)
+{
+    raw_spectrum_record_t ground = {0};
+    raw_spectrum_record_t sky = {0};
+    size_t next = 0, count = 0;
+    ground.header.session_id = sky.header.session_id = 7;
+    ground.header.segment_id = sky.header.segment_id = 3;
+    ground.header.timestamp.b_monotonic_us = 150;
+
+    sky.header.timestamp.b_monotonic_us = 100;
+    sky.frame_count = 1;
+    remember_sky(&sky, &next, &count);
+    sky.header.timestamp.b_monotonic_us = 200;
+    sky.frame_count = 2;
+    remember_sky(&sky, &next, &count);
+
+    const raw_spectrum_record_t *found = find_sky_for_ground(&ground, count);
+    bool passed = found != NULL && found->frame_count == 1 &&
+                  !should_resolve_ground(&ground, 149, false) &&
+                  should_resolve_ground(&ground, 150, false) &&
+                  should_resolve_ground(&ground, 0, true);
+    memset(s_sky_history, 0, sizeof(s_sky_history));
+    return passed;
 }
 
 static esp_err_t read_flight_index_file(const char *path,
@@ -686,10 +727,98 @@ static void write_internal_event(measurement_event_t code,
     note_aux_write(write_event(&event), false);
 }
 
+static void note_calculation_rejection(const raw_spectrum_record_t *ground,
+                                       int32_t detail)
+{
+    uint32_t rejected;
+    taskENTER_CRITICAL(&s_lock);
+    rejected = ++s_status.calculation_rejected;
+    s_totals.calculation_rejected++;
+    taskEXIT_CRITICAL(&s_lock);
+
+    if (rejected == 1U || rejected % 100U == 0U) {
+        write_internal_event(MEASUREMENT_EVENT_REFLECTANCE_REJECTED,
+                             ground->frame_count, detail);
+    }
+}
+
+static void calculate_ground(const raw_spectrum_record_t *ground,
+                             size_t sky_count)
+{
+    const raw_spectrum_record_t *sky =
+        find_sky_for_ground(ground, sky_count);
+    if (sky == NULL) {
+        ESP_LOGW(TAG, "No causal sky for ground frame=%lu t=%llu",
+                 (unsigned long)ground->frame_count,
+                 (unsigned long long)
+                     ground->header.timestamp.b_monotonic_us);
+        note_calculation_rejection(ground, REJECT_NO_CAUSAL_SKY);
+        return;
+    }
+
+    uint32_t count = ++s_calculation_sequence;
+    esp_err_t result = calculation_reflectance(ground, sky, count,
+                                               &s_calculated);
+    if (result == ESP_OK) {
+        note_write_result(write_reflectance(&s_calculated), true);
+        esp_err_t telemetry_result = telemetry_submit_reflectance(&s_calculated);
+        /* Queue pressure is counted and rate-limited inside telemetry; avoid
+         * turning a recoverable DTU slowdown into log flooding. */
+        if (telemetry_result != ESP_OK &&
+            telemetry_result != ESP_ERR_NO_MEM &&
+            telemetry_result != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Reflectance telemetry rejected: %s",
+                     esp_err_to_name(telemetry_result));
+        }
+        return;
+    }
+
+    int64_t sky_age_us =
+        (int64_t)ground->header.timestamp.b_monotonic_us -
+        (int64_t)sky->header.timestamp.b_monotonic_us;
+    ESP_LOGW(TAG, "Reflectance rejected ground=%lu sky=%lu "
+                  "ground_t=%llu sky_t=%llu age=%lldus "
+                  "scales=%d/%d: %s",
+             (unsigned long)ground->frame_count,
+             (unsigned long)sky->frame_count,
+             (unsigned long long)ground->header.timestamp.b_monotonic_us,
+             (unsigned long long)sky->header.timestamp.b_monotonic_us,
+             (long long)sky_age_us,
+             (int)ground->spectrum_scale, (int)sky->spectrum_scale,
+             esp_err_to_name(result));
+    note_calculation_rejection(
+        ground, sky_age_us <= INT32_MAX ? (int32_t)sky_age_us : INT32_MAX);
+}
+
+/** Resolve grounds only after the sky producer has crossed their timestamp.
+ * Because each producer enqueues in acquisition order, this watermark proves
+ * every eligible causal sky is already present in s_sky_history. A segment
+ * barrier drains both producers and therefore resolves all remaining entries.
+ */
+static void resolve_pending_grounds(size_t *pending_count,
+                                    size_t sky_count,
+                                    uint64_t sky_watermark_us,
+                                    bool resolve_all)
+{
+    size_t retained = 0;
+    for (size_t i = 0; i < *pending_count; i++) {
+        raw_spectrum_record_t *ground = &s_pending_grounds[i];
+        if (should_resolve_ground(ground, sky_watermark_us, resolve_all)) {
+            calculate_ground(ground, sky_count);
+        } else {
+            if (retained != i) s_pending_grounds[retained] = *ground;
+            retained++;
+        }
+    }
+    *pending_count = retained;
+}
+
 static void writer_task(void *unused)
 {
     (void)unused;
     size_t sky_next = 0, sky_count = 0;
+    size_t pending_count = 0;
+    uint64_t sky_watermark_us = 0;
     TickType_t last_flush = xTaskGetTickCount();
     message_t message;
     while (true) {
@@ -702,6 +831,10 @@ static void writer_task(void *unused)
             continue;
         }
         if (message.type == MSG_BARRIER) {
+            /* All raw submitters have stopped and all their queue entries
+             * precede this marker, so no further sky for this segment exists. */
+            resolve_pending_grounds(&pending_count, sky_count,
+                                    sky_watermark_us, true);
             write_internal_event(MEASUREMENT_EVENT_SEGMENT_END,
                                  s_status.raw_written,
                                  (int32_t)s_status.reflectance_written);
@@ -714,11 +847,15 @@ static void writer_task(void *unused)
             last_flush = xTaskGetTickCount();
             /* A barrier terminates a capture segment. Never pair a later
              * ground frame with a reference retained across that boundary. */
-            sky_next = sky_count = 0;
+            sky_next = sky_count = pending_count = 0;
+            sky_watermark_us = 0;
             xSemaphoreGive(s_barrier);
             continue;
         }
         if (message.type == MSG_FINALIZE) {
+            /* Defensive fallback: normally MSG_BARRIER already drained this. */
+            resolve_pending_grounds(&pending_count, sky_count,
+                                    sky_watermark_us, true);
             write_internal_event(MEASUREMENT_EVENT_FLIGHT_CLOSED,
                                  s_totals.segments_completed, 0);
             (void)flush_files();
@@ -747,10 +884,11 @@ static void writer_task(void *unused)
         note_write_result(result, false);
         if (result == ESP_OK && raw->spectrometer_role == SPECTROMETER_SKY &&
             message.allow_reflectance) {
-            /* Producers run independently, so queue arrival order is not
-             * guaranteed to match acquisition timestamps. Keep enough recent
-             * references to find the true predecessor of each ground frame. */
             remember_sky(raw, &sky_next, &sky_count);
+            uint64_t sky_us = raw->header.timestamp.b_monotonic_us;
+            if (sky_us > sky_watermark_us) sky_watermark_us = sky_us;
+            resolve_pending_grounds(&pending_count, sky_count,
+                                    sky_watermark_us, false);
         } else if (result == ESP_OK &&
                    raw->spectrometer_role == SPECTROMETER_GROUND) {
             if (!message.allow_reflectance) {
@@ -765,57 +903,20 @@ static void writer_task(void *unused)
                 xQueueSend(s_free_queue, &raw, portMAX_DELAY);
                 continue;
             }
-            const raw_spectrum_record_t *sky =
-                find_sky_for_ground(raw, sky_count);
-            if (sky == NULL) {
-                ESP_LOGW(TAG, "No causal sky for ground frame=%lu t=%llu",
-                         (unsigned long)raw->frame_count,
-                         (unsigned long long)raw->header.timestamp.b_monotonic_us);
-                taskENTER_CRITICAL(&s_lock);
-                s_status.calculation_rejected++;
-                s_totals.calculation_rejected++;
-                taskEXIT_CRITICAL(&s_lock);
-                xQueueSend(s_free_queue, &raw, portMAX_DELAY);
-                continue;
-            }
-            uint32_t count = ++s_calculation_sequence;
-            result = calculation_reflectance(raw, sky, count,
-                                             &s_calculated);
-            if (result == ESP_OK) {
-                note_write_result(write_reflectance(&s_calculated), true);
-                esp_err_t telemetry_result = telemetry_submit_reflectance(
-                    &s_calculated);
-                /* Queue pressure is counted and rate-limited inside telemetry;
-                 * avoid turning a recoverable DTU slowdown into log flooding. */
-                if (telemetry_result != ESP_OK &&
-                    telemetry_result != ESP_ERR_NO_MEM &&
-                    telemetry_result != ESP_ERR_INVALID_STATE) {
-                    ESP_LOGW(TAG, "Reflectance telemetry rejected: %s",
-                             esp_err_to_name(telemetry_result));
-                }
+            if (pending_count < PENDING_GROUND_COUNT) {
+                s_pending_grounds[pending_count++] = *raw;
+                /* Covers the case where the crossing sky reached the queue
+                 * before this ground even though it was acquired later. */
+                resolve_pending_grounds(&pending_count, sky_count,
+                                        sky_watermark_us, false);
             } else {
-                ESP_LOGW(TAG, "Reflectance rejected ground=%lu sky=%lu "
-                              "ground_t=%llu sky_t=%llu age=%lldus "
-                              "scales=%d/%d: %s",
+                /* Preserve raw acquisition under an extreme sky outage; only
+                 * the derived result is dropped, counted, and reported. */
+                ESP_LOGW(TAG, "Ground holdback full at frame=%lu t=%llu",
                          (unsigned long)raw->frame_count,
-                         (unsigned long)sky->frame_count,
-                         (unsigned long long)raw->header.timestamp.b_monotonic_us,
-                         (unsigned long long)sky->header.timestamp.b_monotonic_us,
-                         (long long)(raw->header.timestamp.b_monotonic_us -
-                                     sky->header.timestamp.b_monotonic_us),
-                         (int)raw->spectrum_scale, (int)sky->spectrum_scale,
-                         esp_err_to_name(result));
-                taskENTER_CRITICAL(&s_lock);
-                s_status.calculation_rejected++;
-                s_totals.calculation_rejected++;
-                taskEXIT_CRITICAL(&s_lock);
-                if (s_status.calculation_rejected == 1 ||
-                    s_status.calculation_rejected % 100 == 0) {
-                    write_internal_event(MEASUREMENT_EVENT_REFLECTANCE_REJECTED,
-                                         raw->frame_count,
-                                         (int32_t)(raw->header.timestamp.b_monotonic_us -
-                                                   sky->header.timestamp.b_monotonic_us));
-                }
+                         (unsigned long long)
+                             raw->header.timestamp.b_monotonic_us);
+                note_calculation_rejection(raw, REJECT_PENDING_FULL);
             }
         }
         xQueueSend(s_free_queue, &raw, portMAX_DELAY);
@@ -828,19 +929,41 @@ periodic_flush:
     }
 }
 
+/** Release objects created before the writer task owns them. This is only
+ * valid on init failure; a running writer intentionally retains them for the
+ * full firmware lifetime. */
+static void destroy_init_resources(void)
+{
+    if (s_free_queue != NULL) vQueueDelete(s_free_queue);
+    if (s_writer_queue != NULL) vQueueDelete(s_writer_queue);
+    if (s_barrier != NULL) vSemaphoreDelete(s_barrier);
+    s_free_queue = s_writer_queue = NULL;
+    s_barrier = NULL;
+    heap_caps_free(s_pending_grounds);
+    s_pending_grounds = NULL;
+}
+
 esp_err_t measurement_recorder_init(void)
 {
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
-    if (!flight_index_codec_self_test()) return ESP_FAIL;
+    if (!flight_index_codec_self_test() || !pairing_policy_self_test())
+        return ESP_FAIL;
 #if CONFIG_DJI_H1_TEST_FAULT_INJECTION && \
     CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS > 0
     ESP_LOGW(TAG, "TEST BUILD: recorder flush fault injection enabled (%d ms)",
              CONFIG_DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS);
 #endif
+    s_pending_grounds = heap_caps_calloc(
+        PENDING_GROUND_COUNT, sizeof(*s_pending_grounds),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_pending_grounds == NULL) return ESP_ERR_NO_MEM;
     s_free_queue = xQueueCreate(RAW_POOL_COUNT, sizeof(raw_spectrum_record_t *));
     s_writer_queue = xQueueCreate(WRITER_QUEUE_LENGTH, sizeof(message_t));
     s_barrier = xSemaphoreCreateBinary();
-    if (!s_free_queue || !s_writer_queue || !s_barrier) return ESP_ERR_NO_MEM;
+    if (!s_free_queue || !s_writer_queue || !s_barrier) {
+        destroy_init_resources();
+        return ESP_ERR_NO_MEM;
+    }
     for (size_t i = 0; i < RAW_POOL_COUNT; i++) {
         raw_spectrum_record_t *item = &s_pool[i];
         xQueueSend(s_free_queue, &item, 0);
@@ -857,6 +980,8 @@ esp_err_t measurement_recorder_init(void)
         taskENTER_CRITICAL(&s_lock);
         s_status.healthy = false;
         taskEXIT_CRITICAL(&s_lock);
+        (void)close_files();
+        destroy_init_resources();
         return result;
     }
     if (xTaskCreatePinnedToCore(writer_task, "measurement_writer", 8192, NULL,
@@ -866,6 +991,8 @@ esp_err_t measurement_recorder_init(void)
         s_status.healthy = false;
         taskEXIT_CRITICAL(&s_lock);
         (void)close_files();
+        s_task = NULL;
+        destroy_init_resources();
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

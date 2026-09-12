@@ -83,6 +83,21 @@ of the flight can still be recovered.
 Reflectance values are stored in 0.01 percent units and deliberately clamped to
 0–100%. Per-sample flags preserve whether clamping or an invalid denominator
 occurred, while the raw spectra retain the original signal for offline science.
+Ground and sky producers are independent, so queue arrival order is not treated
+as acquisition order. The recorder holds ground frames in a bounded PSRAM
+workspace until the processed sky timestamp reaches the ground timestamp; it
+then selects the newest sky timestamp not later than the ground timestamp. A
+segment barrier resolves any remaining grounds against the final available sky
+history before that history is cleared. This prevents a temporarily late sky
+queue entry from making a ground frame use an older reference.
+
+The holdback contains 128 ground records. If it fills during an extreme sky
+outage, raw ground frames continue to be written while only their reflectance
+results are rejected and counted. `MEASUREMENT_EVENT_REFLECTANCE_REJECTED`
+stores the ground frame count in `argument0`; `argument1` is sky age in
+microseconds for a calculation rejection, `-1` when no causal sky exists, or
+`-2` when the bounded holdback is full.
+
 If STOP arrives during an exposure, its completed raw frame is retained but is
 not paired after shutdown begins. `MISSION.JSON` and the segment diagnostic
 report this as `reflectance_skipped_shutdown`; it is intentionally separate

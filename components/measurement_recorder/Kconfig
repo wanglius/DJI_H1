@@ -17,4 +17,15 @@ config DJI_H1_TEST_ONESHOT_FLUSH_STALL_MS
         recorder backpressure. The firmware prints a boot warning when this is
         nonzero. Keep fault injection disabled in every production build.
 
+config DJI_H1_TEST_LOGGER_STOP_STALL_MS
+    int "TEST ONLY: acquisition logger shutdown stall (milliseconds)"
+    range 0 30000
+    default 0
+    depends on DJI_H1_TEST_FAULT_INJECTION
+    help
+        Delay the acquisition logger after it consumes its one-time stop
+        marker. Values above the normal 1000 ms wait exercise retained-handle
+        cleanup and prove that a retry waits for the original task instead of
+        creating a second logger. Keep fault injection disabled in production.
+
 endmenu

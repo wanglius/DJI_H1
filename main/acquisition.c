@@ -55,6 +55,13 @@ typedef struct {
     UBaseType_t queue_depth;
 } frame_report_t;
 
+typedef enum {
+    ACQUISITION_RUNTIME_EMPTY,
+    ACQUISITION_RUNTIME_ALLOCATED,
+    ACQUISITION_RUNTIME_ACTIVE,
+    ACQUISITION_RUNTIME_CLEANUP_PENDING,
+} acquisition_runtime_state_t;
+
 static sensor_context_t s_sensors[SENSOR_COUNT] = {
     {.name = "H1-A", .channel = SC16_CHANNEL_A},
     {.name = "H1-B", .channel = SC16_CHANNEL_B},
@@ -63,11 +70,27 @@ static QueueHandle_t s_report_queue;
 static TaskHandle_t s_logger_task;
 static SemaphoreHandle_t s_logger_done;
 static bool s_logger_created;
+static bool s_logger_stop_queued;
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static acquisition_status_t s_status;
 static bool s_stop_requested;
 static bool s_read_failed;
 static int64_t s_stop_deadline_us = INT64_MAX;
+/* These resources outlive acquisition_run_dual() if cooperative teardown
+ * times out. A cleanup retry must operate on the original handles. */
+static acquisition_runtime_state_t s_runtime_state;
+static bool s_service_started;
+static bool s_stream_started[SENSOR_COUNT];
+
+static void set_runtime_state(acquisition_runtime_state_t state)
+{
+    taskENTER_CRITICAL(&s_status_lock);
+    s_runtime_state = state;
+    s_status.cleanup_pending =
+        state == ACQUISITION_RUNTIME_ALLOCATED ||
+        state == ACQUISITION_RUNTIME_CLEANUP_PENDING;
+    taskEXIT_CRITICAL(&s_status_lock);
+}
 
 void acquisition_get_status(acquisition_status_t *out)
 {
@@ -76,14 +99,19 @@ void acquisition_get_status(acquisition_status_t *out)
     taskEXIT_CRITICAL(&s_status_lock);
 }
 
-void acquisition_arm(void)
+esp_err_t acquisition_arm(void)
 {
     taskENTER_CRITICAL(&s_status_lock);
+    if (s_runtime_state != ACQUISITION_RUNTIME_EMPTY) {
+        taskEXIT_CRITICAL(&s_status_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     memset(&s_status, 0, sizeof(s_status));
     s_stop_deadline_us = INT64_MAX;
     taskEXIT_CRITICAL(&s_status_lock);
     __atomic_store_n(&s_read_failed, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_stop_requested, false, __ATOMIC_RELEASE);
+    return ESP_OK;
 }
 
 void acquisition_request_stop(void)
@@ -235,6 +263,13 @@ static void logger_task(void *arg)
     while (true) {
         if (xQueueReceive(s_report_queue, &r, portMAX_DELAY) == pdTRUE) {
             if (r.name == NULL) {
+#if CONFIG_DJI_H1_TEST_FAULT_INJECTION && \
+    CONFIG_DJI_H1_TEST_LOGGER_STOP_STALL_MS > 0
+                ESP_LOGW(TAG, "TEST ONLY: delaying logger shutdown by %d ms",
+                         CONFIG_DJI_H1_TEST_LOGGER_STOP_STALL_MS);
+                vTaskDelay(pdMS_TO_TICKS(
+                    CONFIG_DJI_H1_TEST_LOGGER_STOP_STALL_MS));
+#endif
                 break;
             }
             printf("%s frame=%4lu t=%10.3fms rx=%7.1fms dt=%7.1fms "
@@ -250,7 +285,6 @@ static void logger_task(void *arg)
         }
     }
 
-    s_logger_task = NULL;
     xSemaphoreGive(s_logger_done);
     vTaskDelete(NULL);
 }
@@ -323,8 +357,17 @@ static void print_summary(const sensor_context_t *ctx,
 
 static esp_err_t create_tasks(void)
 {
+    taskENTER_CRITICAL(&s_status_lock);
+    bool empty = s_runtime_state == ACQUISITION_RUNTIME_EMPTY;
+    taskEXIT_CRITICAL(&s_status_lock);
+    if (!empty || s_report_queue != NULL || s_logger_done != NULL ||
+        s_logger_created) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     s_report_queue = xQueueCreate(REPORT_QUEUE_LENGTH, sizeof(frame_report_t));
     if (s_report_queue == NULL) return ESP_ERR_NO_MEM;
+    set_runtime_state(ACQUISITION_RUNTIME_ALLOCATED);
 
     s_logger_done = xSemaphoreCreateBinary();
     if (s_logger_done == NULL) return ESP_ERR_NO_MEM;
@@ -349,6 +392,7 @@ static esp_err_t create_tasks(void)
         }
         s_sensors[i].task_created = true;
     }
+    set_runtime_state(ACQUISITION_RUNTIME_ACTIVE);
     return ESP_OK;
 }
 
@@ -367,8 +411,7 @@ static esp_err_t stop_reader_stream(sensor_context_t *ctx,
     return result;
 }
 
-static esp_err_t stop_acquisition_tasks(bool stream_started[SENSOR_COUNT],
-                                        bool *all_tasks_stopped)
+static esp_err_t stop_acquisition_tasks(bool *all_tasks_stopped)
 {
     *all_tasks_stopped = false;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
@@ -403,7 +446,7 @@ static esp_err_t stop_acquisition_tasks(bool stream_started[SENSOR_COUNT],
              * exposures, waiting for the other task can otherwise fill this
              * channel's abandoned software buffer. */
             esp_err_t stop_result = stop_reader_stream(
-                &s_sensors[i], &stream_started[i]);
+                &s_sensors[i], &s_stream_started[i]);
             if (stop_result != ESP_OK && result == ESP_OK) {
                 result = stop_result;
             }
@@ -430,9 +473,9 @@ static esp_err_t stop_acquisition_tasks(bool stream_started[SENSOR_COUNT],
     /* Any remaining stream has no reader: either task setup was partial or
      * the first stop attempt failed after its reader exited. Retry safely. */
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
-        if (!stream_started[i]) continue;
+        if (!s_stream_started[i]) continue;
         esp_err_t stop_result = stop_reader_stream(
-            &s_sensors[i], &stream_started[i]);
+            &s_sensors[i], &s_stream_started[i]);
         if (stop_result != ESP_OK && result == ESP_OK) {
             result = stop_result;
         }
@@ -445,13 +488,23 @@ static esp_err_t stop_logger_task(void)
 {
     if (!s_logger_created) return ESP_OK;
 
-    const frame_report_t stop_report = {0};
-    if (xQueueSend(s_report_queue, &stop_report,
-                   pdMS_TO_TICKS(1000)) != pdTRUE ||
-        xSemaphoreTake(s_logger_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    if (!s_logger_stop_queued) {
+        const frame_report_t stop_report = {0};
+        if (xQueueSend(s_report_queue, &stop_report,
+                       pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGE(TAG, "Logger stop marker could not be queued");
+            return ESP_ERR_TIMEOUT;
+        }
+        /* Never send a second marker on retry: a stale marker could terminate
+         * the logger belonging to a later session. */
+        s_logger_stop_queued = true;
+    }
+    if (xSemaphoreTake(s_logger_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGE(TAG, "Logger task did not stop; task retained");
         return ESP_ERR_TIMEOUT;
     }
+    s_logger_task = NULL;
+    s_logger_created = false;
     return ESP_OK;
 }
 
@@ -473,6 +526,52 @@ static void delete_runtime_objects(void)
         s_report_queue = NULL;
     }
     s_logger_created = false;
+    s_logger_stop_queued = false;
+    s_service_started = false;
+    memset(s_stream_started, 0, sizeof(s_stream_started));
+    set_runtime_state(ACQUISITION_RUNTIME_EMPTY);
+}
+
+static esp_err_t cleanup_runtime(void)
+{
+    bool nothing_allocated = s_runtime_state == ACQUISITION_RUNTIME_EMPTY &&
+        !s_service_started && !s_logger_created && s_report_queue == NULL;
+    if (nothing_allocated) return ESP_OK;
+
+    set_runtime_state(ACQUISITION_RUNTIME_CLEANUP_PENDING);
+    bool tasks_stopped = false;
+    esp_err_t result = stop_acquisition_tasks(&tasks_stopped);
+    if (!tasks_stopped) return result;
+
+    esp_err_t logger_result = stop_logger_task();
+    if (logger_result != ESP_OK && result == ESP_OK) result = logger_result;
+
+    bool streams_stopped = !s_stream_started[0] && !s_stream_started[1];
+    if (streams_stopped) {
+        taskENTER_CRITICAL(&s_status_lock);
+        s_status.capturing = false;
+        taskEXIT_CRITICAL(&s_status_lock);
+    }
+    if (s_service_started && streams_stopped) {
+        esp_err_t service_result = sc16_stop_dual_rx_service(1000);
+        if (service_result == ESP_OK) {
+            s_service_started = false;
+        } else {
+            ESP_LOGE(TAG, "RX service stop failed: %s",
+                     esp_err_to_name(service_result));
+            if (result == ESP_OK) result = service_result;
+        }
+    }
+
+    if (streams_stopped && !s_service_started && !s_logger_created) {
+        delete_runtime_objects();
+    }
+    return result;
+}
+
+esp_err_t acquisition_retry_cleanup(void)
+{
+    return cleanup_runtime();
 }
 
 static void configure_watchdog(void)
@@ -503,10 +602,16 @@ esp_err_t acquisition_prepare_dual(void)
 
 esp_err_t acquisition_run_dual(uint32_t duration_ms)
 {
-    bool service_started = false;
-    bool stream_started[SENSOR_COUNT] = {false, false};
-    bool tasks_stopped = false;
     esp_err_t result = ESP_OK;
+    bool tasks_stopped = false;
+
+    taskENTER_CRITICAL(&s_status_lock);
+    bool runtime_empty = s_runtime_state == ACQUISITION_RUNTIME_EMPTY;
+    taskEXIT_CRITICAL(&s_status_lock);
+    if (!runtime_empty) return ESP_ERR_INVALID_STATE;
+    s_service_started = false;
+    memset(s_stream_started, 0, sizeof(s_stream_started));
+    s_logger_stop_queued = false;
 
     /* Cancellation is armed by the owner before publishing STARTING, not
      * here: a stop received before this task wakes must never be lost. */
@@ -527,7 +632,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     result = sc16_start_dual_rx_service(
         RX_STREAM_BUFFER_SIZE, RX_SERVICE_PRIORITY, ACQUISITION_CORE);
     if (result != ESP_OK) goto cleanup;
-    service_started = true;
+    s_service_started = true;
     ESP_LOGI(TAG, "SC16 service active: %u-byte software buffer per UART",
              RX_STREAM_BUFFER_SIZE);
     result = create_tasks();
@@ -541,7 +646,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     int64_t start_b_us = esp_timer_get_time();
     result = h1_start_stream(&s_sensors[1].device);
     if (result != ESP_OK) goto cleanup;
-    stream_started[1] = true;
+    s_stream_started[1] = true;
     /* A partial dual-start failure still leaves real hardware streaming.
      * Keep capture asserted until cleanup has stopped every started channel. */
     taskENTER_CRITICAL(&s_status_lock);
@@ -567,7 +672,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     int64_t start_a_us = esp_timer_get_time();
     result = h1_start_stream(&s_sensors[0].device);
     if (result != ESP_OK) goto cleanup;
-    stream_started[0] = true;
+    s_stream_started[0] = true;
     ESP_LOGI(TAG, "Sky primed; streams commanded B=%lldus A=%lldus separation=%.3fms",
              (long long)start_b_us, (long long)start_a_us,
              (start_a_us - start_b_us) / 1000.0);
@@ -600,7 +705,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     /* Also covers duration-based test stops, ensuring any frame that completes
      * during coordinated teardown is recorded raw without reflectance pairing. */
     acquisition_request_stop();
-    result = stop_acquisition_tasks(stream_started, &tasks_stopped);
+    result = stop_acquisition_tasks(&tasks_stopped);
     if (result != ESP_OK) goto cleanup;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         uint32_t total = sc16_get_channel_rx_overrun_count(s_sensors[i].channel);
@@ -626,44 +731,19 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     printf("============================================================\n");
 
 cleanup:
-    if (!tasks_stopped) {
-        esp_err_t stop_ret = stop_acquisition_tasks(stream_started,
-                                                    &tasks_stopped);
-        if (stop_ret != ESP_OK && result == ESP_OK) {
-            result = stop_ret;
-        }
-    }
-
-    if (tasks_stopped) {
-        for (size_t i = 0; i < SENSOR_COUNT; i++) {
-            if (!stream_started[i]) continue;
-            ESP_LOGI(TAG, "Rollback: stopping %s stream", s_sensors[i].name);
-            esp_err_t stop_ret = h1_stop_stream(&s_sensors[i].device);
-            if (stop_ret != ESP_OK) {
-                ESP_LOGE(TAG, "%s rollback stop failed: %s",
-                         s_sensors[i].name, esp_err_to_name(stop_ret));
-                if (result == ESP_OK) result = stop_ret;
-            }
-            if (stop_ret == ESP_OK) stream_started[i] = false;
-        }
-
-        esp_err_t logger_ret = stop_logger_task();
-        if (logger_ret != ESP_OK && result == ESP_OK) result = logger_ret;
-        if (logger_ret == ESP_OK) delete_runtime_objects();
-    }
-
-    if (service_started && tasks_stopped) {
-        esp_err_t service_ret = sc16_stop_dual_rx_service(1000);
-        if (service_ret != ESP_OK) {
-            ESP_LOGE(TAG, "RX service stop failed: %s",
-                     esp_err_to_name(service_ret));
-            if (result == ESP_OK) result = service_ret;
-        }
+    {
+        esp_err_t cleanup_result = cleanup_runtime();
+        if (cleanup_result != ESP_OK && result == ESP_OK)
+            result = cleanup_result;
     }
     if (__atomic_load_n(&s_read_failed, __ATOMIC_ACQUIRE) && result == ESP_OK) {
         result = ESP_FAIL;
     }
-    if (tasks_stopped && !stream_started[0] && !stream_started[1]) {
+    taskENTER_CRITICAL(&s_status_lock);
+    bool cleanup_complete =
+        s_runtime_state == ACQUISITION_RUNTIME_EMPTY;
+    taskEXIT_CRITICAL(&s_status_lock);
+    if (cleanup_complete) {
         taskENTER_CRITICAL(&s_status_lock);
         s_status.capturing = false;
         taskEXIT_CRITICAL(&s_status_lock);

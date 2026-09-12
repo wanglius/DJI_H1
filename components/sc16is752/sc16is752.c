@@ -232,8 +232,13 @@ esp_err_t sc16_init(const sc16_config_t *config)
     if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_spi != NULL || s_spi_mutex != NULL || s_dual_rx_service_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     s_config = *config;
+    bool bus_initialized = false;
+    bool reset_attempted = false;
 
     spi_bus_config_t buscfg = {
         .mosi_io_num = config->pin_mosi,
@@ -253,8 +258,10 @@ esp_err_t sc16_init(const sc16_config_t *config)
         ESP_LOGE(TAG,
                  "spi_bus_initialize failed: %s",
                  esp_err_to_name(ret));
+        memset(&s_config, 0, sizeof(s_config));
         return ret;
     }
+    bus_initialized = true;
 
     spi_device_interface_config_t devcfg = {
         .clock_speed_hz = config->spi_clock_hz,
@@ -273,26 +280,52 @@ esp_err_t sc16_init(const sc16_config_t *config)
         ESP_LOGE(TAG,
                  "spi_bus_add_device failed: %s",
                  esp_err_to_name(ret));
-        return ret;
+        goto fail;
     }
 
     s_spi_mutex = xSemaphoreCreateMutex();
     if (s_spi_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create SPI transaction mutex");
-        return ESP_ERR_NO_MEM;
+        ret = ESP_ERR_NO_MEM;
+        goto fail;
     }
 
     ESP_LOGI(TAG,
              "SPI initialized: %lu Hz",
              (unsigned long)config->spi_clock_hz);
 
+    reset_attempted = true;
     ret = sc16_reset();
 
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
 
     return ESP_OK;
+
+fail:
+    /* Initialization owns this SPI bus for the component lifetime. Unwind in
+     * reverse order so an in-place retry cannot inherit stale global handles. */
+    if (s_spi_mutex != NULL) {
+        vSemaphoreDelete(s_spi_mutex);
+        s_spi_mutex = NULL;
+    }
+    if (s_spi != NULL) {
+        esp_err_t cleanup = spi_bus_remove_device(s_spi);
+        if (cleanup != ESP_OK)
+            ESP_LOGE(TAG, "spi_bus_remove_device cleanup failed: %s",
+                     esp_err_to_name(cleanup));
+        s_spi = NULL;
+    }
+    if (bus_initialized) {
+        esp_err_t cleanup = spi_bus_free(config->spi_host);
+        if (cleanup != ESP_OK)
+            ESP_LOGE(TAG, "spi_bus_free cleanup failed: %s",
+                     esp_err_to_name(cleanup));
+    }
+    if (reset_attempted) (void)gpio_reset_pin(config->pin_reset);
+    memset(&s_config, 0, sizeof(s_config));
+    return ret;
 }
 
 

@@ -61,6 +61,16 @@ protocol's generic failure—the heartbeat error code identifies the subsystem.
 Heartbeats continue on failure. Stop latency includes the current
 bounded H1 frame read (up to 5 seconds), then stream draining and cleanup.
 
+Acquisition runtime handles have explicit retained-cleanup ownership. If a
+reader, logger, H1 stream, or SC16 RX service does not stop within its bounded
+wait, a new session remains busy and cannot replace any queue/semaphore handle.
+The mission-control owner retries the original cleanup cooperatively. The
+logger stop marker is queued at most once, preventing a stale marker from
+terminating a later session. `tests/sdkconfig.lifecycle_cleanup` enables a
+1500 ms logger-stop stall to exercise this path on hardware. Failed SC16
+initialization likewise unwinds its mutex, device, SPI bus, and reset GPIO in
+reverse order so initialization can be retried in place.
+
 Recorder pool/queue pressure is deliberately nonfatal. A dropped raw record is
 counted, exposes heartbeat error 5, and remains detectable through per-channel
 frame-count gaps; the acquisition continues to preserve the rest of the flight.

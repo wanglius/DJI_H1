@@ -50,6 +50,9 @@ static bool known_session(uint32_t session)
 uint8_t mission_control_start(uint32_t session)
 {
     uint8_t result = 0;
+    acquisition_status_t acquisition;
+    acquisition_get_status(&acquisition);
+    bool wake_cleanup = false;
     taskENTER_CRITICAL(&s_lock);
     if (s_power_off) result = 4;
     else if (known_session(session)) result = 0;
@@ -57,19 +60,26 @@ uint8_t mission_control_start(uint32_t session)
      * acquisition fault may be retried with a new session ID. ACK result 1 is
      * the protocol's generic failure; the heartbeat carries the exact cause. */
     else if (s_error && s_error != 3) result = 1;
-    else if (!s_initialized || s_busy) result = 2;
+    else if (!s_initialized || s_busy) {
+        result = 2;
+        wake_cleanup = acquisition.cleanup_pending;
+    }
     else {
         /* Arm before exposing the pending run; a subsequent STOP cannot be
          * overwritten by the worker when it starts preparing the sensors. */
-        acquisition_arm();
-        s_error = 0;
-        s_sessions[s_session_count % SESSION_LIMIT] = session;
-        s_session_count++;
-        s_session = session;
-        s_busy = s_pending = true;
+        if (acquisition_arm() != ESP_OK) {
+            result = 2;
+            wake_cleanup = true;
+        } else {
+            s_error = 0;
+            s_sessions[s_session_count % SESSION_LIMIT] = session;
+            s_session_count++;
+            s_session = session;
+            s_busy = s_pending = true;
+        }
     }
     taskEXIT_CRITICAL(&s_lock);
-    if (result == 0) xTaskNotifyGive(s_task);
+    if (result == 0 || wake_cleanup) xTaskNotifyGive(s_task);
     return result;
 }
 
@@ -196,6 +206,24 @@ static void control_task(void *unused)
 
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        acquisition_status_t retained;
+        acquisition_get_status(&retained);
+        if (retained.cleanup_pending) {
+            esp_err_t cleanup_result = acquisition_retry_cleanup();
+            acquisition_get_status(&retained);
+            taskENTER_CRITICAL(&s_lock);
+            s_busy = retained.capturing || retained.cleanup_pending;
+            if (cleanup_result != ESP_OK) s_error = 3;
+            taskEXIT_CRITICAL(&s_lock);
+            if (retained.cleanup_pending) {
+                /* Retry cooperatively without accepting another session or
+                 * replacing retained handles. Heartbeats remain independent. */
+                vTaskDelay(pdMS_TO_TICKS(250));
+                xTaskNotifyGive(s_task);
+                continue;
+            }
+            ESP_LOGI(TAG, "Retained acquisition cleanup completed");
+        }
         taskENTER_CRITICAL(&s_lock);
         bool run = s_pending;
         uint32_t session = s_session;
@@ -233,8 +261,9 @@ static void control_task(void *unused)
             }
             /* Retain session ownership if failed cleanup leaves a stream
              * potentially active. Faults block reuse; never advertise idle. */
-            s_busy = acquisition.capturing;
+            s_busy = acquisition.capturing || acquisition.cleanup_pending;
             taskEXIT_CRITICAL(&s_lock);
+            if (acquisition.cleanup_pending) xTaskNotifyGive(s_task);
             ESP_LOGI(TAG, "Session %lu finished: %s", (unsigned long)session,
                      esp_err_to_name(result));
         }
@@ -266,7 +295,8 @@ static void control_task(void *unused)
 esp_err_t mission_control_init(void)
 {
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
-    acquisition_arm();
+    esp_err_t result = acquisition_arm();
+    if (result != ESP_OK) return result;
     return xTaskCreate(control_task, "mission_control", 6144, NULL, 5, &s_task)
         == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
