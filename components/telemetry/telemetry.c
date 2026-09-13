@@ -26,7 +26,10 @@ static const char *TAG = "TELEMETRY";
 #define TELEMETRY_POLL_MS 20U
 #define TELEMETRY_UART_TX_TIMEOUT_MS 1000U
 #define TELEMETRY_RECOVERY_RETRY_DELAY_MS 30000U
-#define TELEMETRY_RECOVERY_PROBE_INTERVAL_MS 1000U
+#define TELEMETRY_RECOVERY_PROBE_LOW_RATE_MS 1000U
+#define TELEMETRY_RECOVERY_PROBE_MEDIUM_RATE_MS 500U
+#define TELEMETRY_RECOVERY_PROBE_HIGH_RATE_MS 200U
+#define TELEMETRY_RECOVERY_PROBE_CRITICAL_RATE_MS 100U
 #define TELEMETRY_RECORD_BUFFER_SIZE \
     REFLECTANCE_RECORD_WIRE_SIZE(H1_MAX_SPECTRUM_SAMPLES)
 
@@ -56,6 +59,7 @@ typedef struct {
     int64_t last_tx_done_us;
     int64_t acknowledgement_deadline_us;
     uint32_t payload_crc32;
+    bool payload_crc_known;
     uint16_t transmissions;
     uint8_t message_type;
     uint8_t state;
@@ -284,6 +288,32 @@ static uint64_t entry_timestamp_us(const telemetry_entry_t *entry)
         : entry->record.reflectance.header.timestamp.b_monotonic_us;
 }
 
+static uint32_t recovery_probe_interval_ms(uint32_t pool_used,
+                                           uint32_t pool_capacity)
+{
+    if (pool_capacity == 0) return TELEMETRY_RECOVERY_PROBE_LOW_RATE_MS;
+    uint64_t scaled_used = (uint64_t)pool_used * 4U;
+    if (scaled_used >= (uint64_t)pool_capacity * 3U)
+        return TELEMETRY_RECOVERY_PROBE_CRITICAL_RATE_MS;
+    if ((uint64_t)pool_used * 2U >= pool_capacity)
+        return TELEMETRY_RECOVERY_PROBE_HIGH_RATE_MS;
+    if (scaled_used >= pool_capacity)
+        return TELEMETRY_RECOVERY_PROBE_MEDIUM_RATE_MS;
+    return TELEMETRY_RECOVERY_PROBE_LOW_RATE_MS;
+}
+
+static bool recovery_policy_self_test(void)
+{
+    return recovery_probe_interval_ms(0, 512) == 1000 &&
+           recovery_probe_interval_ms(127, 512) == 1000 &&
+           recovery_probe_interval_ms(128, 512) == 500 &&
+           recovery_probe_interval_ms(255, 512) == 500 &&
+           recovery_probe_interval_ms(256, 512) == 200 &&
+           recovery_probe_interval_ms(383, 512) == 200 &&
+           recovery_probe_interval_ms(384, 512) == 100 &&
+           recovery_probe_interval_ms(512, 512) == 100;
+}
+
 static esp_err_t emit_fragment(const uint8_t *fragment, size_t length,
                                uint16_t index, uint16_t count, void *context)
 {
@@ -436,7 +466,7 @@ static void process_ack(const telemetry_ack_t *ack)
         return;
     }
 
-    if (ack->status != 0) {
+    if (ack->status != TELEMETRY_ACK_STATUS_ACCEPTED) {
         taskENTER_CRITICAL(&s_lock);
         uint32_t count = ++s_status.acknowledgements_negative;
         s_status.acknowledgement_rejected++;
@@ -448,9 +478,9 @@ static void process_ack(const telemetry_ack_t *ack)
                      (unsigned)ack->message_type,
                      (unsigned long)ack->message_sequence);
         }
-        /* A matching negative DTA1 ACK is a definitive application rejection,
-         * not a transient loss. Retrying the same immutable payload cannot
-         * make it valid and would otherwise pin this pool slot forever. */
+        /* By contract, every nonzero DTA1 status is a definitive application
+         * rejection. A temporarily unavailable receiver must withhold DTA1 so
+         * the normal timeout/recovery path retains the immutable payload. */
         discard_failed_entry(entry, "negative cloud acknowledgement");
         return;
     }
@@ -547,8 +577,15 @@ static telemetry_entry_t *take_recovery_probe_due(
 {
     if (now_us < *next_probe_us) return NULL;
 
+    taskENTER_CRITICAL(&s_lock);
+    uint32_t pool_used = s_status.pool_used;
+    taskEXIT_CRITICAL(&s_lock);
+    int64_t interval_us =
+        (int64_t)recovery_probe_interval_ms(
+            pool_used, s_config.pool_length) * 1000LL;
+
     /* Round-robin selection prevents one chronically unacknowledged message
-     * from monopolizing the deliberately sparse recovery-probe budget. */
+     * from monopolizing the pressure-adaptive recovery-probe budget. */
     for (size_t offset = 0; offset < s_config.pool_length; offset++) {
         size_t index = (*cursor + offset) % s_config.pool_length;
         taskENTER_CRITICAL(&s_lock);
@@ -559,12 +596,14 @@ static telemetry_entry_t *take_recovery_probe_due(
             s_status.recovery_probes++;
             taskEXIT_CRITICAL(&s_lock);
             *cursor = (index + 1U) % s_config.pool_length;
-            *next_probe_us = now_us +
-                (int64_t)TELEMETRY_RECOVERY_PROBE_INTERVAL_MS * 1000LL;
+            *next_probe_us = now_us + interval_us;
             return &s_pool[index];
         }
         taskEXIT_CRITICAL(&s_lock);
     }
+    /* Avoid scanning every pool slot on each 20 ms task iteration while no
+     * exhausted entry has reached its recovery deadline. */
+    *next_probe_us = now_us + interval_us;
     return NULL;
 }
 
@@ -627,13 +666,14 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
         discard_failed_entry(entry, "fragment plan failed");
         return result;
     }
-    if (entry->payload_crc32 != 0 &&
+    if (entry->payload_crc_known &&
         entry->payload_crc32 != plan.payload_crc32) {
         note_pool_fault("immutable retry payload changed");
         discard_failed_entry(entry, "retry payload changed");
         return ESP_ERR_INVALID_CRC;
     }
     entry->payload_crc32 = plan.payload_crc32;
+    entry->payload_crc_known = true;
 
     telemetry_timing_t timing = {
         .attempt_started_us = esp_timer_get_time(),
@@ -732,10 +772,10 @@ static void telemetry_task(void *unused)
         while (drain_downlink(0)) {}
         update_expired_entries(esp_timer_get_time());
 
-        /* GPS and ordinary retries precede sparse recovery probes. A due probe
+        /* GPS and ordinary retries precede recovery probes. A due probe
          * precedes new reflectance so continuous acquisition cannot starve old
-         * retained slots forever; the global one-per-second limiter bounds its
-         * effect on current traffic. */
+         * retained slots. Probe rate rises with pool pressure, but remains
+         * globally capped at ten messages per second. */
         telemetry_entry_t *entry = take_queued(
             s_gps_queue, TELEMETRY_MESSAGE_GPS);
         if (entry == NULL) entry = take_retry_due();
@@ -856,6 +896,10 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
          pdMS_TO_TICKS(config->fragment_gap_ms) == 0) ||
         pdMS_TO_TICKS(config->ack_timeout_ms) == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (!recovery_policy_self_test()) {
+        ESP_LOGE(TAG, "Telemetry recovery policy self-test failed");
+        return ESP_FAIL;
     }
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
 

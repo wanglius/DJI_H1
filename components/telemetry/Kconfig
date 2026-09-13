@@ -1,0 +1,12 @@
+menu "DJI H1 telemetry"
+
+config DJI_H1_TELEMETRY_TIMING_DIAGNOSTICS
+    bool "Emit detailed telemetry transmission timing"
+    default y
+    help
+        Emit one TX_TIMING line per transmission attempt and one ACK_TIMING
+        line per accepted application acknowledgement. Keep this enabled for
+        development and field qualification; disable it in a quiet production
+        image to reduce USB-console CPU and log volume.
+
+endmenu

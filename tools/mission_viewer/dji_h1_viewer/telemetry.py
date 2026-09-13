@@ -31,6 +31,8 @@ _MAGIC_BYTES = struct.pack("<I", FRAGMENT_MAGIC)
 ACK_MAGIC = 0x31415444  # Little-endian bytes: DTA1.
 ACK_VERSION = 1
 ACK_WIRE_SIZE = 40
+ACK_STATUS_ACCEPTED = 0
+ACK_STATUS_PERMANENT_REJECTION = 1
 _ACK = struct.Struct("<IBBHQQIIHHI")
 
 
@@ -418,11 +420,18 @@ class TelemetryAcknowledgement:
     mission_id: int
     message_sequence: int
     message_crc32: int
-    status: int = 0
+    status: int = ACK_STATUS_ACCEPTED
 
 
-def encode_acknowledgement(message: ReassembledTelemetry, *, status: int = 0) -> bytes:
-    """Build a DTA1 cloud acknowledgement for a validated logical message."""
+def encode_acknowledgement(
+        message: ReassembledTelemetry, *,
+        status: int = ACK_STATUS_ACCEPTED) -> bytes:
+    """Build a final DTA1 disposition for a validated logical message.
+
+    Every nonzero status is a permanent rejection. A receiver experiencing a
+    transient failure must withhold DTA1 so the sender retains and retries the
+    immutable message.
+    """
     status = _uint("status", status, 0xFFFF)
     message_crc = zlib.crc32(message.payload) & 0xFFFFFFFF
     without_crc = _ACK.pack(

@@ -97,6 +97,15 @@ uint32_t telemetry_crc32(const void *data, size_t length);
 #define TELEMETRY_ACK_VERSION 0x01U
 #define TELEMETRY_ACK_WIRE_SIZE 40U
 
+/** DTA1 is a final application disposition, not a congestion signal. A cloud
+ * consumer that cannot make a durable decision yet must send no ACK and let
+ * the device's timeout/recovery policy retain the record. All nonzero values
+ * are permanent rejection reasons; value 1 is the generic reason. */
+typedef enum {
+    TELEMETRY_ACK_STATUS_ACCEPTED = 0,
+    TELEMETRY_ACK_STATUS_PERMANENT_REJECTION = 1,
+} telemetry_ack_status_t;
+
 typedef struct {
     uint64_t source_id;
     uint64_t mission_id;

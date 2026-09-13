@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "mission_viewer"))
 
 from dji_h1_viewer.telemetry import (  # noqa: E402
+    ACK_STATUS_ACCEPTED, ACK_STATUS_PERMANENT_REJECTION,
     FRAGMENT_HEADER_SIZE, FRAGMENT_MAGIC, FRAGMENT_PAYLOAD_MAX,
     FRAGMENT_WIRE_MAX_SIZE, FragmentError, MESSAGE_GPS, MESSAGE_REFLECTANCE,
     TelemetryFragmentStreamDecoder, TelemetryReassembler,
@@ -108,6 +109,7 @@ class TelemetryTransportTests(unittest.TestCase):
         self.assertEqual(ack.source_id, 0x123456789ABC)
         self.assertEqual(ack.mission_id, 0xFEDCBA9876543210)
         self.assertEqual(ack.message_sequence, 12)
+        self.assertEqual(ack.status, ACK_STATUS_ACCEPTED)
         damaged = bytearray(encoded)
         damaged[-1] ^= 1
         with self.assertRaisesRegex(FragmentError, "acknowledgement CRC"):
@@ -118,8 +120,11 @@ class TelemetryTransportTests(unittest.TestCase):
         message = TelemetryReassembler().push(fragment)
         self.assertIsNotNone(message)
         assert message is not None
-        encoded = encode_acknowledgement(message, status=7)
-        self.assertEqual(decode_acknowledgement(encoded).status, 7)
+        encoded = encode_acknowledgement(
+            message, status=ACK_STATUS_PERMANENT_REJECTION)
+        self.assertEqual(
+            decode_acknowledgement(encoded).status,
+            ACK_STATUS_PERMANENT_REJECTION)
 
     def test_rejects_corrupt_fragment_crc(self) -> None:
         fragment, = fragment_message(MESSAGE_GPS, 1, 2, _payload(98))

@@ -130,6 +130,7 @@ esp_err_t telemetry_transport_self_test(void)
         .message_sequence = 100,
         .message_crc32 = plan.payload_crc32,
         .message_type = TELEMETRY_MESSAGE_GPS,
+        .status = TELEMETRY_ACK_STATUS_ACCEPTED,
     };
     uint8_t encoded_ack[TELEMETRY_ACK_WIRE_SIZE];
     telemetry_ack_t decoded_ack;
@@ -141,19 +142,20 @@ esp_err_t telemetry_transport_self_test(void)
               decoded_ack.message_sequence == expected_ack.message_sequence &&
               decoded_ack.message_crc32 == expected_ack.message_crc32 &&
               decoded_ack.message_type == expected_ack.message_type &&
-              decoded_ack.status == 0,
+              decoded_ack.status == TELEMETRY_ACK_STATUS_ACCEPTED,
           "cloud acknowledgement round trip");
     encoded_ack[TELEMETRY_ACK_WIRE_SIZE - 1] ^= 1;
     CHECK(telemetry_ack_decode(encoded_ack, sizeof(encoded_ack),
                                &decoded_ack) == ESP_ERR_INVALID_CRC,
           "cloud acknowledgement CRC rejection");
 
-    expected_ack.status = 7;
+    expected_ack.status = TELEMETRY_ACK_STATUS_PERMANENT_REJECTION;
     CHECK(telemetry_ack_encode(&expected_ack, encoded_ack) == ESP_OK &&
               telemetry_ack_decode(encoded_ack, sizeof(encoded_ack),
                                    &decoded_ack) == ESP_OK &&
-              decoded_ack.status == 7,
-          "negative cloud acknowledgement round trip");
+              decoded_ack.status ==
+                  TELEMETRY_ACK_STATUS_PERMANENT_REJECTION,
+          "permanent-rejection acknowledgement round trip");
 
     ESP_LOGI(TAG, "TELEMETRY FRAGMENTATION SELF-TEST PASSED");
     return ESP_OK;

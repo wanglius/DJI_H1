@@ -3,6 +3,7 @@
 /build*/
 
 # ESP-IDF configuration backups and generated root-level tooling files.
+/sdkconfig
 /sdkconfig.old
 /compile_commands.json
 

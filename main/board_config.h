@@ -1,6 +1,7 @@
 #pragma once
 
 #include "driver/uart.h"
+#include "sdkconfig.h"
 
 /* Fixed memory population of the production module. Boot validation catches
  * a wrong module variant or unusable external memory before mission-ready. */
@@ -48,4 +49,10 @@
 #define DJI_DTU_MAX_RETRIES 1
 /* Shared GPS/reflectance retained-message pool in external PSRAM. */
 #define DJI_DTU_TELEMETRY_POOL_LENGTH 512
+/* Kconfig keeps verbose timings enabled during field qualification and allows
+ * a production build to silence the per-message USB-console traffic. */
+#ifdef CONFIG_DJI_H1_TELEMETRY_TIMING_DIAGNOSTICS
 #define DJI_DTU_TIMING_DIAGNOSTICS true
+#else
+#define DJI_DTU_TIMING_DIAGNOSTICS false
+#endif

@@ -99,13 +99,18 @@ Current production policy:
   between messages. Positive ACKs may arrive late, duplicated, or out of order;
 - exhausted acknowledgement retries increment `messages_failed` once and
   degrade the heartbeat. The unconfirmed slot remains available for a late ACK
-  and receives a round-robin recovery probe after 30 seconds. Recovery traffic
-  is globally limited to one message per second and runs behind new GPS and
-  ordinary retries but ahead of new reflectance, so it cannot be starved by a
-  continuous reflectance backlog or monopolize a recovered link;
+  and receives a round-robin recovery probe after 30 seconds. Recovery runs
+  behind new GPS and ordinary retries but ahead of new reflectance. Its global
+  rate adapts to shared-pool occupancy: 1 message/s below 25%, 2 messages/s at
+  25%, 5 messages/s at 50%, and at most 10 messages/s at 75% or above. This
+  preserves normal live-traffic priority while clearing a full 512-entry pool
+  in roughly one minute after connectivity returns;
 - a matching negative application ACK or a permanent local serialization/
   framing failure releases the slot immediately because retransmitting the same
-  immutable payload cannot correct it;
+  immutable payload cannot correct it. DTA1 status 0 means accepted; every
+  nonzero status is contractually permanent. A receiver facing temporary
+  storage pressure, rate limiting, or another transient condition must withhold
+  DTA1 and let the sender's timeout/recovery path retain the record;
 - only local infrastructure faults (UART, internal serialization/framing, or a
   pool ownership invariant failure) latch telemetry unhealthy.
   Delivery-pressure counters do not control telemetry or recorder admission.
@@ -115,6 +120,14 @@ DTF2 bytes; application pacing adds no deliberate delay. Cloud ACK latency is
 independent of this serialization path. The 512-entry PSRAM pool absorbs
 prolonged latency or outages; it is finite by design so local SD recording
 always retains bounded memory behavior.
+
+The production UART setting assumes the DTU has already been persistently
+provisioned for 460800 baud with `configure_dtu_mqtt.py` and qualified with the
+bidirectional path verifier. Transparent mode has no reliable in-band query for
+the modem's UART setting. A dead or mismatched uplink is nevertheless visible:
+exhausted application-ACK retries increment `messages_failed`, emit a warning,
+and produce A-board heartbeat error 5. This detects the failed path but cannot
+distinguish baud mismatch from cellular, broker, topic, or receiver failure.
 
 ## Cloud acknowledgement
 
@@ -137,6 +150,11 @@ cause. Pool occupancy/high-water marks, simultaneous in-flight counts,
 transmission attempts, and application-ACK RTT are also checkpointed. A late
 positive ACK can release a retry-exhausted or previously rejected entry.
 
+Detailed per-attempt `TX_TIMING` and `ACK_TIMING` logs are controlled by
+`CONFIG_DJI_H1_TELEMETRY_TIMING_DIAGNOSTICS`. Project defaults keep them enabled
+during field qualification; a quiet production build can disable the option
+without changing source code.
+
 At final power-off, telemetry is deliberately abandoned as soon as the B board
 receives the `0x30` forecast. Admission closes, both ready queues are cleared
 immediately, and the worker reclaims queued and in-flight pool entries. An
@@ -155,10 +173,11 @@ allowed to return because interrupting it could damage the filesystem. The B
 board sets `safe_power_off=1` only after all files close and the card unmounts;
 deadline expiry alone never claims safety.
 
-Each encoded fragment should be submitted to the ESP32 UART in one call. After
-the UART drains, the sender leaves the configured conservative gap. This often
-makes each application fragment a separate MQTT publication. The receiver still
-validates framing and does not trust MQTT boundaries as an integrity mechanism.
+Each encoded fragment is submitted to the ESP32 UART in one call. Production
+uses no application-level gap between fragments and delegates serial-to-MQTT
+packetization to the DTU's configured byte-count/idle-time thresholds. The
+receiver validates DTF2 framing and never trusts MQTT publication boundaries as
+an integrity mechanism.
 
 ## Receiver contract
 

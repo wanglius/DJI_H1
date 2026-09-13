@@ -148,8 +148,9 @@ startup, and it must remain online through the final telemetry drain. The
 GPS minimum reflects the continuous production 5 Hz A-to-B stream; the lower
 reflectance minimum reflects the four active survey segments rather than
 incorrectly assuming ten minutes of acquisition.
-The monitor sends MQTT `PINGREQ` packets during quiet periods, so EMQX does not
-drop the subscriber while the device is idle or after safe shutdown.
+The monitor services MQTT keepalive on a fixed schedule regardless of inbound
+traffic, so continuous QoS-0 publications cannot suppress `PINGREQ` and make
+EMQX drop the subscriber. The independent ACK publisher is kept alive too.
 The production firmware deliberately treats a missing application ACK as a
 telemetry fault, so MQTTX alone is useful for inspection but cannot replace
 this validator (or the future production receiver service).

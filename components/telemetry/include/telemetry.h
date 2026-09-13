@@ -59,8 +59,8 @@ typedef struct {
     uint32_t fragments_sent;
     uint32_t bytes_sent;
     uint32_t messages_retried;
-    /** Slow, globally rate-limited sends of messages whose normal retry
-     * budget was exhausted but which remain retained for eventual delivery. */
+    /** Globally rate-limited sends of messages whose normal retry budget was
+     * exhausted. The rate rises with pool pressure from 1 to at most 10/s. */
     uint32_t recovery_probes;
     uint32_t acknowledgements_received;
     uint32_t acknowledgement_timeouts;
