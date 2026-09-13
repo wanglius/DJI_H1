@@ -74,12 +74,19 @@ def main() -> int:
     parser.add_argument("--topic", default="dji-h1/test/up")
     parser.add_argument("--ack-topic", default="dji-h1/test/down")
     parser.add_argument("--duration", type=float, default=60.0)
-    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--max-inflight", type=int, default=512,
+        help=("maximum simultaneous incomplete messages; the default matches "
+              "the production ESP32 retention pool"),
+    )
     parser.add_argument("--expect-gps-min", type=int, default=0)
     parser.add_argument("--expect-reflectance-min", type=int, default=0)
     args = parser.parse_args()
     if args.duration <= 0:
         parser.error("--duration must be positive")
+    if args.max_inflight <= 0:
+        parser.error("--max-inflight must be positive")
 
     suffix = str(int(time.time() * 1000))[-10:]
     connection = connect_client(
@@ -91,7 +98,13 @@ def main() -> int:
         f"DJI_H1_ack_{suffix}", args.username,
     )
     stream = TelemetryFragmentStreamDecoder()
-    reassembler = TelemetryReassembler(timeout_seconds=30.0)
+    # The asynchronous sender can legitimately have many partially delivered
+    # messages alive at once while missing fragments are awaiting retry.  A
+    # receiver limit smaller than the sender's retention window would turn
+    # ordinary packet loss into a test-client failure and stop all ACKs.
+    reassembler = TelemetryReassembler(
+        timeout_seconds=30.0, max_inflight=args.max_inflight,
+    )
     counts = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}
     last_sequences: dict[tuple[int, int, int], int] = {}
     source_records_skipped = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}

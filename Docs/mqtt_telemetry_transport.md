@@ -27,8 +27,8 @@ reassembles them. It never changes timestamps or measurement fields.
 - Give every DTU its own uplink topic. Because a DTU may divide one DTF2 frame
   across MQTT publications, byte streams from multiple publishers must not be
   interleaved on one topic before framing is recovered.
-- QoS 1 duplicates are expected and must be ignored by the receiver, including
-  duplicates arriving shortly after a message was already completed.
+- Duplicates are expected from application retries and must be ignored by the
+  receiver, including duplicates arriving shortly after completion.
 
 ## Fragment wire format
 
@@ -85,6 +85,9 @@ Current production policy:
 
 - 6 ms idle gap after every fragment, validated against the current DTU at
   460800 baud;
+- DTU uplink publication uses QoS 0 to avoid serializing every 1024-byte
+  fragment behind the modem's broker-PUBACK path; the subscribed acknowledgement
+  topic remains QoS 1;
 - GPS is coalesced to the latest sample and sent no more often than once per
   second;
 - GPS and reflectance share a 512-entry PSRAM retention pool (roughly 1.6 MiB);
@@ -107,8 +110,9 @@ recording always retains bounded memory behavior.
 
 ## Cloud acknowledgement
 
-QoS 1 confirms delivery from the DTU to the broker, but the ESP32 cannot see
-that PUBACK. Therefore the production validator/service publishes a 40-byte
+The DTU uplink deliberately uses QoS 0 because the ESP32 cannot observe an
+MQTT PUBACK and therefore cannot use it to retire retained data. The production
+validator/service instead publishes a 40-byte
 `DTA1` application acknowledgement on the configured downlink topic only after
 the complete DTF2 message and inner DHR1 record pass validation. It echoes the
 source ID, mission ID, type, sequence, and complete-message CRC. The ESP32

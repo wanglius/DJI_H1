@@ -109,7 +109,7 @@ the downlink topic and confirms the same bytes arrive on the serial port.
 Use `--uplink-bytes 3172` to exercise one full-size v01 reflectance record's
 payload volume. Because the DTU packetizer is capped at 1024 bytes, the verifier
 reassembles consecutive MQTT payloads and reports their count while requiring
-QoS 1 on every uplink publication.
+the configured uplink QoS (QoS 0 by default). The downlink remains QoS 1.
 
 To verify the actual `DTF2` application fragments and receiver reassembly
 through the hardware path, run:
@@ -138,7 +138,7 @@ python tests/dtu_uart_bridge/monitor_telemetry.py `
 ```
 
 It does not use COM6. It subscribes to the uplink topic, handles
-arbitrary DTU chunk boundaries and QoS 1 duplicates, validates both DTF2 and
+arbitrary DTU chunk boundaries and duplicates, validates both DTF2 and
 DHR1 CRCs, publishes `DTA1` application acknowledgements on the downlink topic,
 and reports record counts plus intentionally skipped source-record sequences.
 For the 600-second endurance mission, the 720-second monitor budget is

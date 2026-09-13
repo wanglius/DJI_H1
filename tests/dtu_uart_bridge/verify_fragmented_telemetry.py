@@ -36,7 +36,7 @@ def disconnect(connection) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Verify fragmented telemetry through DTU MQTT QoS 1"
+        description="Verify fragmented telemetry through the DTU MQTT uplink"
     )
     parser.add_argument("--serial-port", default="COM6")
     parser.add_argument("--baud", type=int, default=115200)
@@ -44,6 +44,7 @@ def main() -> int:
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--username", default="")
     parser.add_argument("--topic", default="dji-h1/test/up")
+    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=0)
     parser.add_argument("--source-id", type=lambda value: int(value, 0),
                         default=0x12345678)
     parser.add_argument("--message-bytes", type=int, default=3172)
@@ -103,9 +104,9 @@ def main() -> int:
                         continue
                     if topic != args.topic:
                         continue
-                    if qos != 1:
+                    if qos != args.expect_qos:
                         raise RuntimeError(
-                            f"expected QoS 1, received QoS {qos}"
+                            f"expected QoS {args.expect_qos}, received QoS {qos}"
                         )
                     mqtt_sizes.append(len(mqtt_payload))
                     for fragment in stream_decoder.feed(mqtt_payload):
@@ -167,7 +168,8 @@ def main() -> int:
 
         application_sizes = [len(item) for item in messages[0]]
         print(
-            f"FRAGMENTED TELEMETRY PASS qos=1 messages={len(completed)} "
+            f"FRAGMENTED TELEMETRY PASS qos={args.expect_qos} "
+            f"messages={len(completed)} "
             f"source={args.source_id:012X} "
             f"bytes_each={args.message_bytes} "
             f"fragments_each={len(messages[0])} "

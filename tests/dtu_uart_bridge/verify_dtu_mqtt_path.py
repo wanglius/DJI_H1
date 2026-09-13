@@ -18,6 +18,7 @@ from mqtt_broker_probe import (
 
 def receive_matching_publish(
     connection, topic: str, payload: bytes, timeout_seconds: float,
+    expected_qos: int,
 ) -> tuple[int, list[int]]:
     deadline = time.monotonic() + timeout_seconds
     received = bytearray()
@@ -27,9 +28,10 @@ def receive_matching_publish(
         received_topic, received_payload, received_qos = receive_publish(connection)
         if received_topic != topic:
             continue
-        if received_qos != 1:
+        if received_qos != expected_qos:
             raise RuntimeError(
-                f"expected DTU uplink QoS 1, received QoS {received_qos}"
+                f"expected DTU uplink QoS {expected_qos}, "
+                f"received QoS {received_qos}"
             )
         message_count += 1
         message_sizes.append(len(received_payload))
@@ -74,6 +76,9 @@ def main() -> int:
     parser.add_argument("--username", default="")
     parser.add_argument("--up-topic", default="dji-h1/test/up")
     parser.add_argument("--down-topic", default="dji-h1/test/down")
+    parser.add_argument(
+        "--expect-uplink-qos", type=int, choices=(0, 1), default=0,
+    )
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument(
         "--uplink-bytes", type=int, default=32,
@@ -112,11 +117,13 @@ def main() -> int:
             port.write(uplink_payload)
             port.flush()
             message_count, message_sizes = receive_matching_publish(
-                subscriber, args.up_topic, uplink_payload, args.timeout
+                subscriber, args.up_topic, uplink_payload, args.timeout,
+                args.expect_uplink_qos,
             )
             print(
                 f"UPLINK PASS serial={args.serial_port} -> "
-                f"topic={args.up_topic} qos=1 bytes={len(uplink_payload)} "
+                f"topic={args.up_topic} qos={args.expect_uplink_qos} "
+                f"bytes={len(uplink_payload)} "
                 f"mqtt_messages={message_count} chunk_sizes={message_sizes}"
             )
 
