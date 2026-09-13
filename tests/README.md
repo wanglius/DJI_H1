@@ -1,26 +1,28 @@
 # Hardware tests
 
-These sources are integration harnesses, not production modules. The active
-milestone firmware selects them explicitly from `main/CMakeLists.txt`.
+These sources are integration harnesses, not production modules. They are not
+linked into the production application.
 
 - `coexistence_test.c` runs dual-spectrometer acquisition while continuously
   writing and periodically flushing `COEXIST.BIN` on the SD card. It overwrites
   that file on every run.
 - `sd_card_test.c` overwrites `H1TEST.TXT`, then reads it back.
-- `data_pipeline_test.c` validates the documented 30-byte drone payload decoder
-  and common in-memory record metadata.
-- `ab_protocol_test.c` validates A-B CRC, complete-frame encoding, incremental
-  parsing, timeout recovery, CRC rejection, and status-payload round trips.
-- `ab_link_test.c` is a simulated B-board endpoint on GPIO17/GPIO18 for the
-  PC-side A-board emulator. Its mission state and storage percentage are fake.
-- `h1_single_frame_test.c` is the original standalone `app_main` retained for
-  regression diagnosis; it is not part of the normal build.
+- `hardware_diagnostics/` is a standalone ESP-IDF project. Its Kconfig choice
+  selects the destructive SD-card readback test or the dual-H1/SD coexistence
+  test. Build it from that directory; the SD test overwrites `H1TEST.TXT`, and
+  the coexistence test overwrites `COEXIST.BIN`.
+- `h1_single_frame/` is a standalone ESP-IDF project wrapping the original
+  single-frame regression diagnostic.
 - `dtu_uart_bridge/` is a standalone temporary firmware that bridges the native
   USB Serial/JTAG COM port to the 4G DTU on UART1, GPIO17/GPIO18. It does not
   build into or modify the production application.
 
 Hardware tests may write to the inserted card. Never run them with irreplaceable
 media unless the named test files have been backed up.
+
+Deterministic embedded qualification checks live in
+`components/startup_checks/`. Enable `CONFIG_DJI_H1_BOOT_SELF_TESTS` only for a
+qualification image; normal flight firmware does not compile their test bodies.
 
 ## Host-only tests
 

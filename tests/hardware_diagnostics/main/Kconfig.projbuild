@@ -1,0 +1,16 @@
+choice DJI_H1_HARDWARE_DIAGNOSTIC
+    prompt "Hardware diagnostic to run"
+    default DJI_H1_DIAGNOSTIC_SD_CARD
+
+    config DJI_H1_DIAGNOSTIC_SD_CARD
+        bool "Destructive SD-card connection/readback test"
+
+    config DJI_H1_DIAGNOSTIC_COEXISTENCE
+        bool "Dual-spectrometer and SD-card coexistence test"
+endchoice
+
+config DJI_H1_DIAGNOSTIC_DURATION_MS
+    int "Coexistence test duration (milliseconds)"
+    range 1000 3600000
+    default 30000
+    depends on DJI_H1_DIAGNOSTIC_COEXISTENCE

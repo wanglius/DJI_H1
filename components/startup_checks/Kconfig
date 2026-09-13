@@ -1,0 +1,8 @@
+config DJI_H1_BOOT_SELF_TESTS
+    bool "Run deterministic qualification checks at boot"
+    default n
+    help
+        Compile and run the protocol, record-pipeline, clock, calculation, and
+        telemetry transport self-tests before production services start.
+        Enable for qualification firmware; leave disabled in flight images to
+        reduce boot time and keep test-only code out of the binary.

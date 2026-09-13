@@ -5,9 +5,6 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_psram.h"
-#include "data_pipeline_test.h"
-#include "telemetry_transport_test.h"
-#include "ab_protocol_test.h"
 #include "ab_link.h"
 #include "mission_control.h"
 #include "drone_data.h"
@@ -15,6 +12,7 @@
 #include "dji_h1_board.h"
 #include "telemetry.h"
 #include "telemetry_transport.h"
+#include "startup_checks.h"
 
 static const char *TAG = "DJI_H1";
 
@@ -77,11 +75,7 @@ void app_main(void)
     printf("\nDJI_H1 - A-BOARD CONTROLLED DUAL ACQUISITION\n");
     ESP_ERROR_CHECK(verify_board_flash());
     ESP_ERROR_CHECK(verify_board_psram());
-    ESP_ERROR_CHECK(data_pipeline_self_test());
-    ESP_ERROR_CHECK(telemetry_transport_self_test());
-    ESP_ERROR_CHECK(ab_protocol_self_test());
-    ESP_ERROR_CHECK(clock_sync_self_test());
-    ESP_ERROR_CHECK(drone_data_clear()); /* Do not publish self-test GPS as real. */
+    ESP_ERROR_CHECK(startup_checks_run());
     ESP_ERROR_CHECK(clock_sync_init());
     uint8_t factory_mac[6];
     ESP_ERROR_CHECK(esp_efuse_mac_get_default(factory_mac));

@@ -194,7 +194,6 @@ static void control_task(void *unused)
     };
     esp_err_t result = sd_card_mount(&sd);
     if (result == ESP_OK) result = refresh_storage();
-    if (result == ESP_OK) result = calculation_self_test();
     if (result == ESP_OK) result = measurement_recorder_init();
     uint8_t error = result == ESP_OK ? 0 : 1;
     if (!error) {
