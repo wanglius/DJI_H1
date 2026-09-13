@@ -21,7 +21,7 @@ from dji_h1_viewer.telemetry import (  # noqa: E402
     encode_acknowledgement,
 )
 from mqtt_broker_probe import (  # noqa: E402
-    connect_client, publish, receive_publish, send_packet, subscribe,
+    connect_client, ping, publish, receive_publish, send_packet, subscribe,
 )
 
 
@@ -33,6 +33,23 @@ _GPS_BODY = struct.Struct("<B3xiiiIIH8B")
 _REFLECTANCE_PREFIX = struct.Struct("<IIIQIHHHHHH")
 MAX_ACK_CACHE = 4096
 PING_INTERVAL_SECONDS = 10.0
+
+
+def service_keepalives(connection, acknowledger, last_ping: float,
+                       now: float) -> float:
+    """Keep both MQTT clients alive independently of incoming traffic.
+
+    The subscriber normally receives continuous QoS-0 PUBLISH packets, but
+    broker-to-client traffic does not satisfy the MQTT client keepalive.  Its
+    PINGRESP is intentionally left for receive_publish(), which ignores MQTT
+    control packets while looking for the next PUBLISH.  The ACK connection
+    has no unsolicited traffic, so its response can be consumed immediately.
+    """
+    if now - last_ping < PING_INTERVAL_SECONDS:
+        return last_ping
+    send_packet(connection, 0xC0, b"")
+    ping(acknowledger)
+    return now
 
 
 def integer_argument(value: str) -> int:
@@ -137,17 +154,16 @@ def main() -> int:
         deadline = time.monotonic() + args.duration
         last_ping = time.monotonic()
         while time.monotonic() < deadline:
+            # Check the deadline before every receive.  Doing this only from
+            # the socket-timeout path fails when QoS-0 telemetry is continuous:
+            # inbound PUBLISH packets do not count as client keepalive traffic.
+            last_ping = service_keepalives(
+                connection, acknowledger, last_ping, time.monotonic()
+            )
             try:
                 topic, mqtt_payload, qos = receive_publish(connection)
             except socket.timeout:
                 reassembler.expire()
-                now = time.monotonic()
-                if now - last_ping >= PING_INTERVAL_SECONDS:
-                    # MQTT 3.1.1 keepalive is based on client-to-broker
-                    # traffic. After B shuts down there are no QoS-1 PUBACKs,
-                    # so keep the validator subscribed through its budget.
-                    send_packet(connection, 0xC0, b"")
-                    last_ping = now
                 continue
             if topic != args.topic:
                 continue

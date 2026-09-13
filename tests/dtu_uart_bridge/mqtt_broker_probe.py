@@ -53,6 +53,16 @@ def send_packet(connection: socket.socket, first: int, body: bytes) -> None:
     connection.sendall(bytes((first,)) + encode_length(len(body)) + body)
 
 
+def ping(connection: socket.socket) -> None:
+    """Send MQTT PINGREQ and consume the matching PINGRESP."""
+    send_packet(connection, 0xC0, b"")
+    first, body = read_packet(connection)
+    if first != 0xD0 or body:
+        raise ConnectionError(
+            f"invalid MQTT PINGRESP: packet=0x{first:02x}, size={len(body)}"
+        )
+
+
 def connect_client(host: str, port: int, client_id: str,
                    username: str) -> socket.socket:
     connection = socket.create_connection((host, port), timeout=5.0)
