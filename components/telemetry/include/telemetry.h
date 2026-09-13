@@ -16,10 +16,11 @@ typedef struct {
     int tx_gpio;
     int rx_gpio;
     uint32_t baud_rate;
-    /** Minimum idle time after every DTU-bound fragment. */
+    /** Idle time after every DTU-bound fragment. Zero deliberately emits
+     * consecutive fragments without an application-level delay and relies on
+     * the DTU UART packetizer for flow control. Values 1..5 ms are rejected
+     * because they are shorter than the previously qualified safe interval. */
     uint32_t fragment_gap_ms;
-    /** Maximum live GPS publication frequency; newer pending data replaces old. */
-    uint32_t gps_min_interval_ms;
     /** Stable nonzero identity included in every transport message. */
     uint64_t source_id;
     /** Cloud application acknowledgement deadline and retry count. */
@@ -40,7 +41,10 @@ typedef struct {
     uint64_t mission_id;
     uint32_t gps_submitted;
     uint32_t gps_sent;
+    /** Retained for mission-summary compatibility; FIFO GPS never supersedes. */
     uint32_t gps_superseded;
+    /** GPS records rejected because the shared retained pool was full. */
+    uint32_t gps_queue_overflows;
     uint32_t reflectance_submitted;
     /** GPS/reflectance "sent" counters mean positively acknowledged complete
      * application messages, preserving the pre-windowing status semantics. */
@@ -55,6 +59,9 @@ typedef struct {
     uint32_t fragments_sent;
     uint32_t bytes_sent;
     uint32_t messages_retried;
+    /** Slow, globally rate-limited sends of messages whose normal retry
+     * budget was exhausted but which remain retained for eventual delivery. */
+    uint32_t recovery_probes;
     uint32_t acknowledgements_received;
     uint32_t acknowledgement_timeouts;
     /** Backward-compatible aggregate of mismatched and explicit negative
@@ -64,7 +71,8 @@ typedef struct {
     uint32_t acknowledgements_mismatched;
     /** Matching DTA1 frames whose application status is nonzero. */
     uint32_t acknowledgements_negative;
-    /** Logical messages that exhausted all delivery attempts. */
+    /** Unique logical messages that exhausted normal delivery attempts or
+     * were definitively rejected. Recovery probes do not recount them. */
     uint32_t messages_failed;
     uint32_t serialization_errors;
     /** Internal ownership/free-list failures in the shared PSRAM pool. */
@@ -75,6 +83,8 @@ typedef struct {
     uint32_t acknowledgement_rtt_last_us;
     uint32_t acknowledgement_rtt_max_us;
     uint64_t acknowledgement_rtt_sum_us;
+    /** Records deliberately discarded by prepare-power-off. */
+    uint32_t messages_abandoned_shutdown;
     /** True when prepare-power-off deliberately cancelled cloud delivery so
      * the shutdown budget could be reserved for durable SD finalization. */
     bool shutdown_aborted;
@@ -91,10 +101,10 @@ esp_err_t telemetry_start(const telemetry_config_t *config);
  */
 esp_err_t telemetry_begin_mission(uint64_t mission_id);
 
-/** GPS is a nonblocking latest-value submission at the configured rate.
- * Reflectance uses a bounded FIFO: it never silently overwrites an older
- * result, and a full queue returns ESP_ERR_NO_MEM and counts a dropped live
- * telemetry record without stopping later submissions or SD recording.
+/** GPS and reflectance are nonblocking bounded FIFO submissions backed by one
+ * retained PSRAM pool. Neither silently overwrites an older record. A full
+ * pool returns ESP_ERR_NO_MEM and counts a dropped live telemetry record
+ * without stopping later submissions or SD recording.
  */
 esp_err_t telemetry_submit_gps(const gps_record_t *record);
 esp_err_t telemetry_submit_reflectance(
@@ -106,8 +116,12 @@ esp_err_t telemetry_submit_reflectance(
 esp_err_t telemetry_finish_mission(uint32_t timeout_ms);
 
 /** Immediately close admission and cancel queued/in-progress delivery.
- * This is the prepare-power-off path: it is nonblocking and intentionally
+ * This idempotent prepare-power-off hook is nonblocking and intentionally
  * sacrifices telemetry so SD recording can be finalized before power loss.
+ * Bytes already accepted by the UART hardware may finish shifting, but no
+ * later fragment, retry, or queued message is intentionally transmitted.
+ * The shutdown latch is terminal: begin/submit calls remain rejected until
+ * the expected physical power cycle resets the component.
  */
 esp_err_t telemetry_abort_mission(void);
 

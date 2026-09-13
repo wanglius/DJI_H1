@@ -35,6 +35,17 @@ MAX_ACK_CACHE = 4096
 PING_INTERVAL_SECONDS = 10.0
 
 
+def integer_argument(value: str) -> int:
+    """Accept decimal or conventional 0x-prefixed identifiers."""
+    try:
+        parsed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= parsed <= 0xFFFFFFFFFFFFFFFF:
+        raise argparse.ArgumentTypeError("must be in 1..0xffffffffffffffff")
+    return parsed
+
+
 def disconnect(connection) -> None:
     if connection is None:
         return
@@ -82,6 +93,11 @@ def main() -> int:
     )
     parser.add_argument("--expect-gps-min", type=int, default=0)
     parser.add_argument("--expect-reflectance-min", type=int, default=0)
+    parser.add_argument(
+        "--mission-id", type=integer_argument,
+        help=("count and print only this mission; other complete missions are "
+              "still validated and acknowledged so stale DTU traffic drains"),
+    )
     args = parser.parse_args()
     if args.duration <= 0:
         parser.error("--duration must be positive")
@@ -106,8 +122,7 @@ def main() -> int:
         timeout_seconds=30.0, max_inflight=args.max_inflight,
     )
     counts = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}
-    last_sequences: dict[tuple[int, int, int], int] = {}
-    source_records_skipped = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}
+    observed_sequences: dict[tuple[int, int, int], set[int]] = {}
     # Retain enough recently completed identities to answer the ESP32's
     # bounded retransmission after a lost downlink ACK, without leaking memory
     # in a receiver service that may run for days.
@@ -115,6 +130,7 @@ def main() -> int:
     ack_packet_id = 1
     mqtt_messages = 0
     mqtt_bytes = 0
+    other_mission_records = 0
     try:
         subscribe(connection, args.topic, 1)
         connection.settimeout(1.0)
@@ -165,14 +181,26 @@ def main() -> int:
                     message.payload, message.message_type,
                     message.message_sequence,
                 )
+                # Acknowledge every fully validated record, including a stale
+                # mission left in the DTU. Filtering affects only the reported
+                # test population and never prevents old traffic from draining.
+                encoded_ack = encode_acknowledgement(message)
+                ack_cache[key] = encoded_ack
+                ack_cache.move_to_end(key)
+                if len(ack_cache) > MAX_ACK_CACHE:
+                    ack_cache.popitem(last=False)
+                publish(acknowledger, args.ack_topic, encoded_ack, 1,
+                        ack_packet_id)
+                ack_packet_id = 1 if ack_packet_id == 0xFFFF else ack_packet_id + 1
+                if args.mission_id is not None and \
+                        message.mission_id != args.mission_id:
+                    other_mission_records += 1
+                    continue
                 sequence_key = (message.source_id, message.mission_id,
                                 message.message_type)
-                previous = last_sequences.get(sequence_key)
-                if previous is not None and message.message_sequence > previous + 1:
-                    source_records_skipped[message.message_type] += (
-                        message.message_sequence - previous - 1
-                    )
-                last_sequences[sequence_key] = message.message_sequence
+                observed_sequences.setdefault(sequence_key, set()).add(
+                    message.message_sequence
+                )
                 counts[message.message_type] = counts.get(message.message_type, 0) + 1
                 utc_ms = fields[11]
                 if message.message_type == MESSAGE_GPS:
@@ -203,14 +231,6 @@ def main() -> int:
                         f"samples={sample_count} valid={reflectance[6]} "
                         f"sky_age_us={reflectance[4]}"
                     )
-                encoded_ack = encode_acknowledgement(message)
-                ack_cache[key] = encoded_ack
-                ack_cache.move_to_end(key)
-                if len(ack_cache) > MAX_ACK_CACHE:
-                    ack_cache.popitem(last=False)
-                publish(acknowledger, args.ack_topic, encoded_ack, 1,
-                        ack_packet_id)
-                ack_packet_id = 1 if ack_packet_id == 0xFFFF else ack_packet_id + 1
     except (FragmentError, ValueError, OSError, RuntimeError) as exc:
         print(f"TELEMETRY INVALID: {exc}", file=sys.stderr)
         return 2
@@ -220,10 +240,21 @@ def main() -> int:
 
     gps_count = counts[MESSAGE_GPS]
     reflectance_count = counts[MESSAGE_REFLECTANCE]
+    source_records_skipped = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}
+    # Retries can complete old records out of order. Compute actual holes from
+    # the final observed set instead of treating each forward arrival jump as
+    # loss, which would substantially over-report gaps under normal recovery.
+    for sequence_key, sequences in observed_sequences.items():
+        ordered = sorted(sequences)
+        source_records_skipped[sequence_key[2]] += sum(
+            current - previous - 1
+            for previous, current in zip(ordered, ordered[1:])
+        )
     print(
         "TELEMETRY SUMMARY "
         f"mqtt_messages={mqtt_messages} mqtt_bytes={mqtt_bytes} "
         f"gps={gps_count} reflectance={reflectance_count} "
+        f"other_mission_records={other_mission_records} "
         f"gps_source_records_skipped={source_records_skipped[MESSAGE_GPS]} "
         f"reflectance_source_records_skipped="
         f"{source_records_skipped[MESSAGE_REFLECTANCE]} "

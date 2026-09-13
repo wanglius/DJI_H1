@@ -39,9 +39,13 @@
 #endif
 
 #define DJI_DTU_UART_BAUD_RATE 460800
-#define DJI_DTU_FRAGMENT_GAP_MS 6
-#define DJI_DTU_GPS_MIN_INTERVAL_MS 1000
+/* DTF2 carries its own length, fragment index/count, and CRC. Send fragments
+ * contiguously and let the DTU's configured 1024-byte/5-ms UART packetizer
+ * choose MQTT packet boundaries; the cloud receiver reassembles DTF2 rather
+ * than assuming one UART write equals one MQTT message. */
+#define DJI_DTU_FRAGMENT_GAP_MS 0
 #define DJI_DTU_ACK_TIMEOUT_MS 3000
 #define DJI_DTU_MAX_RETRIES 1
+/* Shared GPS/reflectance retained-message pool in external PSRAM. */
 #define DJI_DTU_TELEMETRY_POOL_LENGTH 512
 #define DJI_DTU_TIMING_DIAGNOSTICS true

@@ -148,6 +148,7 @@ void mission_control_get_status(ab_status_report_t *out)
      * Keep it visible to A while later SD and telemetry submissions continue. */
     if (!error && telemetry.initialized &&
         (!telemetry.healthy || telemetry.messages_failed ||
+         telemetry.gps_queue_overflows ||
          telemetry.reflectance_queue_overflows))
         error = 5;
     *out = (ab_status_report_t) {

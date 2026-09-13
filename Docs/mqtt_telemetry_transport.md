@@ -66,14 +66,15 @@ production publisher will send GPS and reflectance only.
 The `telemetry` component owns UART1 on GPIO17/GPIO18 and is the only task that
 writes application data to the DTU. The measurement recorder gives it finalized
 v01 GPS and reflectance records without ever waiting for UART or cellular I/O.
-GPS first enters a one-element latest-value mailbox and is admitted to the
-shared pool at no more than 1 Hz. Reflectance enters the pool in FIFO order and
-is never silently overwritten. Pool exhaustion drops and counts only the new
-live-telemetry copy, then accepts later records once acknowledgements release
-slots. It does not latch infrastructure health or affect the authoritative SD
-write. The loss remains visible to the A board as mission-level data
-degradation. A future SD-backed replay service is required if every record must
-reach the broker through an arbitrarily long outage.
+Every received 5 Hz GPS record and every reflectance result enters its own FIFO
+while occupying one slot in the shared retained pool. GPS is served first so a
+reflectance/retry backlog cannot age the flight track, but neither stream
+silently overwrites an older accepted record. Pool exhaustion drops and counts
+only the new live-telemetry copy, then accepts later records once
+acknowledgements release slots. It does not latch infrastructure health or
+affect the authoritative SD write. The loss remains visible to the A board as
+mission-level data degradation. A future SD-backed replay service is required
+if every record must reach the broker through an arbitrarily long outage.
 
 The task serializes records with the same `data_records` functions used for SD,
 calls `telemetry_fragment_plan_init()` once, then
@@ -83,30 +84,37 @@ retains the pointer because the next fragment immediately overwrites it.
 
 Current production policy:
 
-- 6 ms idle gap after every fragment, validated against the current DTU at
-  460800 baud;
+- fragments are written continuously with no application-level idle gap at
+  460800 baud. DTF2 framing remains authoritative, while the DTU's configured
+  1024-byte/5-ms UART packetizer is free to split or combine MQTT payloads;
 - DTU uplink publication uses QoS 0 to avoid serializing every 1024-byte
   fragment behind the modem's broker-PUBACK path; the subscribed acknowledgement
   topic remains QoS 1;
-- GPS is coalesced to the latest sample and sent no more often than once per
-  second;
+- every accepted 5 Hz A-to-B GPS record is retained and transmitted in FIFO
+  order, with GPS ready records scheduled ahead of reflectance/retry backlog;
 - GPS and reflectance share a 512-entry PSRAM retention pool (roughly 1.6 MiB);
   queue exhaustion is a visible, heartbeat-degrading drop rather than a silent
   overwrite;
 - the task transmits new messages continuously and does not wait for DTA1
   between messages. Positive ACKs may arrive late, duplicated, or out of order;
-- exhausted acknowledgement retries increment `messages_failed` and degrade
-  the heartbeat, retain the unconfirmed slot for possible late ACK, and do not
-  stop later transmissions;
+- exhausted acknowledgement retries increment `messages_failed` once and
+  degrade the heartbeat. The unconfirmed slot remains available for a late ACK
+  and receives a round-robin recovery probe after 30 seconds. Recovery traffic
+  is globally limited to one message per second and runs behind new GPS and
+  ordinary retries but ahead of new reflectance, so it cannot be starved by a
+  continuous reflectance backlog or monopolize a recovered link;
+- a matching negative application ACK or a permanent local serialization/
+  framing failure releases the slot immediately because retransmitting the same
+  immutable payload cannot correct it;
 - only local infrastructure faults (UART, internal serialization/framing, or a
   pool ownership invariant failure) latch telemetry unhealthy.
   Delivery-pressure counters do not control telemetry or recorder admission.
 
-At 460800 baud, a current four-fragment reflectance message occupies roughly
-74 ms of the UART including its 6 ms boundaries. Cloud ACK latency is typically
-hundreds of milliseconds, but no longer consumes the serialization path. The
-pool absorbs prolonged latency or outages; it is finite by design so local SD
-recording always retains bounded memory behavior.
+At 460800 baud, serialization time is now almost entirely the wire time of the
+DTF2 bytes; application pacing adds no deliberate delay. Cloud ACK latency is
+independent of this serialization path. The 512-entry PSRAM pool absorbs
+prolonged latency or outages; it is finite by design so local SD recording
+always retains bounded memory behavior.
 
 ## Cloud acknowledgement
 
@@ -130,11 +138,15 @@ transmission attempts, and application-ACK RTT are also checkpointed. A late
 positive ACK can release a retry-exhausted or previously rejected entry.
 
 At final power-off, telemetry is deliberately abandoned as soon as the B board
-receives the `0x30` forecast. Admission closes, the worker reclaims queued and
-in-flight pool entries, and an in-progress fragment sequence observes a
-cancellation flag. Cloud delivery never delays authoritative SD finalization. The final
-`MISSION.JSON` records `telemetry.shutdown_aborted=true`; this is intentional
-shutdown policy, not an infrastructure failure or delivery-pressure fault.
+receives the `0x30` forecast. Admission closes, both ready queues are cleared
+immediately, and the worker reclaims queued and in-flight pool entries. An
+in-progress sequence checks cancellation between fragments; only bytes already
+accepted by the UART hardware may finish shifting. The abort API never waits
+for UART drain, MQTT acknowledgements, or retry deadlines, so cloud delivery
+cannot delay authoritative SD finalization. The final `MISSION.JSON` records
+`telemetry.shutdown_aborted=true` and `messages_abandoned_shutdown`; this is
+intentional shutdown policy, not an infrastructure failure or delivery-pressure
+fault.
 
 The `grace_sec` value becomes an absolute B-monotonic cleanup deadline. Reader
 and recorder barrier waits are bounded by that deadline, with time reserved for

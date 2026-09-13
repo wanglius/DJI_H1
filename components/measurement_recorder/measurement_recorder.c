@@ -462,6 +462,7 @@ static esp_err_t write_mission_summary(const char *state)
     telemetry_get_status(&telemetry);
     bool telemetry_delivery_degraded =
         telemetry.messages_failed != 0 ||
+        telemetry.gps_queue_overflows != 0 ||
         telemetry.reflectance_queue_overflows != 0 ||
         telemetry.drain_timeouts != 0;
 
@@ -529,6 +530,7 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"shutdown_aborted\": %s"
         ", \"gps_submitted\": %" PRIu32
         ", \"gps_sent\": %" PRIu32 ", \"gps_superseded\": %" PRIu32
+        ", \"gps_queue_overflows\": %" PRIu32
         ", \"reflectance_submitted\": %" PRIu32
         ", \"reflectance_sent\": %" PRIu32
         ", \"reflectance_queue_overflows\": %" PRIu32
@@ -540,6 +542,7 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"transmission_attempts\": %" PRIu32
         ", \"fragments_sent\": %" PRIu32 ", \"bytes_sent\": %" PRIu32
         ", \"messages_retried\": %" PRIu32
+        ", \"recovery_probes\": %" PRIu32
         ", \"acknowledgements_received\": %" PRIu32
         ", \"acknowledgement_timeouts\": %" PRIu32
         ", \"acknowledgement_rejected\": %" PRIu32
@@ -554,6 +557,7 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"acknowledgement_rtt_last_us\": %" PRIu32
         ", \"acknowledgement_rtt_max_us\": %" PRIu32
         ", \"acknowledgement_rtt_sum_us\": %" PRIu64
+        ", \"messages_abandoned_shutdown\": %" PRIu32
         ", \"source_id\": \"%016" PRIX64 "\""
         "},\n"
         "  \"identity_mismatches\": %" PRIu32 ",\n"
@@ -578,14 +582,16 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry_delivery_degraded ? "true" : "false",
         telemetry.shutdown_aborted ? "true" : "false",
         telemetry.gps_submitted, telemetry.gps_sent,
-        telemetry.gps_superseded, telemetry.reflectance_submitted,
+        telemetry.gps_superseded, telemetry.gps_queue_overflows,
+        telemetry.reflectance_submitted,
         telemetry.reflectance_sent, telemetry.reflectance_queue_overflows,
         telemetry.pool_capacity, telemetry.pool_used,
         telemetry.pool_high_watermark, telemetry.messages_in_flight,
         telemetry.messages_in_flight_high_watermark,
         telemetry.transmission_attempts,
         telemetry.fragments_sent, telemetry.bytes_sent,
-        telemetry.messages_retried, telemetry.acknowledgements_received,
+        telemetry.messages_retried, telemetry.recovery_probes,
+        telemetry.acknowledgements_received,
         telemetry.acknowledgement_timeouts,
         telemetry.acknowledgement_rejected,
         telemetry.acknowledgements_mismatched,
@@ -597,6 +603,7 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.acknowledgement_rtt_last_us,
         telemetry.acknowledgement_rtt_max_us,
         telemetry.acknowledgement_rtt_sum_us,
+        telemetry.messages_abandoned_shutdown,
         telemetry.source_id,
         totals.identity_mismatches,
         totals.write_errors,

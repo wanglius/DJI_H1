@@ -154,16 +154,24 @@ static void handle_frame(const ab_frame_t *frame)
             ESP_LOGW(TAG, "Handshake response failed: %s", esp_err_to_name(result));
             return;
         }
-        /* Retries and serial-number updates must preserve cadence and session. */
-        if (!s_state.linked) {
-            s_state.linked = true;
-            s_state.next_heartbeat_us = esp_timer_get_time();
+        /* Per section 5.1, the link is established only by a ready=1
+         * response. A will retry at 1 Hz while asynchronous B-board startup
+         * is still in progress. Once linked, a later readiness fault is
+         * reported by heartbeat rather than silently destroying the session. */
+        if (response.b_ready != 0) {
+            if (!s_state.linked) {
+                s_state.linked = true;
+                s_state.next_heartbeat_us = esp_timer_get_time();
+            }
+            measurement_recorder_note_handshake(request.drone_serial,
+                                                request.firmware_version,
+                                                request.drone_link);
         }
-        measurement_recorder_note_handshake(request.drone_serial,
-                                            request.firmware_version,
-                                            request.drone_link);
-        ESP_LOGI(TAG, "Handshake accepted: seq=%u drone_link=%u A-fw=0x%04X",
-                 frame->sequence, request.drone_link, request.firmware_version);
+        ESP_LOGI(TAG,
+                 "Handshake response: seq=%u ready=%u drone_link=%u "
+                 "A-fw=0x%04X",
+                 frame->sequence, response.b_ready, request.drone_link,
+                 request.firmware_version);
         break;
     }
     case AB_CMD_REALTIME_DATA: {

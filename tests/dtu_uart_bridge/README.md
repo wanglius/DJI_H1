@@ -124,9 +124,10 @@ This sends the four bounded application fragments separately, recovers them
 even if the DTU changes their MQTT boundaries, and requires the final payload
 to match the source byte-for-byte. The MQTT receiver runs concurrently so QoS
 1 acknowledgements are not delayed while the serial burst is being generated.
-For a paced burst test, add `--message-count 12 --fragment-gap-ms 100`. Setting
-the fragment gap to zero deliberately floods the DTU and is useful for finding
-its buffering limit; it is not the intended production scheduling policy.
+For a paced comparison test, add `--message-count 12 --fragment-gap-ms 100`.
+Production uses a zero application-level gap: DTF2 provides the logical-message
+boundaries and the receiver must tolerate the DTU splitting or combining those
+bytes into arbitrary MQTT payloads.
 
 During a production-firmware mission, start the validator/acknowledger before the
 A-board emulator:
@@ -134,7 +135,7 @@ A-board emulator:
 ```powershell
 python tests/dtu_uart_bridge/monitor_telemetry.py `
     --host mqtt.example.com --mqtt-port 1883 --username device_test `
-    --duration 720 --expect-gps-min 450 --expect-reflectance-min 300
+    --duration 720 --expect-gps-min 2900 --expect-reflectance-min 300
 ```
 
 It does not use COM6. It subscribes to the uplink topic, handles
@@ -144,8 +145,9 @@ and reports record counts plus intentionally skipped source-record sequences.
 For the 600-second endurance mission, the 720-second monitor budget is
 intentional: its timer starts before board reset, preparation, and emulator
 startup, and it must remain online through the final telemetry drain. The
-minimum counts reflect the production 1 Hz GPS limiter and the four active
-survey segments rather than incorrectly assuming ten minutes of acquisition.
+GPS minimum reflects the continuous production 5 Hz A-to-B stream; the lower
+reflectance minimum reflects the four active survey segments rather than
+incorrectly assuming ten minutes of acquisition.
 The monitor sends MQTT `PINGREQ` packets during quiet periods, so EMQX does not
 drop the subscriber while the device is idle or after safe shutdown.
 The production firmware deliberately treats a missing application ACK as a

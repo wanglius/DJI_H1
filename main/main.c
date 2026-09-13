@@ -95,7 +95,6 @@ void app_main(void)
         .rx_gpio = DJI_DTU_UART_RX_GPIO,
         .baud_rate = DJI_DTU_UART_BAUD_RATE,
         .fragment_gap_ms = DJI_DTU_FRAGMENT_GAP_MS,
-        .gps_min_interval_ms = DJI_DTU_GPS_MIN_INTERVAL_MS,
         .source_id = source_id,
         .ack_timeout_ms = DJI_DTU_ACK_TIMEOUT_MS,
         .max_retries = DJI_DTU_MAX_RETRIES,

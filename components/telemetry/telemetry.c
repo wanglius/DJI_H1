@@ -25,6 +25,8 @@ static const char *TAG = "TELEMETRY";
 #define TELEMETRY_MAX_POOL_LENGTH 2048U
 #define TELEMETRY_POLL_MS 20U
 #define TELEMETRY_UART_TX_TIMEOUT_MS 1000U
+#define TELEMETRY_RECOVERY_RETRY_DELAY_MS 30000U
+#define TELEMETRY_RECOVERY_PROBE_INTERVAL_MS 1000U
 #define TELEMETRY_RECORD_BUFFER_SIZE \
     REFLECTANCE_RECORD_WIRE_SIZE(H1_MAX_SPECTRUM_SAMPLES)
 
@@ -58,6 +60,9 @@ typedef struct {
     uint8_t message_type;
     uint8_t state;
     bool counted_in_flight;
+    /** Prevent repeated recovery probes from counting one logical delivery
+     * failure more than once. */
+    bool failure_counted;
 } telemetry_entry_t;
 
 typedef struct {
@@ -187,24 +192,33 @@ static void release_entry(telemetry_entry_t *entry)
         note_pool_fault("free list overflow");
 }
 
-static void mark_admitted(telemetry_entry_t *entry, uint8_t message_type,
-                          telemetry_entry_state_t state)
+static bool try_mark_admitted(telemetry_entry_t *entry, uint8_t message_type,
+                              telemetry_entry_state_t state)
 {
     taskENTER_CRITICAL(&s_lock);
+    if (!s_accepting || s_abort_requested || s_status.mission_id == 0) {
+        taskEXIT_CRITICAL(&s_lock);
+        return false;
+    }
     entry->message_type = message_type;
     entry->state = state;
     s_status.pool_used++;
     if (s_status.pool_used > s_status.pool_high_watermark)
         s_status.pool_high_watermark = s_status.pool_used;
     taskEXIT_CRITICAL(&s_lock);
+    return true;
 }
 
 static void mark_exhausted(telemetry_entry_t *entry, const char *reason)
 {
+    int64_t retry_at_us = esp_timer_get_time() +
+        (int64_t)TELEMETRY_RECOVERY_RETRY_DELAY_MS * 1000LL;
     bool first_failure = false;
     taskENTER_CRITICAL(&s_lock);
-    if (entry->state != ENTRY_EXHAUSTED) {
-        entry->state = ENTRY_EXHAUSTED;
+    entry->state = ENTRY_EXHAUSTED;
+    entry->acknowledgement_deadline_us = retry_at_us;
+    if (!entry->failure_counted) {
+        entry->failure_counted = true;
         s_status.messages_failed++;
         first_failure = true;
     }
@@ -217,6 +231,27 @@ static void mark_exhausted(telemetry_entry_t *entry, const char *reason)
                  (unsigned)entry->message_type, (unsigned long)sequence,
                  reason);
     }
+}
+
+static void discard_failed_entry(telemetry_entry_t *entry, const char *reason)
+{
+    bool first_failure = false;
+    taskENTER_CRITICAL(&s_lock);
+    if (!entry->failure_counted) {
+        entry->failure_counted = true;
+        s_status.messages_failed++;
+        first_failure = true;
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    if (first_failure) {
+        uint32_t sequence = entry->message_type == TELEMETRY_MESSAGE_GPS
+            ? entry->record.gps.header.record_sequence
+            : entry->record.reflectance.header.record_sequence;
+        ESP_LOGW(TAG, "Discarding failed type=%u seq=%lu: %s",
+                 (unsigned)entry->message_type, (unsigned long)sequence,
+                 reason);
+    }
+    release_entry(entry);
 }
 
 static void purge_all_entries(void)
@@ -285,10 +320,13 @@ static esp_err_t emit_fragment(const uint8_t *fragment, size_t length,
     timing->fragments++;
     timing->bytes += (uint32_t)length;
 
-    /* This is flow control for the DTU's UART packetizer, not MQTT framing.
-     * It includes the final fragment so consecutive logical messages also
-     * have an idle boundary. DTF2 remains the authoritative framing layer. */
-    vTaskDelay(pdMS_TO_TICKS(s_config.fragment_gap_ms));
+    /* This is optional flow control for the DTU's UART packetizer, not MQTT
+     * framing. A zero gap deliberately presents the DTF2 byte stream without
+     * an application-level pause; the DTU's configured packet length/timeout
+     * then owns UART-to-MQTT packetization. */
+    if (s_config.fragment_gap_ms != 0) {
+        vTaskDelay(pdMS_TO_TICKS(s_config.fragment_gap_ms));
+    }
     int64_t gap_done_us = esp_timer_get_time();
     timing->gap_wait_us += gap_done_us - tx_done_us;
     timing->emit_done_us = gap_done_us;
@@ -410,7 +448,10 @@ static void process_ack(const telemetry_ack_t *ack)
                      (unsigned)ack->message_type,
                      (unsigned long)ack->message_sequence);
         }
-        mark_exhausted(entry, "negative cloud acknowledgement");
+        /* A matching negative DTA1 ACK is a definitive application rejection,
+         * not a transient loss. Retrying the same immutable payload cannot
+         * make it valid and would otherwise pin this pool slot forever. */
+        discard_failed_entry(entry, "negative cloud acknowledgement");
         return;
     }
 
@@ -501,12 +542,39 @@ static telemetry_entry_t *take_retry_due(void)
     return NULL;
 }
 
-static telemetry_entry_t *take_ready(void)
+static telemetry_entry_t *take_recovery_probe_due(
+    int64_t now_us, size_t *cursor, int64_t *next_probe_us)
+{
+    if (now_us < *next_probe_us) return NULL;
+
+    /* Round-robin selection prevents one chronically unacknowledged message
+     * from monopolizing the deliberately sparse recovery-probe budget. */
+    for (size_t offset = 0; offset < s_config.pool_length; offset++) {
+        size_t index = (*cursor + offset) % s_config.pool_length;
+        taskENTER_CRITICAL(&s_lock);
+        bool due = s_pool[index].state == ENTRY_EXHAUSTED &&
+                   now_us >= s_pool[index].acknowledgement_deadline_us;
+        if (due) {
+            s_pool[index].state = ENTRY_SENDING;
+            s_status.recovery_probes++;
+            taskEXIT_CRITICAL(&s_lock);
+            *cursor = (index + 1U) % s_config.pool_length;
+            *next_probe_us = now_us +
+                (int64_t)TELEMETRY_RECOVERY_PROBE_INTERVAL_MS * 1000LL;
+            return &s_pool[index];
+        }
+        taskEXIT_CRITICAL(&s_lock);
+    }
+    return NULL;
+}
+
+static telemetry_entry_t *take_queued(QueueHandle_t queue,
+                                      uint8_t expected_message_type)
 {
     telemetry_entry_t *entry = NULL;
-    if (xQueueReceive(s_ready_queue, &entry, 0) != pdTRUE) return NULL;
+    if (xQueueReceive(queue, &entry, 0) != pdTRUE) return NULL;
     if (!entry_belongs_to_pool(entry)) {
-        note_pool_fault("ready-list pointer outside pool");
+        note_pool_fault("queued pointer outside pool");
         return NULL;
     }
     taskENTER_CRITICAL(&s_lock);
@@ -516,27 +584,13 @@ static telemetry_entry_t *take_ready(void)
         note_pool_fault("non-queued entry on ready list");
         return NULL;
     }
-    entry->state = ENTRY_SENDING;
-    taskEXIT_CRITICAL(&s_lock);
-    return entry;
-}
-
-static telemetry_entry_t *take_due_gps(TickType_t now, TickType_t *last_gps,
-                                        bool *gps_admitted_once)
-{
-    TickType_t interval = pdMS_TO_TICKS(s_config.gps_min_interval_ms);
-    bool due = !*gps_admitted_once || now - *last_gps >= interval;
-    if (!due || uxQueueMessagesWaiting(s_gps_queue) == 0) return NULL;
-
-    telemetry_entry_t *entry = acquire_entry();
-    if (entry == NULL) return NULL;
-    if (xQueueReceive(s_gps_queue, &entry->record.gps, 0) != pdTRUE) {
-        release_entry(entry);
+    if (entry->message_type != expected_message_type) {
+        taskEXIT_CRITICAL(&s_lock);
+        note_pool_fault("message on wrong ready list");
         return NULL;
     }
-    mark_admitted(entry, TELEMETRY_MESSAGE_GPS, ENTRY_SENDING);
-    *last_gps = now;
-    *gps_admitted_once = true;
+    entry->state = ENTRY_SENDING;
+    taskEXIT_CRITICAL(&s_lock);
     return entry;
 }
 
@@ -560,7 +614,7 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
     esp_err_t result = serialize_entry(entry, &length);
     if (result != ESP_OK) {
         note_serialization_fault();
-        mark_exhausted(entry, "record serialization failed");
+        discard_failed_entry(entry, "record serialization failed");
         return result;
     }
 
@@ -570,13 +624,13 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
         entry_sequence(entry), 0, s_record_buffer, length);
     if (result != ESP_OK) {
         note_serialization_fault();
-        mark_exhausted(entry, "fragment plan failed");
+        discard_failed_entry(entry, "fragment plan failed");
         return result;
     }
     if (entry->payload_crc32 != 0 &&
         entry->payload_crc32 != plan.payload_crc32) {
         note_pool_fault("immutable retry payload changed");
-        mark_exhausted(entry, "retry payload changed");
+        discard_failed_entry(entry, "retry payload changed");
         return ESP_ERR_INVALID_CRC;
     }
     entry->payload_crc32 = plan.payload_crc32;
@@ -585,7 +639,7 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
         .attempt_started_us = esp_timer_get_time(),
     };
     uint16_t prior_transmissions = entry->transmissions;
-    entry->transmissions++;
+    if (entry->transmissions < UINT16_MAX) entry->transmissions++;
     taskENTER_CRITICAL(&s_lock);
     s_status.transmission_attempts++;
     if (prior_transmissions != 0) s_status.messages_retried++;
@@ -657,8 +711,8 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
 static void telemetry_task(void *unused)
 {
     (void)unused;
-    TickType_t last_gps = 0;
-    bool gps_admitted_once = false;
+    size_t recovery_cursor = 0;
+    int64_t next_recovery_probe_us = 0;
 
     while (true) {
         if (abort_requested()) {
@@ -678,10 +732,20 @@ static void telemetry_task(void *unused)
         while (drain_downlink(0)) {}
         update_expired_entries(esp_timer_get_time());
 
-        telemetry_entry_t *entry = take_due_gps(
-            xTaskGetTickCount(), &last_gps, &gps_admitted_once);
+        /* GPS and ordinary retries precede sparse recovery probes. A due probe
+         * precedes new reflectance so continuous acquisition cannot starve old
+         * retained slots forever; the global one-per-second limiter bounds its
+         * effect on current traffic. */
+        telemetry_entry_t *entry = take_queued(
+            s_gps_queue, TELEMETRY_MESSAGE_GPS);
         if (entry == NULL) entry = take_retry_due();
-        if (entry == NULL) entry = take_ready();
+        if (entry == NULL) {
+            entry = take_recovery_probe_due(
+                esp_timer_get_time(), &recovery_cursor,
+                &next_recovery_probe_us);
+        }
+        if (entry == NULL) entry = take_queued(
+            s_ready_queue, TELEMETRY_MESSAGE_REFLECTANCE);
         if (entry != NULL) {
             taskENTER_CRITICAL(&s_lock);
             s_sending = true;
@@ -699,15 +763,36 @@ static void telemetry_task(void *unused)
     }
 }
 
-static esp_err_t overwrite_gps(const gps_record_t *record)
+static esp_err_t enqueue_gps(const gps_record_t *record)
 {
-    bool superseded = uxQueueMessagesWaiting(s_gps_queue) != 0;
-    if (xQueueOverwrite(s_gps_queue, record) != pdPASS) return ESP_FAIL;
+    telemetry_entry_t *entry = acquire_entry();
+    if (entry != NULL) {
+        entry->record.gps = *record;
+        if (!try_mark_admitted(entry, TELEMETRY_MESSAGE_GPS,
+                               ENTRY_ENQUEUING)) {
+            release_entry(entry);
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (xQueueSend(s_gps_queue, &entry, 0) == pdTRUE) {
+            taskENTER_CRITICAL(&s_lock);
+            if (entry->state == ENTRY_ENQUEUING)
+                entry->state = ENTRY_QUEUED;
+            s_status.gps_submitted++;
+            taskEXIT_CRITICAL(&s_lock);
+            return ESP_OK;
+        }
+        note_pool_fault("GPS ready list overflow");
+        release_entry(entry);
+    }
+
     taskENTER_CRITICAL(&s_lock);
-    s_status.gps_submitted++;
-    if (superseded) s_status.gps_superseded++;
+    uint32_t dropped = ++s_status.gps_queue_overflows;
     taskEXIT_CRITICAL(&s_lock);
-    return ESP_OK;
+    if (dropped == 1 || dropped % 100U == 0) {
+        ESP_LOGW(TAG, "Telemetry pool full; GPS dropped=%lu",
+                 (unsigned long)dropped);
+    }
+    return ESP_ERR_NO_MEM;
 }
 
 static esp_err_t enqueue_reflectance(const reflectance_record_t *record)
@@ -718,7 +803,11 @@ static esp_err_t enqueue_reflectance(const reflectance_record_t *record)
         /* Abort-side reclamation skips ENQUEUING until the pointer publication
          * is complete. The worker may dequeue immediately and advance it to
          * SENDING before this producer gets CPU again. */
-        mark_admitted(entry, TELEMETRY_MESSAGE_REFLECTANCE, ENTRY_ENQUEUING);
+        if (!try_mark_admitted(entry, TELEMETRY_MESSAGE_REFLECTANCE,
+                               ENTRY_ENQUEUING)) {
+            release_entry(entry);
+            return ESP_ERR_INVALID_STATE;
+        }
         if (xQueueSend(s_ready_queue, &entry, 0) == pdTRUE) {
             taskENTER_CRITICAL(&s_lock);
             if (entry->state == ENTRY_ENQUEUING)
@@ -757,13 +846,14 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     if (config == NULL || config->uart_port < UART_NUM_0 ||
         config->uart_port >= UART_NUM_MAX || config->tx_gpio < 0 ||
         config->rx_gpio < 0 || config->tx_gpio == config->rx_gpio ||
-        config->baud_rate == 0 || config->fragment_gap_ms < 6 ||
-        config->gps_min_interval_ms == 0 || config->source_id == 0 ||
+        config->baud_rate == 0 ||
+        (config->fragment_gap_ms != 0 && config->fragment_gap_ms < 6) ||
+        config->source_id == 0 ||
         config->ack_timeout_ms == 0 || config->max_retries > 3 ||
         config->pool_length < TELEMETRY_MIN_POOL_LENGTH ||
         config->pool_length > TELEMETRY_MAX_POOL_LENGTH ||
-        pdMS_TO_TICKS(config->fragment_gap_ms) == 0 ||
-        pdMS_TO_TICKS(config->gps_min_interval_ms) == 0 ||
+        (config->fragment_gap_ms != 0 &&
+         pdMS_TO_TICKS(config->fragment_gap_ms) == 0) ||
         pdMS_TO_TICKS(config->ack_timeout_ms) == 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -772,7 +862,8 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     s_config = *config;
     s_pool = heap_caps_calloc(config->pool_length, sizeof(*s_pool),
                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_gps_queue = xQueueCreate(1, sizeof(gps_record_t));
+    s_gps_queue = xQueueCreate(config->pool_length,
+                               sizeof(telemetry_entry_t *));
     s_ready_queue = xQueueCreate(config->pool_length,
                                  sizeof(telemetry_entry_t *));
     s_free_queue = xQueueCreate(config->pool_length,
@@ -840,13 +931,12 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     }
 
     ESP_LOGI(TAG,
-             "DTU UART%d TX=GPIO%d RX=GPIO%d %lu 8N1; gap=%lums GPS=%lums "
+             "DTU UART%d TX=GPIO%d RX=GPIO%d %lu 8N1; gap=%lums GPS=FIFO "
              "source=%016llX ACK=%lums retries=%u; async_pool=%u entries, "
              "%u bytes PSRAM",
              config->uart_port, config->tx_gpio, config->rx_gpio,
              (unsigned long)config->baud_rate,
              (unsigned long)config->fragment_gap_ms,
-             (unsigned long)config->gps_min_interval_ms,
              (unsigned long long)config->source_id,
              (unsigned long)config->ack_timeout_ms, config->max_retries,
              (unsigned)config->pool_length,
@@ -860,7 +950,8 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     if (s_task == NULL) return ESP_ERR_INVALID_STATE;
     taskENTER_CRITICAL(&s_lock);
     bool available = s_status.mission_id == 0 && !s_accepting &&
-                     s_submitters == 0 && s_status.pool_used == 0;
+                     !s_abort_requested && s_submitters == 0 &&
+                     s_status.pool_used == 0;
     taskEXIT_CRITICAL(&s_lock);
     if (!available || uxQueueMessagesWaiting(s_gps_queue) != 0 ||
         uxQueueMessagesWaiting(s_ready_queue) != 0 ||
@@ -870,6 +961,13 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
 
     xQueueReset(s_gps_queue);
     taskENTER_CRITICAL(&s_lock);
+    /* Power-off is terminal for this boot. Recheck under the publication lock
+     * because an abort may arrive after the queue/free-list observations. */
+    if (s_abort_requested || s_status.mission_id != 0 || s_accepting ||
+        s_submitters != 0 || s_status.pool_used != 0) {
+        taskEXIT_CRITICAL(&s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     bool healthy = s_status.healthy;
     uint32_t pool_errors = s_status.reflectance_pool_errors;
     uint32_t serialization_errors = s_status.serialization_errors;
@@ -885,7 +983,6 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     s_status.pool_capacity = s_config.pool_length;
     s_accepting = true;
     s_sending = false;
-    s_abort_requested = false;
     s_submitters = 0;
     taskEXIT_CRITICAL(&s_lock);
     return ESP_OK;
@@ -899,7 +996,7 @@ esp_err_t telemetry_submit_gps(const gps_record_t *record)
     if (active) s_submitters++;
     taskEXIT_CRITICAL(&s_lock);
     if (!active) return ESP_ERR_INVALID_STATE;
-    esp_err_t result = overwrite_gps(record);
+    esp_err_t result = enqueue_gps(record);
     taskENTER_CRITICAL(&s_lock);
     s_submitters--;
     taskEXIT_CRITICAL(&s_lock);
@@ -971,15 +1068,22 @@ esp_err_t telemetry_finish_mission(uint32_t timeout_ms)
 esp_err_t telemetry_abort_mission(void)
 {
     taskENTER_CRITICAL(&s_lock);
-    if (s_task == NULL || s_status.mission_id == 0) {
+    if (s_task == NULL) {
         taskEXIT_CRITICAL(&s_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    bool first_abort = !s_abort_requested;
     s_accepting = false;
     s_abort_requested = true;
     s_status.shutdown_aborted = true;
+    if (first_abort)
+        s_status.messages_abandoned_shutdown += s_status.pool_used;
     taskEXIT_CRITICAL(&s_lock);
+    /* Remove every not-yet-dequeued pointer immediately. The worker owns pool
+     * reclamation and observes s_abort_requested between fragments, so this
+     * call never waits for UART, MQTT acknowledgements, or retry deadlines. */
     xQueueReset(s_gps_queue);
+    xQueueReset(s_ready_queue);
     ESP_LOGI(TAG,
              "Telemetry pool abandoned for power-off; SD finalization has priority");
     return ESP_OK;
