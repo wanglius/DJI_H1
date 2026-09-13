@@ -26,19 +26,6 @@ typedef struct {
     const char *mount_point;
 } sd_card_config_t;
 
-/** Proven LilyGO T8-S3 TF-slot wiring with a conservative 10 MHz clock. */
-#define SD_CARD_LILYGO_T8_S3_DEFAULT_CONFIG() { \
-    .spi_host = SPI2_HOST,                         \
-    .pin_cs = 10,                                  \
-    .pin_mosi = 11,                                \
-    .pin_sclk = 12,                                \
-    .pin_miso = 13,                                \
-    .max_frequency_khz = 10000,                    \
-    .max_transfer_size = 4096,                     \
-    .max_open_files = 8,                           \
-    .mount_point = "/sdcard",                     \
-}
-
 esp_err_t sd_card_mount(const sd_card_config_t *config);
 esp_err_t sd_card_unmount(void);
 bool sd_card_is_mounted(void);

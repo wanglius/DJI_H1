@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "dji_h1_board.h"
 #include "esp_log.h"
 #include "sd_card.h"
 
@@ -10,14 +11,23 @@ static const char *TAG = "SD_CARD_TEST";
 esp_err_t sd_card_connection_test(void)
 {
     static const char expected[] =
-        "DJI_H1 LilyGO T8-S3 TF connection test: PASS\n";
+        "DJI_H1 production-board TF connection test: PASS\n";
     char received[sizeof(expected)] = {0};
     sd_card_file_t *file = NULL;
     size_t transferred = 0;
     esp_err_t result;
 
-    const sd_card_config_t config =
-        SD_CARD_LILYGO_T8_S3_DEFAULT_CONFIG();
+    const sd_card_config_t config = {
+        .spi_host = DJI_SD_SPI_HOST,
+        .pin_cs = DJI_SD_PIN_CS,
+        .pin_mosi = DJI_SD_PIN_MOSI,
+        .pin_sclk = DJI_SD_PIN_SCLK,
+        .pin_miso = DJI_SD_PIN_MISO,
+        .max_frequency_khz = DJI_SD_MAX_FREQUENCY_KHZ,
+        .max_transfer_size = DJI_SD_MAX_TRANSFER_SIZE,
+        .max_open_files = DJI_SD_MAX_OPEN_FILES,
+        .mount_point = DJI_SD_MOUNT_POINT,
+    };
     ESP_LOGI(TAG, "TF wiring: CS=%d MOSI=%d SCLK=%d MISO=%d",
              config.pin_cs, config.pin_mosi,
              config.pin_sclk, config.pin_miso);
@@ -27,7 +37,7 @@ esp_err_t sd_card_connection_test(void)
     result = sd_card_print_info(stdout);
     if (result != ESP_OK) goto cleanup;
 
-    /* FatFs long-file-name support is disabled, so use an 8.3 name. */
+    /* Keep a stable short name so repeated diagnostic runs are easy to find. */
     result = sd_card_file_open("H1TEST.TXT", "wb", &file);
     if (result != ESP_OK) goto cleanup;
     result = sd_card_file_write(

@@ -12,7 +12,7 @@
 #include "mission_control.h"
 #include "drone_data.h"
 #include "clock_sync.h"
-#include "board_config.h"
+#include "dji_h1_board.h"
 #include "telemetry.h"
 #include "telemetry_transport.h"
 

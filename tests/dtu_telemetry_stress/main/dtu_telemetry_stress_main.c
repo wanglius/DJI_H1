@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "data_records.h"
+#include "dji_h1_board.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -16,11 +17,6 @@
 
 static const char *const TAG = "DTU_STRESS";
 
-#define DTU_UART_PORT UART_NUM_1
-#define DTU_TX_GPIO 17
-#define DTU_RX_GPIO 18
-#define DTU_BAUD_RATE 460800U
-#define DTU_FRAGMENT_GAP_MS 0U
 #define TELEMETRY_POOL_LENGTH 128U
 #define ACK_TIMEOUT_MS 3000U
 #define MAX_RETRIES 3U
@@ -174,11 +170,11 @@ void app_main(void)
 
     uint64_t source_id = factory_source_id();
     const telemetry_config_t config = {
-        .uart_port = DTU_UART_PORT,
-        .tx_gpio = DTU_TX_GPIO,
-        .rx_gpio = DTU_RX_GPIO,
-        .baud_rate = DTU_BAUD_RATE,
-        .fragment_gap_ms = DTU_FRAGMENT_GAP_MS,
+        .uart_port = DJI_DTU_UART_PORT,
+        .tx_gpio = DJI_DTU_UART_TX_GPIO,
+        .rx_gpio = DJI_DTU_UART_RX_GPIO,
+        .baud_rate = DJI_DTU_UART_BAUD_RATE,
+        .fragment_gap_ms = DJI_DTU_FRAGMENT_GAP_MS,
         .source_id = source_id,
         .ack_timeout_ms = ACK_TIMEOUT_MS,
         .max_retries = MAX_RETRIES,

@@ -9,6 +9,7 @@
 
 #include "sc16is752.h"
 #include "h1.h"
+#include "dji_h1_board.h"
 
 
 static const char *TAG = "DJI_H1";
@@ -48,16 +49,16 @@ void app_main(void)
 
     sc16_config_t sc16_config = {
 
-        .spi_host = SPI2_HOST,
+        .spi_host = DJI_SC16_SPI_HOST,
 
-        .pin_mosi = 2,
-        .pin_miso = 3,
-        .pin_sclk = 5,
-        .pin_cs = 1,
-        .pin_reset = 6,
+        .pin_mosi = DJI_SC16_PIN_MOSI,
+        .pin_miso = DJI_SC16_PIN_MISO,
+        .pin_sclk = DJI_SC16_PIN_SCLK,
+        .pin_cs = DJI_SC16_PIN_CS,
+        .pin_reset = DJI_SC16_PIN_RESET,
 
-        .spi_clock_hz = 1000000,
-        .crystal_hz = 1843200
+        .spi_clock_hz = DJI_SC16_SPI_CLOCK_HZ,
+        .crystal_hz = DJI_SC16_CRYSTAL_HZ
     };
 
 

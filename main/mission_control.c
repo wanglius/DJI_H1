@@ -2,6 +2,7 @@
 
 #include "acquisition.h"
 #include "calculation.h"
+#include "dji_h1_board.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -180,7 +181,17 @@ static esp_err_t refresh_storage(void)
 static void control_task(void *unused)
 {
     (void)unused;
-    const sd_card_config_t sd = SD_CARD_LILYGO_T8_S3_DEFAULT_CONFIG();
+    const sd_card_config_t sd = {
+        .spi_host = DJI_SD_SPI_HOST,
+        .pin_cs = DJI_SD_PIN_CS,
+        .pin_mosi = DJI_SD_PIN_MOSI,
+        .pin_sclk = DJI_SD_PIN_SCLK,
+        .pin_miso = DJI_SD_PIN_MISO,
+        .max_frequency_khz = DJI_SD_MAX_FREQUENCY_KHZ,
+        .max_transfer_size = DJI_SD_MAX_TRANSFER_SIZE,
+        .max_open_files = DJI_SD_MAX_OPEN_FILES,
+        .mount_point = DJI_SD_MOUNT_POINT,
+    };
     esp_err_t result = sd_card_mount(&sd);
     if (result == ESP_OK) result = refresh_storage();
     if (result == ESP_OK) result = calculation_self_test();
@@ -188,9 +199,14 @@ static void control_task(void *unused)
     uint8_t error = result == ESP_OK ? 0 : 1;
     if (!error) {
         const sc16_config_t bridge = {
-            .spi_host = SPI3_HOST, .pin_mosi = 2, .pin_miso = 3,
-            .pin_sclk = 5, .pin_cs = 1, .pin_reset = 6,
-            .spi_clock_hz = 4000000, .crystal_hz = 1843200,
+            .spi_host = DJI_SC16_SPI_HOST,
+            .pin_mosi = DJI_SC16_PIN_MOSI,
+            .pin_miso = DJI_SC16_PIN_MISO,
+            .pin_sclk = DJI_SC16_PIN_SCLK,
+            .pin_cs = DJI_SC16_PIN_CS,
+            .pin_reset = DJI_SC16_PIN_RESET,
+            .spi_clock_hz = DJI_SC16_SPI_CLOCK_HZ,
+            .crystal_hz = DJI_SC16_CRYSTAL_HZ,
         };
         result = sc16_init(&bridge);
         if (result == ESP_OK) {

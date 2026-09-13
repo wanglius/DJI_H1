@@ -9,7 +9,7 @@
 #include <string.h>
 
 #include "ab_protocol.h"
-#include "board_config.h"
+#include "dji_h1_board.h"
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_log.h"

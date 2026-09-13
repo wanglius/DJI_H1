@@ -87,7 +87,7 @@ Windows 的 COM 编号可能随 USB 接口和设备枚举变化，因此脚本�
 
 ### 4.2 A/B 板 UART
 
-定义位于 `main/board_config.h`：
+定义位于 `components/board_support/include/dji_h1_board.h`：
 
 | 信号 | ESP32-S3 GPIO | 当前用途 |
 |---|---:|---|
@@ -157,7 +157,7 @@ SC16 初始化完成后，固件固定等待 500 ms，再准备两台 H1。该�
 | 文件 | 职责 |
 |---|---|
 | `main/main.c` | 启动与自检编排 |
-| `main/board_config.h` | A/B UART 板级配置 |
+| `components/board_support/` | 量产板全部 UART、SPI、存储与内存配置 |
 | `main/ab_link.c` | UART 收发、协议解析、握手、实时数据、控制命令、ACK、1 Hz 心跳 |
 | `main/mission_control.c` | 飞行任务生命周期的唯一所有者，协调 SD、记录器、SC16/H1 和采集 |
 | `main/acquisition.c` | 两路 H1 采集任务、SC16 RX 服务、采集统计和诊断日志 |

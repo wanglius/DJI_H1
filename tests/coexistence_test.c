@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "acquisition.h"
+#include "dji_h1_board.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -75,10 +76,19 @@ esp_err_t coexistence_test_run(uint32_t duration_ms)
     bool writer_started = false;
     sd_writer_context_t writer = {0};
 
-    const sd_card_config_t sd_config =
-        SD_CARD_LILYGO_T8_S3_DEFAULT_CONFIG();
-    ESP_LOGI(TAG, "SD card: SPI2 CS=%d MOSI=%d SCLK=%d MISO=%d",
-             sd_config.pin_cs, sd_config.pin_mosi,
+    const sd_card_config_t sd_config = {
+        .spi_host = DJI_SD_SPI_HOST,
+        .pin_cs = DJI_SD_PIN_CS,
+        .pin_mosi = DJI_SD_PIN_MOSI,
+        .pin_sclk = DJI_SD_PIN_SCLK,
+        .pin_miso = DJI_SD_PIN_MISO,
+        .max_frequency_khz = DJI_SD_MAX_FREQUENCY_KHZ,
+        .max_transfer_size = DJI_SD_MAX_TRANSFER_SIZE,
+        .max_open_files = DJI_SD_MAX_OPEN_FILES,
+        .mount_point = DJI_SD_MOUNT_POINT,
+    };
+    ESP_LOGI(TAG, "SD card: SPI host=%d CS=%d MOSI=%d SCLK=%d MISO=%d",
+             (int)sd_config.spi_host, sd_config.pin_cs, sd_config.pin_mosi,
              sd_config.pin_sclk, sd_config.pin_miso);
     result = sd_card_mount(&sd_config);
     if (result != ESP_OK) return result;
@@ -87,17 +97,17 @@ esp_err_t coexistence_test_run(uint32_t duration_ms)
     if (result != ESP_OK) goto cleanup;
 
     const sc16_config_t sc16_config = {
-        .spi_host = SPI3_HOST,
-        .pin_mosi = 2,
-        .pin_miso = 3,
-        .pin_sclk = 5,
-        .pin_cs = 1,
-        .pin_reset = 6,
-        .spi_clock_hz = 4000000,
-        .crystal_hz = 1843200,
+        .spi_host = DJI_SC16_SPI_HOST,
+        .pin_mosi = DJI_SC16_PIN_MOSI,
+        .pin_miso = DJI_SC16_PIN_MISO,
+        .pin_sclk = DJI_SC16_PIN_SCLK,
+        .pin_cs = DJI_SC16_PIN_CS,
+        .pin_reset = DJI_SC16_PIN_RESET,
+        .spi_clock_hz = DJI_SC16_SPI_CLOCK_HZ,
+        .crystal_hz = DJI_SC16_CRYSTAL_HZ,
     };
-    ESP_LOGI(TAG, "SC16IS752: SPI3 CS=%d MOSI=%d SCLK=%d MISO=%d",
-             sc16_config.pin_cs, sc16_config.pin_mosi,
+    ESP_LOGI(TAG, "SC16IS752: SPI host=%d CS=%d MOSI=%d SCLK=%d MISO=%d",
+             (int)sc16_config.spi_host, sc16_config.pin_cs, sc16_config.pin_mosi,
              sc16_config.pin_sclk, sc16_config.pin_miso);
     result = sc16_init(&sc16_config);
     if (result != ESP_OK) goto cleanup;

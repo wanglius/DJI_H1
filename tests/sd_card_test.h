@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-/** Mount, write, read back, and unmount the LilyGO T8-S3 TF card. */
+/** Mount, write, read back, and unmount the production-board TF card. */
 esp_err_t sd_card_connection_test(void);
 
 #ifdef __cplusplus
