@@ -6,9 +6,9 @@ continuously and rejects heartbeat/ACK delays while exercising real hardware.
 import json
 import struct
 import time
-from ab_board_emulator import (Parser, encode_frame, realtime_payload,
-    CMD_HANDSHAKE, CMD_HANDSHAKE_RESPONSE, CMD_REALTIME, CMD_START, CMD_STOP,
-    CMD_POWER_OFF, CMD_STATUS, CMD_ACK)
+from ab_board_emulator import (ACTION_MAX_ATTEMPTS, Parser, encode_frame,
+    realtime_payload, CMD_HANDSHAKE, CMD_HANDSHAKE_RESPONSE, CMD_REALTIME,
+    CMD_START, CMD_STOP, CMD_POWER_OFF, CMD_STATUS, CMD_ACK)
 
 
 class ControlProbe:
@@ -93,7 +93,7 @@ class ControlProbe:
         seq = self.seq() if seq is None else seq
         key = (cmd, seq)
         self.acks.pop(key, None)
-        for attempt in range(4):
+        for attempt in range(ACTION_MAX_ATTEMPTS):
             sent = time.monotonic()
             self.send(cmd, seq, payload)
             while time.monotonic() - sent < .2:

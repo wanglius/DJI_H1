@@ -24,11 +24,15 @@ media unless the named test files have been backed up.
 
 ## Host-only tests
 
-`mission_viewer/` exercises the Python mission decoder, timestamp-aware GPS
-interpolation, CRC rejection, query service, and read-only localhost HTTP API
-using generated temporary records. It does not require hardware and does not
-access an SD card:
+Run the authoritative repository host-test entry point from the project root:
 
 ```powershell
-python -m unittest discover -s tests/mission_viewer -v
+python -B tests/run_host_tests.py
 ```
+
+The runner discovers every immediate `tests/*/test_*.py` group, rejects an
+empty group, and currently covers the mission viewer, A-board emulator, record
+format, and telemetry transport. These tests do not require hardware or access
+an SD card. Do not use plain `python -m unittest discover -s tests`: the nested
+test directories are intentionally not Python packages, so that command can
+silently discover zero tests.

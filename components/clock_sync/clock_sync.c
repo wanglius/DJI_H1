@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -11,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "CLOCK_SYNC";
 
@@ -22,6 +24,17 @@ static const char *TAG = "CLOCK_SYNC";
 #define SYNC_HOLDOVER_US 1500000LL
 #define SYNC_INVALID_US 5000000LL
 #define SYNC_RESIDUAL_LIMIT_US 50000.0
+
+#ifndef CONFIG_DJI_H1_TIMEZONE_NAME
+#define CONFIG_DJI_H1_TIMEZONE_NAME "Asia/Shanghai"
+#endif
+#ifndef CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES
+#define CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES 480
+#endif
+
+_Static_assert(CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES >= -720 &&
+               CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES <= 840,
+               "timezone offset must be between UTC-12:00 and UTC+14:00");
 
 typedef struct {
     uint32_t a_raw_ms;
@@ -72,6 +85,30 @@ const char *clock_sync_state_name(clock_sync_state_t state)
     case CLOCK_SYNC_INVALID: return "INVALID";
     default: return "UNKNOWN";
     }
+}
+
+const char *clock_sync_timezone_name(void)
+{
+    return CONFIG_DJI_H1_TIMEZONE_NAME;
+}
+
+int16_t clock_sync_timezone_offset_minutes(void)
+{
+    return (int16_t)CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES;
+}
+
+static bool valid_timezone_name(const char *name)
+{
+    if (name == NULL || *name == '\0' || strlen(name) > 63U) return false;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        bool safe = (*p >= 'A' && *p <= 'Z') ||
+                    (*p >= 'a' && *p <= 'z') ||
+                    (*p >= '0' && *p <= '9') ||
+                    *p == '/' || *p == '_' || *p == '-' || *p == '+' ||
+                    *p == '.';
+        if (!safe) return false;
+    }
+    return true;
 }
 
 static void publish(const sync_snapshot_t *snapshot)
@@ -279,10 +316,29 @@ static void clock_sync_task(void *unused)
 esp_err_t clock_sync_init(void)
 {
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
-    /* FAT stores calendar fields without a timezone. Persist UTC consistently
-     * so mission media remains unambiguous across deployment locations. */
-    if (setenv("TZ", "UTC0", 1) != 0) return ESP_ERR_NO_MEM;
+    if (!valid_timezone_name(CONFIG_DJI_H1_TIMEZONE_NAME)) {
+        ESP_LOGE(TAG, "Invalid mission timezone name");
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Unix timestamps remain UTC. POSIX TZ only controls conversion to the
+     * timezone-less calendar fields stored by FAT, so Windows in the selected
+     * deployment zone displays the intended local modification time. POSIX
+     * signs are reversed: local UTC+08:00 is encoded as UTC-8:00. */
+    int offset = CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES;
+    int posix_offset = -offset;
+    unsigned magnitude = (unsigned)abs(posix_offset);
+    char posix_tz[24];
+    int length = snprintf(posix_tz, sizeof(posix_tz), "UTC%c%u:%02u",
+                          posix_offset >= 0 ? '+' : '-', magnitude / 60U,
+                          magnitude % 60U);
+    if (length <= 0 || (size_t)length >= sizeof(posix_tz))
+        return ESP_ERR_INVALID_SIZE;
+    if (setenv("TZ", posix_tz, 1) != 0) return ESP_ERR_NO_MEM;
     tzset();
+    unsigned display_offset = (unsigned)abs(offset);
+    ESP_LOGI(TAG, "Mission timezone %s (UTC%c%02u:%02u)",
+             CONFIG_DJI_H1_TIMEZONE_NAME, offset >= 0 ? '+' : '-',
+             display_offset / 60U, display_offset % 60U);
     s_queue = xQueueCreate(SYNC_QUEUE_LENGTH, sizeof(sync_observation_t));
     if (s_queue == NULL) return ESP_ERR_NO_MEM;
     if (xTaskCreate(clock_sync_task, "clock_sync", SYNC_TASK_STACK, NULL,

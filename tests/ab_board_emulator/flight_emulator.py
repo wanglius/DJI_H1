@@ -12,8 +12,9 @@ import struct
 import time
 
 from ab_board_emulator import (
-    Parser, encode_frame, CMD_HANDSHAKE, CMD_HANDSHAKE_RESPONSE, CMD_REALTIME,
-    CMD_START, CMD_STOP, CMD_POWER_OFF, CMD_ACK, CMD_STATUS,
+    ACTION_MAX_ATTEMPTS, Parser, encode_frame, CMD_HANDSHAKE,
+    CMD_HANDSHAKE_RESPONSE, CMD_REALTIME, CMD_START, CMD_STOP, CMD_POWER_OFF,
+    CMD_ACK, CMD_STATUS,
 )
 from flight_model import FlightModel
 
@@ -354,7 +355,7 @@ class FlightEmulator:
                 self.power_sent = now
         if self.pending and (not self.pending.attempts or now - self.pending.sent >= .2):
             # Doc says at most three retransmissions: initial + three retries.
-            if self.pending.attempts >= 4:
+            if self.pending.attempts >= ACTION_MAX_ATTEMPTS:
                 self.fail(f"ACK timeout: {self.pending.label}")
                 self.pending = None
             else:

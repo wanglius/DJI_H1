@@ -33,7 +33,7 @@ A 板模拟器 ──UART0──> B 板状态机
                                       └── MISSION.JSON
 ```
 
-尚未完成的主要链路是 4G DTU/MQTT 实时上传。当前反射率结果已经具备清晰的数据边界，后续应以独立队列和独立传输任务接入，不能让网络阻塞采集或 SD 写入。
+4G DTU/MQTT 实时上传链路已经接入：GPS 与反射率副本进入独立遥测任务和共享 PSRAM 保留池，UART 连续发送，云端 DTA1 确认后才释放。它仍需在真实蜂窝网络和长期 ACK 故障场景中完成压力验证；网络拥塞不得阻塞采集或 SD 写入。
 
 ## 2. 仓库和版本基线
 
@@ -413,7 +413,7 @@ utc_ms = utc_sec × 1000 + utc_msec
 
 每个实时数据包到达 B 板 UART 时提交一条时间观测。系统只在每个锁定 generation 中设置一次 POSIX 墙钟，避免反复调整系统时间。
 
-协议没有 PPS，因此绝对 UTC 精度预计只能达到约 ±100–200 ms，不能宣称亚毫秒同步。FAT 时间戳只有 2 s 分辨率且不携带时区；项目约定写入内容代表 UTC，Windows 显示时可能按本地时区解释。
+协议没有 PPS，因此绝对 UTC 精度预计只能达到约 ±100–200 ms，不能宣称亚毫秒同步。科学数据中的 `utc_ms` 始终是 Unix UTC 毫秒。任务本地时区由 `CONFIG_DJI_H1_TIMEZONE_NAME` 与 `CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES` 配置，默认 `Asia/Shanghai`、UTC+08:00；`MISSION.JSON` 保存该配置，`EVENTS.JSONL` 每条事件也保存名称和分钟偏移。FAT 时间戳只有 2 s 分辨率且不携带时区，因此固件按该固定偏移写入本地日历字段，使同一时区的 Windows 正确显示修改时间。
 
 ## 12. SD 卡任务目录与文件
 
@@ -554,13 +554,11 @@ idf.py -B build-review -p COM6 monitor
 ### 16.1 主机单元测试
 
 ```powershell
-python -B -m unittest discover -s tests/mission_viewer -p "test_*.py" -v
-python -B -m unittest discover -s tests/ab_board_emulator -p "test_*.py" -v
-python -B -m unittest discover -s tests/record_format -p "test_*.py" -v
+python -B tests/run_host_tests.py
 python -m pip check
 ```
 
-本文本次更新后的工作区共有 49 个 Python 测试：mission viewer 14（含无 Chromium/不触网的离屏 GUI 冒烟测试）、A 板模拟器 29、记录格式 6。测试数量会随代码演进变化，应以当前测试发现结果为准。
+统一入口会发现每个 `tests/*/test_*.py` 测试组，并在任一测试组发现数为 0 时失败。当前共有 67 个 Python 测试：mission viewer 17（含无 Chromium/不触网的离屏 GUI 冒烟测试）、A 板模拟器 29、记录格式 6、telemetry transport 15。测试数量会随代码演进变化，应以统一入口输出为准。
 
 ### 16.2 A 板模拟器硬件飞行
 
@@ -654,7 +652,7 @@ python -B tests/ab_board_emulator/run_hardware_flight.py `
 1. **当前 HEAD 硬件回归**：刷写专用板，跑正常和异常模拟任务，确认最终 FAT 修改时间、完整任务目录和 viewer 解析；
 2. **真实 A 板联调**：逐项核对电平、握手版本、5 Hz 数据、动作重试、心跳、grace deadline 和断电；
 3. **光谱标定**：建立暗场、白板、两传感器响应和波长映射流程，明确“表观反射率”升级为科学产品的条件；
-4. **4G DTU/MQTT**：增加独立传输组件和有界队列，只消费计算结果的副本；设计断网缓存、重连、QoS、消息版本、设备身份和 TLS；
+4. **4G DTU/MQTT**：压力验证现有 512 项异步确认池、乱序/延迟/重复 ACK、断网恢复和池满降级；随后补充 SD 回放、TLS 与正式设备身份；
 5. **数据格式兼容策略**：保留 v01 解码器，新格式只能增加新版本，不能静默改变已有字段含义；
 6. **部署可靠性**：规划 OTA 双分区、回滚、固件签名、看门狗复位记录和掉电保护；
 7. **查看器完善**：备份摘要恢复、事件分类、重叠点选择、BD-09 转换和真实波长轴；
@@ -665,10 +663,10 @@ MQTT 接入时建议的数据流：
 ```text
 calculation ──> SD recorder queue ──> SD（权威本地副本）
        │
-       └──────> telemetry queue ──> MQTT task ──> 4G DTU
+       └──────> PSRAM telemetry pool ──> UART task ──> 4G DTU
 ```
 
-网络任务不得持有采集缓冲区，不得直接调用 H1，不得阻塞 writer，也不得把“已发到 MQTT”当作“已可靠记录”的替代。
+网络任务不得持有采集缓冲区，不得直接调用 H1，不得阻塞 writer，也不得把“已发到 MQTT”当作“已可靠记录”的替代。当前遥测采用 512 项共享 PSRAM 保留池：UART 连续发送而不逐条等待，收到匹配的 DTA1 后才释放记录；ACK 可乱序、延迟或重复。池满只丢弃并计数新的实时遥测副本，SD 记录不受影响。收到断电预告则立即放弃整个遥测池，为 SD 刷写、关闭和卸载让路。
 
 ## 20. 代码修改守则
 

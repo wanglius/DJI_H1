@@ -53,6 +53,12 @@ esp_err_t clock_sync_self_test(void);
 
 const char *clock_sync_state_name(clock_sync_state_t state);
 
+/** Fixed mission-local civil-time metadata configured at build time. UTC
+ * timestamps remain authoritative; consumers add this signed offset only for
+ * display. */
+const char *clock_sync_timezone_name(void);
+int16_t clock_sync_timezone_offset_minutes(void);
+
 #ifdef __cplusplus
 }
 #endif

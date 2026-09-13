@@ -12,6 +12,8 @@ from dataclasses import dataclass
 HEAD = b"\xAA\x55"
 MAX_PAYLOAD = 247
 INTERBYTE_TIMEOUT_S = 0.100
+# Section 5.3: one initial transmission followed by at most three retries.
+ACTION_MAX_ATTEMPTS = 4
 
 CMD_REALTIME = 0x01
 CMD_START = 0x10
@@ -77,12 +79,17 @@ class Parser:
             if len(self.buffer) < frame_length:
                 break
             candidate = bytes(self.buffer[:frame_length])
-            del self.buffer[:frame_length]
             received_crc = struct.unpack_from("<H", candidate, frame_length - 2)[0]
             expected_crc = crc16_ccitt_false(candidate[2:-2])
             if received_crc != expected_crc:
                 print(f"{stamp()}  RX bad CRC expected=0x{expected_crc:04X} got=0x{received_crc:04X}")
+                # Slide by one byte and scan again. A truncated/corrupt frame
+                # may have consumed AA or AA 55 from the next valid frame as
+                # its CRC, so deleting the entire candidate would mask the
+                # same recovery failure in the firmware under test.
+                del self.buffer[0]
                 continue
+            del self.buffer[:frame_length]
             frames.append(Frame(candidate[3], candidate[4], candidate[5:-2]))
         return frames
 
@@ -321,8 +328,10 @@ class Emulator:
                     self.queue_command(CMD_POWER_OFF, struct.pack("<B", 10), "power-off")
 
             if self.pending is not None and now - self.pending.sent_at >= 0.2:
-                if self.pending.attempts >= 3:
-                    self.fail("no ACK after 3 attempts")
+                # Protocol section 5.3 allows three retransmissions after the
+                # initial transmission, matching the full-flight emulator.
+                if self.pending.attempts >= ACTION_MAX_ATTEMPTS:
+                    self.fail(f"no ACK after {ACTION_MAX_ATTEMPTS} attempts")
                     self.pending = None
                 else:
                     self.retry_pending()
@@ -376,6 +385,8 @@ def self_test() -> None:
     corrupted = bytearray(wire)
     corrupted[5] ^= 1
     assert Parser().feed(bytes(corrupted) + wire, 0) == [expected]
+    assert Parser().feed(wire[:-1] + wire, 0) == [expected]
+    assert Parser().feed(wire[:-2] + wire, 0) == [expected]
     assert Parser().feed(wire + wire, 0) == [expected, expected]
     print("A-board emulator self-test passed")
 

@@ -63,6 +63,35 @@ class Mission:
         if self.gps is not None:
             self._positions = PositionInterpolator(self.gps.records)
 
+    def _timezone_metadata(self) -> tuple[str, int]:
+        """Return one validated name/offset pair; never mix partial metadata."""
+        timezone = self.summary.get("timezone", {})
+        if not isinstance(timezone, dict):
+            return ("UTC", 0)
+        name = timezone.get("name")
+        offset = timezone.get("utc_offset_minutes")
+        safe_name = (
+            isinstance(name, str) and 0 < len(name) <= 63 and
+            all(character.isascii() and
+                (character.isalnum() or character in "/_-+.")
+                for character in name)
+        )
+        safe_offset = (
+            not isinstance(offset, bool) and isinstance(offset, int) and
+            -720 <= offset <= 840
+        )
+        return (name, offset) if safe_name and safe_offset else ("UTC", 0)
+
+    @property
+    def timezone_offset_minutes(self) -> int:
+        """Configured fixed civil-time offset, or UTC for legacy missions."""
+        return self._timezone_metadata()[1]
+
+    @property
+    def timezone_name(self) -> str:
+        """Human-readable timezone label, safely bounded for presentation."""
+        return self._timezone_metadata()[0]
+
     @classmethod
     def open(cls, path: str | Path, *, verify_crc: bool = True,
              strict_products: bool = False) -> "Mission":

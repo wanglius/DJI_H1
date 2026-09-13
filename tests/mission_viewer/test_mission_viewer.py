@@ -89,6 +89,9 @@ def _make_mission(root: Path) -> None:
         json.dumps({
             "schema_version": 1,
             "flight_index": 42,
+            "timestamp_basis": "UTC",
+            "timezone": {"name": "Asia/Shanghai",
+                         "utc_offset_minutes": 480},
             "drone_serial": "TEST_DRONE",
             "drone_serial_hex": (
                 "544553545F44524F4E45" + "00" * (32 - len("TEST_DRONE"))),
@@ -114,6 +117,8 @@ class MissionViewerTests(unittest.TestCase):
     def test_decodes_complete_mission_and_tolerates_bad_event_tail(self) -> None:
         mission = open_mission(self.root)
         self.assertEqual(mission.summary["flight_index"], 42)
+        self.assertEqual(mission.timezone_name, "Asia/Shanghai")
+        self.assertEqual(mission.timezone_offset_minutes, 480)
         self.assertEqual(mission.raw_indices(role=GROUND), [0])
         self.assertEqual(mission.raw.raw_spectrum(0).samples, (10, 20, 30, 40))
         result = mission.reflectance.reflectance_spectrum(0)
@@ -121,6 +126,24 @@ class MissionViewerTests(unittest.TestCase):
         self.assertEqual(len(mission.gps_page()), 2)
         self.assertEqual(mission.events[0]["event"], "handshake")
         self.assertEqual(mission.event_errors[0].line_number, 3)
+
+    def test_legacy_or_invalid_timezone_falls_back_to_utc(self) -> None:
+        mission = open_mission(self.root)
+        mission.summary.pop("timezone")
+        self.assertEqual(mission.timezone_name, "UTC")
+        self.assertEqual(mission.timezone_offset_minutes, 0)
+        mission.summary["timezone"] = {
+            "name": "x" * 65, "utc_offset_minutes": 2000}
+        self.assertEqual(mission.timezone_name, "UTC")
+        self.assertEqual(mission.timezone_offset_minutes, 0)
+        mission.summary["timezone"] = {
+            "name": "Asia/Shanghai", "utc_offset_minutes": 2000}
+        self.assertEqual(mission.timezone_name, "UTC")
+        self.assertEqual(mission.timezone_offset_minutes, 0)
+        mission.summary["timezone"] = {
+            "name": "unsafe name", "utc_offset_minutes": 480}
+        self.assertEqual(mission.timezone_name, "UTC")
+        self.assertEqual(mission.timezone_offset_minutes, 0)
 
     def test_salvages_verified_prefix_at_crc_corruption(self) -> None:
         path = self.root / "RAW_SPECTRA.BIN"
@@ -315,6 +338,9 @@ class MissionViewerTests(unittest.TestCase):
 
             def set_model(self, model) -> None:
                 self.model = model
+
+            def set_timezone(self, name: str, offset_minutes: int) -> None:
+                self.timezone = (name, offset_minutes)
 
             def select_measurement(self, _index: int, **_kwargs) -> None:
                 pass

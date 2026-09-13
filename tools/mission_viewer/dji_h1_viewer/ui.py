@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import html
 import math
 import os
@@ -51,11 +51,21 @@ def _nice_distance(value: float) -> float:
     return factor * (10 ** exponent)
 
 
-def _utc_text(utc_ms: int) -> str:
+def _time_text(utc_ms: int, offset_minutes: int = 0,
+               timezone_name: str = "UTC") -> str:
     if utc_ms <= 0:
         return "unavailable"
-    return datetime.fromtimestamp(utc_ms / 1000, timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
+    local_zone = timezone(timedelta(minutes=offset_minutes))
+    local = datetime.fromtimestamp(utc_ms / 1000, local_zone).strftime(
+        "%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return (f"{local} {timezone_name} "
+            f"({_offset_text(offset_minutes)})")
+
+
+def _offset_text(offset_minutes: int) -> str:
+    sign = "+" if offset_minutes >= 0 else "-"
+    magnitude = abs(offset_minutes)
+    return f"UTC{sign}{magnitude // 60:02d}:{magnitude % 60:02d}"
 
 
 def _time_domain_text(domain: str, generation: int | None) -> str:
@@ -185,8 +195,14 @@ class MissionMap(QWidget):
         self._selected_measurement: int | None = None
         self._selected_event: int | None = None
         self._pan_anchor: QPointF | None = None
+        self._timezone_name = "UTC"
+        self._timezone_offset_minutes = 0
         self.setMinimumSize(520, 360)
         self.setMouseTracking(True)
+
+    def set_timezone(self, name: str, offset_minutes: int) -> None:
+        self._timezone_name = name
+        self._timezone_offset_minutes = offset_minutes
 
     def set_model(self, model: MissionMapModel) -> None:
         self._model = model
@@ -307,7 +323,7 @@ class MissionMap(QWidget):
                 f"Reflectance #{measurement.calculation_count}\n"
                 f"{measurement.latitude_deg:.7f}, "
                 f"{measurement.longitude_deg:.7f}\n"
-                f"{_utc_text(measurement.utc_ms)}\n"
+                f"{_time_text(measurement.utc_ms, self._timezone_offset_minutes, self._timezone_name)}\n"
                 f"{_time_domain_text(measurement.time_domain, measurement.sync_generation)}",
                 self)
         elif map_event is not None:
@@ -535,6 +551,9 @@ class MissionMapPanel(QWidget):
             self.status_text = "Baidu Map · mission overlay awaiting permission"
             self.status_changed.emit(self.status_text)
 
+    def set_timezone(self, name: str, offset_minutes: int) -> None:
+        self._offline.set_timezone(name, offset_minutes)
+
     def set_external_data_enabled(self, enabled: bool) -> None:
         self._external_data_enabled = bool(enabled and self._web is not None)
         if self._external_data_enabled and self._web is not None:
@@ -708,6 +727,8 @@ class MissionViewer(QMainWindow):
             return
         self.path_text.setText(str(mission.path))
         self.map_model = build_mission_map(mission)
+        self.route_map.set_timezone(mission.timezone_name,
+                                    mission.timezone_offset_minutes)
         self.route_map.set_model(self.map_model)
         if self.route_map.baidu_available:
             choice = QMessageBox.question(
@@ -739,6 +760,8 @@ class MissionViewer(QMainWindow):
         files = overview["files"]
         start = int(summary.get("started_utc_ms", 0) or 0)
         end = int(summary.get("updated_utc_ms", 0) or 0)
+        timezone_name = mission.timezone_name
+        timezone_offset = mission.timezone_offset_minutes
         duration = (max(0.0, (end - start) / 1000.0)
                     if start and end else max(
                         item["duration_seconds"] for item in files.values()))
@@ -778,7 +801,8 @@ class MissionViewer(QMainWindow):
             ("Canonical drone ID",
              summary.get("drone_serial_hex", "unknown")),
             ("Firmware", summary.get("firmware_version", "unknown")),
-            ("Started", _utc_text(start)),
+            ("Timezone", f"{timezone_name} ({_offset_text(timezone_offset)})"),
+            ("Started", _time_text(start, timezone_offset, timezone_name)),
             ("Duration", f"{duration:.1f} s"),
             ("Segments", summary.get("segments_completed",
                                      len(overview["sessions"]))),
@@ -876,7 +900,7 @@ class MissionViewer(QMainWindow):
             f"ground frame {info.ground_frame_count}, "
             f"sky frame {info.sky_frame_count} · "
             f"valid {info.valid_sample_count}/{info.sample_count} · "
-            f"{html.escape(_utc_text(record.header.utc_ms))}<br>"
+            f"{html.escape(_time_text(record.header.utc_ms, mission.timezone_offset_minutes, mission.timezone_name))}<br>"
             f"{html.escape(position_text)}")
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802

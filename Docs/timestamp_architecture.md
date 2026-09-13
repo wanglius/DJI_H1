@@ -97,15 +97,25 @@ The original A-board timestamp fields and B receive timestamp should also remain
 in the GPS/navigation record. They provide an audit trail and allow the clock
 relationship to be reconstructed or improved during post-processing.
 
-FatFs obtains modification timestamps from the POSIX wall clock. The firmware
-uses the `UTC0` process timezone because FAT stores calendar fields without any
-timezone marker and has only two-second resolution. At orderly mission shutdown,
+FatFs obtains modification timestamps from the POSIX wall clock. FAT stores
+calendar fields without a timezone marker and has only two-second resolution,
+so the firmware converts them using the configured fixed mission timezone.
+`CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES` defaults to `480` (UTC+08:00), and
+`CONFIG_DJI_H1_TIMEZONE_NAME` defaults to `Asia/Shanghai`. Scientific binary
+and MQTT timestamps remain Unix UTC milliseconds; `MISSION.JSON` records the
+name and offset that apply to the folder, and each `EVENTS.JSONL` entry repeats
+them so a detached event remains interpretable. At orderly mission shutdown,
 after every handle and the final `MISSION.JSON` checkpoint have closed, the SD
 component applies the final synchronized UTC time to all five mission files and
 their directory. This best-effort metadata update cannot turn a safely flushed
 dataset into a failed shutdown. Original FAT creation times can still show the
 boot fallback because the directory is intentionally allocated before A-board
 time is available; consumers should sort by modification time.
+
+The timezone is intentionally a fixed offset, not a daylight-saving rules
+database. Deployments outside UTC+08:00 must configure both values before the
+firmware is built. Changing them never alters the A/B clock fit or the meaning
+of an already recorded `utc_ms` value.
 
 ## Failure behavior
 

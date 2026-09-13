@@ -5,6 +5,11 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
 
+# Mission-local civil time. Scientific timestamps remain UTC; this fixed
+# offset is recorded as metadata and used for timezone-less FAT timestamps.
+CONFIG_DJI_H1_TIMEZONE_NAME="Asia/Shanghai"
+CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES=480
+
 # Mission logging uses descriptive file and directory names.
 CONFIG_FATFS_LFN_HEAP=y
 

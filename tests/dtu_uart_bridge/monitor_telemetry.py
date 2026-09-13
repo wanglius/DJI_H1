@@ -74,6 +74,7 @@ def main() -> int:
     parser.add_argument("--topic", default="dji-h1/test/up")
     parser.add_argument("--ack-topic", default="dji-h1/test/down")
     parser.add_argument("--duration", type=float, default=60.0)
+    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=1)
     parser.add_argument("--expect-gps-min", type=int, default=0)
     parser.add_argument("--expect-reflectance-min", type=int, default=0)
     args = parser.parse_args()
@@ -121,8 +122,10 @@ def main() -> int:
                 continue
             if topic != args.topic:
                 continue
-            if qos != 1:
-                raise RuntimeError(f"expected QoS 1, received QoS {qos}")
+            if qos != args.expect_qos:
+                raise RuntimeError(
+                    f"expected QoS {args.expect_qos}, received QoS {qos}"
+                )
             mqtt_messages += 1
             mqtt_bytes += len(mqtt_payload)
             for fragment in stream.feed(mqtt_payload):

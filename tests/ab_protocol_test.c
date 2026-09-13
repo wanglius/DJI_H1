@@ -192,6 +192,27 @@ esp_err_t ab_protocol_self_test(void)
     CHECK(parse_result == AB_PARSE_FRAME && frame.sequence == 0xFE,
           "valid frame after truncation");
 
+    /* A back-to-back frame header can occupy either one or both missing CRC
+     * bytes of a truncated predecessor. Both cases must preserve the valid
+     * successor without needing an inter-byte timeout. */
+    for (size_t missing_crc = 1; missing_crc <= 2; missing_crc++) {
+        ab_parser_init(&parser);
+        unsigned crc_errors = 0;
+        unsigned recovered_frames = 0;
+        for (size_t i = 0; i < wire_length - missing_crc; i++) {
+            (void)ab_parser_feed(&parser, wire[i], (uint32_t)i, &frame);
+        }
+        for (size_t i = 0; i < wire_length; i++) {
+            ab_parse_result_t recovered = ab_parser_feed(
+                &parser, wire[i], (uint32_t)(wire_length + i), &frame);
+            if (recovered == AB_PARSE_CRC_ERROR) crc_errors++;
+            if (recovered == AB_PARSE_FRAME) recovered_frames++;
+        }
+        CHECK(crc_errors == 1 && recovered_frames == 1 &&
+                  frame.sequence == 0xFE,
+              "CRC-boundary header recovery");
+    }
+
     uint8_t second_wire[AB_MAX_FRAME_SIZE];
     size_t second_length = 0;
     CHECK(ab_frame_encode(AB_CMD_PREPARE_POWER_OFF, 0xFF, power_payload,

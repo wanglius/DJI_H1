@@ -2307,6 +2307,13 @@ CONFIG_WIFI_PROV_STA_ALL_CHANNEL_SCAN=y
 # end of Wi-Fi Provisioning Manager
 
 #
+# DJI H1 timekeeping
+#
+CONFIG_DJI_H1_TIMEZONE_NAME="Asia/Shanghai"
+CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES=480
+# end of DJI H1 timekeeping
+
+#
 # DJI H1 measurement recorder
 #
 # CONFIG_DJI_H1_TEST_FAULT_INJECTION is not set

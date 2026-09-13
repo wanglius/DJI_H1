@@ -99,6 +99,8 @@ void app_main(void)
         .source_id = source_id,
         .ack_timeout_ms = DJI_DTU_ACK_TIMEOUT_MS,
         .max_retries = DJI_DTU_MAX_RETRIES,
+        .pool_length = DJI_DTU_TELEMETRY_POOL_LENGTH,
+        .timing_diagnostics = DJI_DTU_TIMING_DIAGNOSTICS,
     };
     ESP_ERROR_CHECK(telemetry_start(&telemetry));
     ESP_ERROR_CHECK(mission_control_init());

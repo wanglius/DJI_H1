@@ -12,9 +12,11 @@ reassembles them. It never changes timestamps or measurement fields.
   64-bit field. A fresh nonzero 64-bit random transport mission ID is generated for
   each flight and recorded in `MISSION.JSON`; neither device clones nor a
   reformatted/replaced card can reuse the complete message identity.
-- The ESP32 implementation performs no per-message allocation. Its queues are
-  allocated once at boot, and the telemetry TX task owns a logical message
-  until transmission and acknowledgement complete.
+- The ESP32 implementation performs no per-message allocation. A configurable
+  shared GPS/reflectance pool (512 entries in the production board profile) is
+  allocated once in PSRAM. Only pointers cross the FreeRTOS ready/free queues.
+  A slot remains owned until a matching positive application ACK arrives or a
+  shutdown abort deliberately discards it.
 - The caller of the future MQTT publish API enqueues a complete logical message;
   acquisition and calculation tasks must never wait for UART or cellular I/O.
 - Integers are serialized explicitly in little-endian order. Compiler struct
@@ -63,13 +65,15 @@ production publisher will send GPS and reflectance only.
 
 The `telemetry` component owns UART1 on GPIO17/GPIO18 and is the only task that
 writes application data to the DTU. The measurement recorder gives it finalized
-v01 GPS and reflectance records through independent bounded queues. GPS is an
-explicit 1 Hz latest-value product. Reflectance is FIFO and is never silently
-overwritten: queue exhaustion drops and counts only the new live-telemetry
-copy, then accepts later records. It does not latch infrastructure health or
-affect the authoritative SD write. The loss remains visible to the A board as
-mission-level data degradation. A future SD-backed replay service is required
-if every record must reach the broker through an arbitrarily long outage.
+v01 GPS and reflectance records without ever waiting for UART or cellular I/O.
+GPS first enters a one-element latest-value mailbox and is admitted to the
+shared pool at no more than 1 Hz. Reflectance enters the pool in FIFO order and
+is never silently overwritten. Pool exhaustion drops and counts only the new
+live-telemetry copy, then accepts later records once acknowledgements release
+slots. It does not latch infrastructure health or affect the authoritative SD
+write. The loss remains visible to the A board as mission-level data
+degradation. A future SD-backed replay service is required if every record must
+reach the broker through an arbitrarily long outage.
 
 The task serializes records with the same `data_records` functions used for SD,
 calls `telemetry_fragment_plan_init()` once, then
@@ -77,25 +81,29 @@ calls `telemetry_fragment_plan_init()` once, then
 emitter sends each provided buffer synchronously before returning and never
 retains the pointer because the next fragment immediately overwrites it.
 
-Initial conservative policy:
+Current production policy:
 
-- 100 ms idle gap after every fragment, based on the sustained QoS 1 hardware
-  characterization;
+- 6 ms idle gap after every fragment, validated against the current DTU at
+  460800 baud;
 - GPS is coalesced to the latest sample and sent no more often than once per
   second;
-- reflectance uses an eight-record FIFO and queue exhaustion is a visible,
-  heartbeat-degrading fault rather than a silent overwrite;
+- GPS and reflectance share a 512-entry PSRAM retention pool (roughly 1.6 MiB);
+  queue exhaustion is a visible, heartbeat-degrading drop rather than a silent
+  overwrite;
+- the task transmits new messages continuously and does not wait for DTA1
+  between messages. Positive ACKs may arrive late, duplicated, or out of order;
 - exhausted acknowledgement retries increment `messages_failed` and degrade
-  the heartbeat, but do not stop later transmissions;
-- only local infrastructure faults (UART or internal serialization/framing)
-  latch telemetry unhealthy. Delivery-pressure counters do not control
-  telemetry or recorder admission.
+  the heartbeat, retain the unconfirmed slot for possible late ACK, and do not
+  stop later transmissions;
+- only local infrastructure faults (UART, internal serialization/framing, or a
+  pool ownership invariant failure) latch telemetry unhealthy.
+  Delivery-pressure counters do not control telemetry or recorder admission.
 
-At 460800 baud, the current 100 ms gap limits a four-fragment reflectance
-message to roughly two messages per second even before broker latency. A faster
-calculation cadence can therefore produce deliberate FIFO drops on a healthy
-link. Reducing this gap requires a dedicated sustained hardware test; it is not
-changed as part of the failure-policy correction.
+At 460800 baud, a current four-fragment reflectance message occupies roughly
+74 ms of the UART including its 6 ms boundaries. Cloud ACK latency is typically
+hundreds of milliseconds, but no longer consumes the serialization path. The
+pool absorbs prolonged latency or outages; it is finite by design so local SD
+recording always retains bounded memory behavior.
 
 ## Cloud acknowledgement
 
@@ -103,22 +111,24 @@ QoS 1 confirms delivery from the DTU to the broker, but the ESP32 cannot see
 that PUBACK. Therefore the production validator/service publishes a 40-byte
 `DTA1` application acknowledgement on the configured downlink topic only after
 the complete DTF2 message and inner DHR1 record pass validation. It echoes the
-source ID, mission ID, type, sequence, and complete-message CRC. The ESP32 waits
-for this acknowledgement and retries the entire logical message once on a
-timeout. Identical retransmissions are safe because the receiver deduplicates
+source ID, mission ID, type, sequence, and complete-message CRC. The ESP32
+matches each ACK against every retained in-flight slot. An ACK deadline schedules
+the whole logical message for retry without blocking transmission of unrelated
+messages. Identical retransmissions are safe because the receiver deduplicates
 them and repeats the acknowledgement.
 
 Sender diagnostics distinguish a valid but stale/mismatched ACK from a matching
 ACK whose application status is nonzero. `acknowledgement_rejected` remains in
 `MISSION.JSON` as the backward-compatible sum of both cases, while
 `acknowledgements_mismatched` and `acknowledgements_negative` identify the
-cause. Mismatched keys are logged with the received and expected message
-identity at a rate-limited cadence.
+cause. Pool occupancy/high-water marks, simultaneous in-flight counts,
+transmission attempts, and application-ACK RTT are also checkpointed. A late
+positive ACK can release a retry-exhausted or previously rejected entry.
 
 At final power-off, telemetry is deliberately abandoned as soon as the B board
-receives the `0x30` forecast. Admission closes, queued GPS/reflectance copies are
-purged, and an in-progress fragment/ACK/retry sequence observes a cancellation
-flag. Cloud delivery never delays authoritative SD finalization. The final
+receives the `0x30` forecast. Admission closes, the worker reclaims queued and
+in-flight pool entries, and an in-progress fragment sequence observes a
+cancellation flag. Cloud delivery never delays authoritative SD finalization. The final
 `MISSION.JSON` records `telemetry.shutdown_aborted=true`; this is intentional
 shutdown policy, not an infrastructure failure or delivery-pressure fault.
 

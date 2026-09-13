@@ -1,0 +1,19 @@
+menu "DJI H1 timekeeping"
+
+config DJI_H1_TIMEZONE_NAME
+    string "Mission local timezone name"
+    default "Asia/Shanghai"
+    help
+        Human-readable IANA-style label recorded in MISSION.JSON. The label is
+        metadata only; the numeric UTC offset below controls conversion.
+
+config DJI_H1_TIMEZONE_OFFSET_MINUTES
+    int "Mission local offset from UTC (minutes)"
+    range -720 840
+    default 480
+    help
+        Fixed civil-time offset recorded with each mission and operation event.
+        Positive values are east of UTC. The default 480 is UTC+08:00 for
+        Shanghai and Beijing. Scientific record timestamps remain Unix UTC.
+
+endmenu

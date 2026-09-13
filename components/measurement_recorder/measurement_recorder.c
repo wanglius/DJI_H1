@@ -398,17 +398,21 @@ static const char *event_name(measurement_event_t event)
 
 static esp_err_t write_event(const operation_event_t *event)
 {
+    const char *timezone_name = clock_sync_timezone_name();
+    int timezone_offset = clock_sync_timezone_offset_minutes();
     int length = snprintf((char *)s_serial_buffer, sizeof(s_serial_buffer),
         "{\"schema_version\":1,\"sequence\":%" PRIu32
         ",\"event\":\"%s\",\"session_id\":%" PRIu32
         ",\"segment_id\":%u,\"b_monotonic_us\":%" PRIu64
         ",\"utc_ms\":%" PRIu64 ",\"sync_state\":%u"
         ",\"time_valid_flags\":%u,\"argument0\":%" PRIu32
-        ",\"argument1\":%" PRId32 "}\n",
+        ",\"argument1\":%" PRId32
+        ",\"timezone_name\":\"%s\",\"utc_offset_minutes\":%d}\n",
         event->sequence, event_name(event->code), event->session_id,
         event->segment_id, event->timestamp.b_monotonic_us,
         event->timestamp.utc_ms, event->timestamp.sync_state,
-        event->timestamp.valid_flags, event->argument0, event->argument1);
+        event->timestamp.valid_flags, event->argument0, event->argument1,
+        timezone_name, timezone_offset);
     if (length <= 0 || (size_t)length >= sizeof(s_serial_buffer))
         return ESP_ERR_INVALID_SIZE;
     size_t written = 0;
@@ -480,12 +484,17 @@ static esp_err_t write_mission_summary(const char *state)
         }
     }
     (void)clock_sync_timestamp(esp_timer_get_time(), &updated);
+    const char *timezone_name = clock_sync_timezone_name();
+    int timezone_offset = clock_sync_timezone_offset_minutes();
     const esp_app_desc_t *app = esp_app_get_description();
     int length = snprintf((char *)s_serial_buffer, sizeof(s_serial_buffer),
         "{\n"
         "  \"schema\": \"DJI_H1_MISSION\",\n"
         "  \"schema_version\": 1,\n"
         "  \"record_format_version\": %u,\n"
+        "  \"timestamp_basis\": \"UTC\",\n"
+        "  \"timezone\": {\"name\": \"%s\", "
+        "\"utc_offset_minutes\": %d},\n"
         "  \"state\": \"%s\",\n"
         "  \"directory\": \"%s\",\n"
         "  \"flight_index\": %" PRIu32 ",\n"
@@ -523,6 +532,12 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"reflectance_submitted\": %" PRIu32
         ", \"reflectance_sent\": %" PRIu32
         ", \"reflectance_queue_overflows\": %" PRIu32
+        ", \"pool_capacity\": %" PRIu32
+        ", \"pool_used\": %" PRIu32
+        ", \"pool_high_watermark\": %" PRIu32
+        ", \"messages_in_flight\": %" PRIu32
+        ", \"messages_in_flight_high_watermark\": %" PRIu32
+        ", \"transmission_attempts\": %" PRIu32
         ", \"fragments_sent\": %" PRIu32 ", \"bytes_sent\": %" PRIu32
         ", \"messages_retried\": %" PRIu32
         ", \"acknowledgements_received\": %" PRIu32
@@ -532,9 +547,13 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"acknowledgements_negative\": %" PRIu32
         ", \"messages_failed\": %" PRIu32
         ", \"serialization_errors\": %" PRIu32
+        ", \"reflectance_pool_errors\": %" PRIu32
         ", \"uart_errors\": %" PRIu32
         ", \"drain_timeouts\": %" PRIu32
         ", \"downlink_bytes\": %" PRIu32
+        ", \"acknowledgement_rtt_last_us\": %" PRIu32
+        ", \"acknowledgement_rtt_max_us\": %" PRIu32
+        ", \"acknowledgement_rtt_sum_us\": %" PRIu64
         ", \"source_id\": \"%016" PRIX64 "\""
         "},\n"
         "  \"identity_mismatches\": %" PRIu32 ",\n"
@@ -542,7 +561,8 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"flush_errors\": %" PRIu32 ",\n"
         "  \"max_flush_us\": %" PRIu32 "\n"
         "}\n",
-        DATA_RECORD_FORMAT_VERSION, state, s_directory, s_flight_index,
+        DATA_RECORD_FORMAT_VERSION, timezone_name, timezone_offset,
+        state, s_directory, s_flight_index,
         telemetry_mission_id,
         app ? app->version : "unknown", a_firmware, drone_link,
         drone_serial_text, drone_serial_hex, flight_started.b_monotonic_us,
@@ -560,6 +580,10 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.gps_submitted, telemetry.gps_sent,
         telemetry.gps_superseded, telemetry.reflectance_submitted,
         telemetry.reflectance_sent, telemetry.reflectance_queue_overflows,
+        telemetry.pool_capacity, telemetry.pool_used,
+        telemetry.pool_high_watermark, telemetry.messages_in_flight,
+        telemetry.messages_in_flight_high_watermark,
+        telemetry.transmission_attempts,
         telemetry.fragments_sent, telemetry.bytes_sent,
         telemetry.messages_retried, telemetry.acknowledgements_received,
         telemetry.acknowledgement_timeouts,
@@ -567,8 +591,13 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.acknowledgements_mismatched,
         telemetry.acknowledgements_negative,
         telemetry.messages_failed, telemetry.serialization_errors,
-        telemetry.uart_errors, telemetry.drain_timeouts,
-        telemetry.downlink_bytes_received, telemetry.source_id,
+        telemetry.reflectance_pool_errors, telemetry.uart_errors,
+        telemetry.drain_timeouts,
+        telemetry.downlink_bytes_received,
+        telemetry.acknowledgement_rtt_last_us,
+        telemetry.acknowledgement_rtt_max_us,
+        telemetry.acknowledgement_rtt_sum_us,
+        telemetry.source_id,
         totals.identity_mismatches,
         totals.write_errors,
         totals.flush_errors, totals.max_flush_us);

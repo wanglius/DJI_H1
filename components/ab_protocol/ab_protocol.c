@@ -171,7 +171,22 @@ ab_parse_result_t ab_parser_feed(ab_parser_t *parser, uint8_t byte,
             if (out_frame != NULL) *out_frame = parser->frame;
             result = AB_PARSE_FRAME;
         }
+        /* A damaged/truncated frame may consume the beginning of the next
+         * back-to-back frame as its CRC. Preserve AA or AA 55 at that boundary
+         * so one bad frame does not force the following valid frame to be
+         * discarded as well. */
+        bool have_complete_header = result == AB_PARSE_CRC_ERROR &&
+            parser->crc_low == AB_FRAME_HEADER_0 && byte == AB_FRAME_HEADER_1;
+        bool have_header_candidate = result == AB_PARSE_CRC_ERROR &&
+            byte == AB_FRAME_HEADER_0;
         parser_reset(parser);
+        if (have_complete_header) {
+            parser->state = PARSER_LENGTH;
+            parser->last_byte_ms = now_ms;
+            parser->have_last_byte = true;
+        } else if (have_header_candidate) {
+            parser_accept_header_candidate(parser, byte, now_ms);
+        }
         return result;
     }
     default:

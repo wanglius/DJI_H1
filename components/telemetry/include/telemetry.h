@@ -25,6 +25,10 @@ typedef struct {
     /** Cloud application acknowledgement deadline and retry count. */
     uint32_t ack_timeout_ms;
     uint8_t max_retries;
+    /** Number of retained unacknowledged records allocated in PSRAM. */
+    uint16_t pool_length;
+    /** Emit one compact microsecond timing record per delivery attempt. */
+    bool timing_diagnostics;
 } telemetry_config_t;
 
 typedef struct {
@@ -38,8 +42,16 @@ typedef struct {
     uint32_t gps_sent;
     uint32_t gps_superseded;
     uint32_t reflectance_submitted;
+    /** GPS/reflectance "sent" counters mean positively acknowledged complete
+     * application messages, preserving the pre-windowing status semantics. */
     uint32_t reflectance_sent;
     uint32_t reflectance_queue_overflows;
+    uint32_t pool_capacity;
+    uint32_t pool_used;
+    uint32_t pool_high_watermark;
+    uint32_t messages_in_flight;
+    uint32_t messages_in_flight_high_watermark;
+    uint32_t transmission_attempts;
     uint32_t fragments_sent;
     uint32_t bytes_sent;
     uint32_t messages_retried;
@@ -55,16 +67,22 @@ typedef struct {
     /** Logical messages that exhausted all delivery attempts. */
     uint32_t messages_failed;
     uint32_t serialization_errors;
+    /** Internal ownership/free-list failures in the shared PSRAM pool. */
+    uint32_t reflectance_pool_errors;
     uint32_t uart_errors;
     uint32_t drain_timeouts;
     uint32_t downlink_bytes_received;
+    uint32_t acknowledgement_rtt_last_us;
+    uint32_t acknowledgement_rtt_max_us;
+    uint64_t acknowledgement_rtt_sum_us;
     /** True when prepare-power-off deliberately cancelled cloud delivery so
      * the shutdown budget could be reserved for durable SD finalization. */
     bool shutdown_aborted;
 } telemetry_status_t;
 
 /** Start the sole DTU UART owner and its paced transmit task. The DTU must
- * already contain its persistent MQTT provisioning.
+ * already contain its persistent MQTT provisioning. The fixed shared payload
+ * pool is allocated from initialized PSRAM during this call.
  */
 esp_err_t telemetry_start(const telemetry_config_t *config);
 
@@ -82,8 +100,8 @@ esp_err_t telemetry_submit_gps(const gps_record_t *record);
 esp_err_t telemetry_submit_reflectance(
     const reflectance_record_t *record);
 
-/** Stop accepting records and wait until pending GPS/reflectance records have
- * received matching cloud application acknowledgements.
+/** Stop accepting records and wait until every retained GPS/reflectance record
+ * has received a matching positive cloud application acknowledgement.
  */
 esp_err_t telemetry_finish_mission(uint32_t timeout_ms);
 

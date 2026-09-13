@@ -67,6 +67,14 @@ later clock-model reset cannot silently reinterpret mission start. The updated
 timestamp has matching generation/state fields and may legitimately belong to
 a later generation.
 
+`utc_ms` always remains Unix UTC and does not change with deployment location.
+The mission summary records `timestamp_basis: "UTC"` and a `timezone` object
+containing the configured human-readable name and signed offset in minutes.
+That mission-level setting applies to every binary record in the folder without
+changing v01 or redundantly storing the same offset in every spectrum. Operation
+events repeat `timezone_name` and `utc_offset_minutes` because JSONL lines are
+designed to remain useful when recovered independently.
+
 ## Measurement interpretation and durability
 
 The recorder synchronizes all open flight files at least every 1.5 seconds and
