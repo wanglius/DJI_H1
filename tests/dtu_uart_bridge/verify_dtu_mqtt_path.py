@@ -77,7 +77,11 @@ def main() -> int:
     parser.add_argument("--up-topic", default="dji-h1/test/up")
     parser.add_argument("--down-topic", default="dji-h1/test/down")
     parser.add_argument(
-        "--expect-uplink-qos", type=int, choices=(0, 1), default=0,
+        "--expect-uplink-qos", type=int, choices=(0, 1), default=1,
+    )
+    parser.add_argument(
+        "--downlink-qos", type=int, choices=(0, 1), default=0,
+        help="MQTT QoS for the broker-to-DTU test payload (production ACK: 0)",
     )
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument(
@@ -128,11 +132,14 @@ def main() -> int:
             )
 
             port.reset_input_buffer()
-            publish(publisher, args.down_topic, downlink_payload, 1)
+            publish(
+                publisher, args.down_topic, downlink_payload,
+                args.downlink_qos,
+            )
             receive_serial_payload(port, downlink_payload, args.timeout)
             print(
                 f"DOWNLINK PASS topic={args.down_topic} -> "
-                f"serial={args.serial_port} qos=1 "
+                f"serial={args.serial_port} qos={args.downlink_qos} "
                 f"payload={downlink_payload.decode('ascii')}"
             )
     finally:

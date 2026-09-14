@@ -68,20 +68,24 @@ writes application data to the DTU. The measurement recorder gives it finalized
 v01 GPS and reflectance records without ever waiting for UART or cellular I/O.
 Every received 5 Hz GPS record enters its FIFO. Calculated reflectance remains
 full-rate on SD, while telemetry keeps one latest-value candidate and admits at
-most one candidate every 200 ms (5 Hz) to its reliable FIFO. A newer candidate
+most one candidate every 500 ms (2 Hz) to its reliable FIFO. A newer candidate
 within the same interval intentionally supersedes the older one. This
 rate-limited count is diagnostic, not data-path degradation. The original
 ground timestamp and record sequence remain unchanged, so the receiver can
 identify exactly which calculated records were selected.
 
 GPS is served first so a reflectance/retry backlog cannot age the flight track.
-Once a record enters either reliable FIFO, it is never silently overwritten.
-Pool exhaustion drops and counts only the new live-telemetry copy, then accepts
-later records once acknowledgements release slots. It does not latch
-infrastructure health or affect the authoritative SD write. The loss remains
-visible to the A board as mission-level data degradation. A future SD-backed
-replay service is required if every selected record must reach the broker
-through an arbitrarily long outage.
+Every admitted record is retained until a positive application ACK or the
+configured freshness deadline, whichever comes first. Production measures the
+deadline from local pool admission (not the record's synchronized timestamp)
+and expires an entry after 10 seconds. This deliberately trades a small,
+explicit gap in live telemetry for a bounded and current backlog during a slow
+or disconnected cellular link. Expiration is counted by message type and
+reported as mission degradation, but it does not latch infrastructure health
+or affect the authoritative SD write. Pool exhaustion likewise drops and
+counts only the new live-telemetry copy, then accepts later records once slots
+are released. A future SD-backed replay service is required if every selected
+record must reach the broker through an arbitrarily long outage.
 
 The task serializes records with the same `data_records` functions used for SD,
 calls `telemetry_fragment_plan_init()` once, then
@@ -94,28 +98,37 @@ Current production policy:
 - fragments are written continuously with no application-level idle gap at
   460800 baud. DTF2 framing remains authoritative, while the DTU's configured
   1024-byte/5-ms UART packetizer is free to split or combine MQTT payloads;
-- DTU uplink publication uses QoS 0 to avoid serializing every 1024-byte
-  fragment behind the modem's broker-PUBACK path; the subscribed acknowledgement
-  topic remains QoS 1;
+- DTU uplink publication uses QoS 1. The DTU remains subscribed to the
+  acknowledgement topic at QoS 1, but the ground service publishes each DTA1
+  at QoS 0. The application ACK is idempotent and a lost ACK is already covered
+  by the B-board timeout/retry and 10-second residency policy, so blocking the
+  ground receiver on another broker PUBACK adds load without improving the
+  end-to-end acceptance guarantee;
 - every accepted 5 Hz A-to-B GPS record is retained and transmitted in FIFO
   order, with GPS ready records scheduled ahead of reflectance/retry backlog;
-- new reflectance telemetry is selected on a 200 ms mission-monotonic cadence.
+- new reflectance telemetry is selected on a 500 ms mission-monotonic cadence.
   Each tick admits only the newest unsent calculated record; empty ticks send
   nothing and missed ticks are not replayed as a burst. `MISSION.JSON` reports
   offered, admitted, intentionally rate-limited, and acknowledged counts;
 - GPS and reflectance share a 512-entry PSRAM retention pool (roughly 1.6 MiB);
   queue exhaustion is a visible, heartbeat-degrading drop rather than a silent
   overwrite;
+- production pool residency is limited to 10 seconds. Staged, queued,
+  in-flight, retry-due, and exhausted entries are expired safely; queued
+  entries use a tombstone until their FreeRTOS queue pointer is consumed.
+  `gps_expired` and `reflectance_expired` expose the resulting live-delivery
+  gaps in the heartbeat and `MISSION.JSON`. A late ACK for a released entry is
+  harmlessly counted as mismatched;
 - the task transmits new messages continuously and does not wait for DTA1
   between messages. Positive ACKs may arrive late, duplicated, or out of order;
 - exhausted acknowledgement retries increment `messages_failed` once and
-  degrade the heartbeat. The unconfirmed slot remains available for a late ACK
-  and receives a round-robin recovery probe after 30 seconds. Recovery runs
-  behind new GPS and ordinary retries but ahead of new reflectance. Its global
-  rate adapts to shared-pool occupancy: 1 message/s below 25%, 2 messages/s at
-  25%, 5 messages/s at 50%, and at most 10 messages/s at 75% or above. This
-  preserves normal live-traffic priority while clearing a full 512-entry pool
-  in roughly one minute after connectivity returns;
+  degrade the heartbeat. The generic component can retain such a slot for a
+  late ACK and issue round-robin recovery probes after 30 seconds when its
+  residency limit is disabled or configured long enough. With the production
+  10-second freshness policy, the old slot expires before that recovery phase;
+  live data is preferred to delayed replay. Recovery otherwise runs behind new
+  GPS and ordinary retries but ahead of new reflectance, with a global rate
+  adapting from 1 to at most 10 messages/s according to pool pressure;
 - a matching negative application ACK or a permanent local serialization/
   framing failure releases the slot immediately because retransmitting the same
   immutable payload cannot correct it. DTA1 status 0 means accepted; every
@@ -128,9 +141,10 @@ Current production policy:
 
 At 460800 baud, serialization time is now almost entirely the wire time of the
 DTF2 bytes; application pacing adds no deliberate delay. Cloud ACK latency is
-independent of this serialization path. The 512-entry PSRAM pool absorbs
-prolonged latency or outages; it is finite by design so local SD recording
-always retains bounded memory behavior.
+independent of this serialization path. The 512-entry PSRAM pool absorbs normal
+latency and short outages, while the 10-second deadline prevents an old backlog
+from consuming it indefinitely. Local SD recording remains the complete,
+authoritative data path.
 
 The production UART setting assumes the DTU has already been persistently
 provisioned for 460800 baud with `configure_dtu_mqtt.py` and qualified with the
@@ -142,11 +156,13 @@ distinguish baud mismatch from cellular, broker, topic, or receiver failure.
 
 ## Cloud acknowledgement
 
-The DTU uplink deliberately uses QoS 0 because the ESP32 cannot observe an
-MQTT PUBACK and therefore cannot use it to retire retained data. The production
-validator/service instead publishes a 40-byte
-`DTA1` application acknowledgement on the configured downlink topic only after
-the complete DTF2 message and inner DHR1 record pass validation. It echoes the
+The DTU uplink uses QoS 1, but the ESP32 cannot observe the modem's MQTT PUBACK
+and therefore cannot use it to retire retained data. The production
+validator/service publishes the 40-byte `DTA1` at MQTT QoS 0 so ACK generation
+does not block uplink consumption while waiting for a second broker PUBACK. The
+B-board application retry covers an ACK lost on this QoS 0 leg. The
+acknowledgement is published on the configured downlink topic only after the
+complete DTF2 message and inner DHR1 record pass validation. It echoes the
 source ID, mission ID, type, sequence, and complete-message CRC. The ESP32
 matches each ACK against every retained in-flight slot. An ACK deadline schedules
 the whole logical message for retry without blocking transmission of unrelated
@@ -189,6 +205,19 @@ uses no application-level gap between fragments and delegates serial-to-MQTT
 packetization to the DTU's configured byte-count/idle-time thresholds. The
 receiver validates DTF2 framing and never trusts MQTT publication boundaries as
 an integrity mechanism.
+
+### Qualified production rate
+
+The 2026-09-14 controlled bridge tests used the real 98-byte GPS and 2233-byte,
+711-sample reflectance payload sizes, GPS at 5 Hz, QoS 1, zero application gap,
+and a 460800-baud DTU UART. A 60-second 2 Hz reflectance run followed by a
+60-second drain delivered all 300 GPS and 120 reflectance messages; reflectance
+p95 latency was 485 ms. A 2.5 Hz bridge run delivered every message, but its p95
+latency rose to 1438 ms; a subsequent 10-minute full-stack mission exposed ACK
+latency above the 3-second retry deadline and delivered only 537 of 805 selected
+reflectance records. At 3 Hz, GPS delivery fell to 83.3% and reflectance to 65%
+despite the full drain. Production therefore uses the conservative 2 Hz rate
+(one latest candidate every 500 ms) pending long-duration field qualification.
 
 ## Receiver contract
 

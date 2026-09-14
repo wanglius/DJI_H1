@@ -47,7 +47,11 @@ files could be finalized first; it is not itself a telemetry fault.
 `reflectance_submitted` counts records selected by the configured live cadence,
 and `reflectance_rate_limited` counts older pending candidates intentionally
 superseded before a sampling tick. Rate limiting is expected and does not make
-`delivery_degraded` true.
+`delivery_degraded` true. `max_residency_ms` records the configured maximum
+time that a live record may occupy the telemetry pool; `gps_expired` and
+`reflectance_expired` count records deliberately shed after that age. Any
+nonzero expiration count makes `delivery_degraded` true, but does not imply an
+SD-recording failure or an unhealthy telemetry component.
 
 The protocol intentionally provides no B-readable flight key: section 4.9 says
 that `session_id` is opaque. The B boot-to-poweroff lifecycle therefore defines

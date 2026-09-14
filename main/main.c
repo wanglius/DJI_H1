@@ -92,7 +92,9 @@ void app_main(void)
         .source_id = source_id,
         .ack_timeout_ms = DJI_DTU_ACK_TIMEOUT_MS,
         .max_retries = DJI_DTU_MAX_RETRIES,
+        .delivery_mode = TELEMETRY_DELIVERY_APPLICATION_ACK,
         .pool_length = DJI_DTU_TELEMETRY_POOL_LENGTH,
+        .max_residency_ms = DJI_DTU_MAX_RESIDENCY_MS,
         .reflectance_interval_ms = DJI_DTU_REFLECTANCE_INTERVAL_MS,
         .timing_diagnostics = DJI_DTU_TIMING_DIAGNOSTICS,
     };

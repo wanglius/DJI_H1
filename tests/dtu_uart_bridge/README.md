@@ -1,5 +1,9 @@
 # DTU UART bridge test firmware
 
+For production-firmware flight tests, follow the complete
+[emulator flight-test SOP](../../Docs/emulator_test_sop.md). In particular, the
+ground validator must print `TELEMETRY READY` before the A-board emulator starts.
+
 This standalone ESP-IDF application temporarily turns the ESP32-S3 into a
 transparent serial bridge:
 
@@ -109,7 +113,9 @@ the downlink topic and confirms the same bytes arrive on the serial port.
 Use `--uplink-bytes 3172` to exercise one full-size v01 reflectance record's
 payload volume. Because the DTU packetizer is capped at 1024 bytes, the verifier
 reassembles consecutive MQTT payloads and reports their count while requiring
-the configured uplink QoS (QoS 0 by default). The downlink remains QoS 1.
+the configured uplink QoS (QoS 1 by default). Its downlink payload defaults to
+QoS 0, matching the production DTA1 path; use `--downlink-qos 1` only for a
+deliberate diagnostic comparison.
 
 To verify the actual `DTF2` application fragments and receiver reassembly
 through the hardware path, run:
@@ -129,19 +135,70 @@ Production uses a zero application-level gap: DTF2 provides the logical-message
 boundaries and the receiver must tolerate the DTU splitting or combining those
 bytes into arbitrary MQTT payloads.
 
+## Controlled DTU input-rate sweep
+
+To isolate the sustainable DTU UART-to-MQTT rate from spectrometer, SD-card,
+and application-ACK behavior, keep the transparent bridge firmware installed
+and run:
+
+```powershell
+python tests/dtu_uart_bridge/measure_input_rate.py `
+    --serial-port COM6 --host mqtt.example.com --mqtt-port 1883 `
+    --username device_test --expect-qos 1 `
+    --report build-review/dtu-input-rate-qos1.json
+```
+
+The default sweep runs four 10-second stages: GPS at 5 Hz throughout, with
+reflectance at 0, 1, 2, then 5 Hz. Payloads are deterministic test bytes, but
+their sizes are exactly the current production v01 sizes: 98-byte GPS records
+and 2,233-byte, 711-sample reflectance records. They use the real DTF2 encoder,
+producing one and three application fragments respectively, with zero
+inter-fragment gap. Add `--reflectance-samples 1024` to exercise the schema's
+3,172-byte, four-fragment maximum instead.
+Each stage has a distinct mission ID, so messages delayed by the DTU remain
+attributed to the stage that generated them. The MQTT subscriber is connected,
+subscribed, and ping-verified before `RATE TEST READY` is printed.
+
+After the sweep, the script drains the link for 30 seconds and reports offered
+and received message counts, delivery percentage, p95 end-to-end latency,
+fragment duplicates, and schedule lag per stage. The default pass threshold is
+99%; change it only when deliberately characterizing a lossy operating point.
+Useful focused variants are:
+
+```powershell
+# Longer 0/1/2/5 Hz comparison.
+python tests/dtu_uart_bridge/measure_input_rate.py --serial-port COM6 `
+    --host mqtt.example.com --username device_test --expect-qos 1 `
+    --stage-seconds 30 --drain-seconds 60
+
+# Compare one rate or a different MQTT publish QoS.
+python tests/dtu_uart_bridge/measure_input_rate.py --serial-port COM6 `
+    --host mqtt.example.com --username device_test --expect-qos 0 `
+    --reflectance-rates 2 --stage-seconds 60
+```
+
+This is a transport-capacity probe, not a replacement for
+`monitor_telemetry.py`: it does not emit valid DHR1 measurement records and
+does not send DTA1 application acknowledgements. Restore the production image
+before the next simulated flight.
+
 During a production-firmware mission, start the validator/acknowledger before the
 A-board emulator:
 
 ```powershell
 python tests/dtu_uart_bridge/monitor_telemetry.py `
     --host mqtt.example.com --mqtt-port 1883 --username device_test `
-    --duration 720 --expect-gps-min 2900 --expect-reflectance-min 300
+    --duration 720 --expect-qos 1 --ack-qos 0 `
+    --expect-gps-min 2900 --expect-reflectance-min 300
 ```
 
 It does not use COM6. It subscribes to the uplink topic, handles
 arbitrary DTU chunk boundaries and duplicates, validates both DTF2 and
 DHR1 CRCs, publishes `DTA1` application acknowledgements on the downlink topic,
 and reports record counts plus intentionally skipped source-record sequences.
+The uplink remains QoS 1, while DTA1 defaults to QoS 0 so the validator never
+serializes uplink consumption behind a broker PUBACK. A lost DTA1 is safe: the
+B board retains and retries the corresponding idempotent logical message.
 For the 600-second endurance mission, the 720-second monitor budget is
 intentional: its timer starts before board reset, preparation, and emulator
 startup, and it must remain online through the final telemetry drain. The

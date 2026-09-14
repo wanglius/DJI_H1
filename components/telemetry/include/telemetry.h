@@ -11,6 +11,13 @@
 extern "C" {
 #endif
 
+typedef enum {
+    /** Retain each record until a matching positive DTA1 is received. */
+    TELEMETRY_DELIVERY_APPLICATION_ACK = 0,
+    /** Release each record after one complete successful UART transmission. */
+    TELEMETRY_DELIVERY_FIRE_AND_FORGET = 1,
+} telemetry_delivery_mode_t;
+
 typedef struct {
     uart_port_t uart_port;
     int tx_gpio;
@@ -26,10 +33,18 @@ typedef struct {
     /** Cloud application acknowledgement deadline and retry count. */
     uint32_t ack_timeout_ms;
     uint8_t max_retries;
+    /** Zero-initialization deliberately selects the production-compatible
+     * application-ACK behavior. Fire-and-forget is currently diagnostic. */
+    telemetry_delivery_mode_t delivery_mode;
     /** Number of retained unacknowledged records allocated in PSRAM. */
     uint16_t pool_length;
+    /** Maximum time a record may occupy the retained pool, measured from
+     * local admission time. Expired records are dropped so delayed cloud
+     * delivery cannot turn the pool into an ever-older backlog. Zero disables
+     * expiry and is intended only for dedicated transport diagnostics. */
+    uint32_t max_residency_ms;
     /** Period of the latest-value reflectance sampler. Production uses
-     * 200 ms (5 Hz). Zero bypasses sampling for dedicated transport stress
+     * 500 ms (2 Hz). Zero bypasses sampling for dedicated transport stress
      * firmware; it should not be used by the production application. */
     uint32_t reflectance_interval_ms;
     /** Emit one compact microsecond timing record per delivery attempt. */
@@ -49,17 +64,24 @@ typedef struct {
     uint32_t gps_superseded;
     /** GPS records rejected because the shared retained pool was full. */
     uint32_t gps_queue_overflows;
+    /** GPS records deliberately discarded after exceeding max_residency_ms. */
+    uint32_t gps_expired;
     /** Valid calculated records offered by the measurement pipeline. */
     uint32_t reflectance_offered;
-    /** Records admitted by the 5 Hz latest-value sampler. */
+    /** Records admitted by the configured latest-value sampler. */
     uint32_t reflectance_submitted;
     /** Older candidates intentionally replaced before their sampling tick.
      * This is expected downsampling, not delivery degradation. */
     uint32_t reflectance_rate_limited;
-    /** GPS/reflectance "sent" counters mean positively acknowledged complete
-     * application messages, preserving the pre-windowing status semantics. */
+    /** Complete messages cleared according to the configured delivery mode:
+     * positive DTA1 in application-ACK mode, or successful complete UART
+     * transmission in fire-and-forget mode. */
     uint32_t reflectance_sent;
     uint32_t reflectance_queue_overflows;
+    /** Reflectance records deliberately discarded after exceeding the
+     * configured maximum pool residency. */
+    uint32_t reflectance_expired;
+    uint32_t max_residency_ms;
     uint32_t pool_capacity;
     uint32_t pool_used;
     uint32_t pool_high_watermark;
@@ -116,14 +138,16 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id);
  * sampling period before entering the reliable FIFO; intentional replacement
  * is counted separately and is not an error. A full pool returns
  * ESP_ERR_NO_MEM and counts a dropped live telemetry record without stopping
- * later submissions or SD recording.
+ * later submissions or SD recording. Every admitted record also has a bounded
+ * residency; expiration is counted as delivery degradation but never latches
+ * the component unhealthy.
  */
 esp_err_t telemetry_submit_gps(const gps_record_t *record);
 esp_err_t telemetry_submit_reflectance(
     const reflectance_record_t *record);
 
 /** Stop accepting records and wait until every retained GPS/reflectance record
- * has received a matching positive cloud application acknowledgement.
+ * has completed according to the configured delivery mode.
  */
 esp_err_t telemetry_finish_mission(uint32_t timeout_ms);
 

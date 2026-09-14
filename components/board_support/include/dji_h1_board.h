@@ -37,9 +37,14 @@
 #define DJI_DTU_ACK_TIMEOUT_MS 3000
 #define DJI_DTU_MAX_RETRIES 1
 #define DJI_DTU_TELEMETRY_POOL_LENGTH 512
-/* Select the newest calculated reflectance at each 200 ms cadence. Full-rate
- * calculated and raw spectra remain on the SD card. */
-#define DJI_DTU_REFLECTANCE_INTERVAL_MS 200
+/* Preserve the normal 3 s + 6 s acknowledgement/retry window, then prefer
+ * fresh flight data over retaining an obsolete cloud-delivery backlog. */
+#define DJI_DTU_MAX_RESIDENCY_MS 10000
+/* Select the newest calculated reflectance at each 500 ms cadence (2 Hz).
+ * A full-stack 2.5 Hz mission exposed application-ACK congestion, so 2 Hz is
+ * the conservative field baseline. Calculated and raw spectra remain
+ * full-rate on the SD card. */
+#define DJI_DTU_REFLECTANCE_INTERVAL_MS 500
 
 #ifdef CONFIG_DJI_H1_TELEMETRY_TIMING_DIAGNOSTICS
 #define DJI_DTU_TIMING_DIAGNOSTICS true

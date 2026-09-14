@@ -31,7 +31,7 @@
     "publish": {
       "enabled": true,
       "topic": "dji-h1/test/up",
-      "qos": 0,
+      "qos": 1,
       "retain": false
     },
     "subscribe": {

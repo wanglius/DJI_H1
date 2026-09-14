@@ -11,7 +11,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
 from monitor_telemetry import (  # noqa: E402
-    PING_INTERVAL_SECONDS, service_keepalives,
+    DEFAULT_ACK_QOS, PING_INTERVAL_SECONDS, publish_ack, service_keepalives,
 )
 from mqtt_broker_probe import ping  # noqa: E402
 
@@ -33,6 +33,29 @@ class FakeSocket:
 
 
 class KeepaliveTests(unittest.TestCase):
+    def test_application_ack_defaults_to_nonblocking_qos_zero(self) -> None:
+        connection = FakeSocket()
+
+        next_packet_id = publish_ack(
+            connection, "dji-h1/test/down", b"DTA1", DEFAULT_ACK_QOS, 7,
+        )
+
+        self.assertEqual(DEFAULT_ACK_QOS, 0)
+        self.assertEqual(connection.sent[0], 0x30)
+        self.assertTrue(connection.sent.endswith(b"DTA1"))
+        self.assertEqual(next_packet_id, 7)
+
+    def test_diagnostic_qos_one_ack_waits_for_matching_puback(self) -> None:
+        connection = FakeSocket(b"\x40\x02\x00\x07")
+
+        next_packet_id = publish_ack(
+            connection, "dji-h1/test/down", b"DTA1", 1, 7,
+        )
+
+        self.assertEqual(connection.sent[0], 0x32)
+        self.assertEqual(connection.received, b"")
+        self.assertEqual(next_packet_id, 8)
+
     def test_ping_validates_and_consumes_pingresp(self) -> None:
         connection = FakeSocket(b"\xD0\x00")
 
@@ -61,6 +84,15 @@ class KeepaliveTests(unittest.TestCase):
         self.assertEqual(updated, now)
         self.assertEqual(subscriber.sent, b"\xC0\x00")
         self.assertEqual(acknowledger.sent, b"\xC0\x00")
+
+    def test_service_supports_fire_and_forget_without_ack_client(self) -> None:
+        subscriber = FakeSocket()
+        now = 110.0
+
+        updated = service_keepalives(subscriber, None, 100.0, now)
+
+        self.assertEqual(updated, now)
+        self.assertEqual(subscriber.sent, b"\xC0\x00")
 
     def test_ping_rejects_invalid_response(self) -> None:
         connection = FakeSocket(b"\x20\x02\x00\x00")

@@ -33,14 +33,15 @@ _GPS_BODY = struct.Struct("<B3xiiiIIH8B")
 _REFLECTANCE_PREFIX = struct.Struct("<IIIQIHHHHHH")
 MAX_ACK_CACHE = 4096
 PING_INTERVAL_SECONDS = 10.0
+DEFAULT_ACK_QOS = 0
 
 
 def service_keepalives(connection, acknowledger, last_ping: float,
                        now: float) -> float:
     """Keep both MQTT clients alive independently of incoming traffic.
 
-    The subscriber normally receives continuous QoS-0 PUBLISH packets, but
-    broker-to-client traffic does not satisfy the MQTT client keepalive.  Its
+    The subscriber normally receives continuous PUBLISH packets, but
+    broker-to-client traffic does not satisfy the MQTT client keepalive. Its
     PINGRESP is intentionally left for receive_publish(), which ignores MQTT
     control packets while looking for the next PUBLISH.  The ACK connection
     has no unsolicited traffic, so its response can be consumed immediately.
@@ -48,8 +49,23 @@ def service_keepalives(connection, acknowledger, last_ping: float,
     if now - last_ping < PING_INTERVAL_SECONDS:
         return last_ping
     send_packet(connection, 0xC0, b"")
-    ping(acknowledger)
+    if acknowledger is not None:
+        ping(acknowledger)
     return now
+
+
+def publish_ack(connection, topic: str, payload: bytes, qos: int,
+                packet_id: int) -> int:
+    """Publish one idempotent DTA1 and return the next MQTT packet ID.
+
+    QoS 0 is the production default: loss is already covered by the B-board's
+    application timeout/retry policy, while avoiding a blocking broker PUBACK
+    on the ground receiver's hot path. QoS 1 remains available for diagnostics.
+    """
+    publish(connection, topic, payload, qos, packet_id)
+    if qos == 0:
+        return packet_id
+    return 1 if packet_id == 0xFFFF else packet_id + 1
 
 
 def integer_argument(value: str) -> int:
@@ -101,8 +117,19 @@ def main() -> int:
     parser.add_argument("--username", default="")
     parser.add_argument("--topic", default="dji-h1/test/up")
     parser.add_argument("--ack-topic", default="dji-h1/test/down")
+    parser.add_argument(
+        "--ack-qos", type=int, choices=(0, 1), default=DEFAULT_ACK_QOS,
+        help=("MQTT QoS used to publish DTA1 application acknowledgements; "
+              "production defaults to 0 because B-board retry supplies "
+              "end-to-end reliability"),
+    )
+    parser.add_argument(
+        "--no-ack", action="store_true",
+        help=("validate and deduplicate telemetry without publishing DTA1; "
+              "use only with fire-and-forget sender diagnostics"),
+    )
     parser.add_argument("--duration", type=float, default=60.0)
-    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=1)
     parser.add_argument(
         "--max-inflight", type=int, default=512,
         help=("maximum simultaneous incomplete messages; the default matches "
@@ -110,6 +137,10 @@ def main() -> int:
     )
     parser.add_argument("--expect-gps-min", type=int, default=0)
     parser.add_argument("--expect-reflectance-min", type=int, default=0)
+    parser.add_argument(
+        "--quiet-records", action="store_true",
+        help="suppress one-line output for each valid record; keep the summary",
+    )
     parser.add_argument(
         "--mission-id", type=integer_argument,
         help=("count and print only this mission; other complete missions are "
@@ -126,10 +157,12 @@ def main() -> int:
         args.host, args.mqtt_port,
         f"DJI_H1_monitor_{suffix}", args.username,
     )
-    acknowledger = connect_client(
-        args.host, args.mqtt_port,
-        f"DJI_H1_ack_{suffix}", args.username,
-    )
+    acknowledger = None
+    if not args.no_ack:
+        acknowledger = connect_client(
+            args.host, args.mqtt_port,
+            f"DJI_H1_ack_{suffix}", args.username,
+        )
     stream = TelemetryFragmentStreamDecoder()
     # The asynchronous sender can legitimately have many partially delivered
     # messages alive at once while missing fragments are awaiting retry.  A
@@ -150,12 +183,26 @@ def main() -> int:
     other_mission_records = 0
     try:
         subscribe(connection, args.topic, 1)
+        # This is the operator's pre-flight gate.  Do not announce readiness
+        # until the broker has accepted both clients and the uplink SUBSCRIBE,
+        # and both sockets have completed a request/response exchange.  The
+        # flight-test SOP requires this line before the A-board emulator starts.
+        ping(connection)
+        if acknowledger is not None:
+            ping(acknowledger)
+        print(
+            "TELEMETRY READY "
+            f"host={args.host}:{args.mqtt_port} topic={args.topic} "
+            f"ack_topic={args.ack_topic} uplink_qos={args.expect_qos} "
+            f"ack={'disabled' if args.no_ack else f'qos{args.ack_qos}'}",
+            flush=True,
+        )
         connection.settimeout(1.0)
         deadline = time.monotonic() + args.duration
         last_ping = time.monotonic()
         while time.monotonic() < deadline:
-            # Check the deadline before every receive.  Doing this only from
-            # the socket-timeout path fails when QoS-0 telemetry is continuous:
+            # Check the deadline before every receive. Doing this only from
+            # the socket-timeout path fails when telemetry is continuous:
             # inbound PUBLISH packets do not count as client keepalive traffic.
             last_ping = service_keepalives(
                 connection, acknowledger, last_ping, time.monotonic()
@@ -181,11 +228,17 @@ def main() -> int:
                     fragment.fragment_count, fragment.flags,
                 )
                 cached_ack = ack_cache.get(key)
-                if cached_ack is not None and fragment.fragment_index == 0:
+                if cached_ack is not None:
+                    # A complete logical record is idempotent. MQTT QoS 1 or
+                    # an application retry may deliver it again; never count
+                    # or write a completed identity twice.
                     ack_cache.move_to_end(key)
-                    publish(acknowledger, args.ack_topic, cached_ack, 1,
-                            ack_packet_id)
-                    ack_packet_id = 1 if ack_packet_id == 0xFFFF else ack_packet_id + 1
+                    if acknowledger is not None and fragment.fragment_index == 0:
+                        ack_packet_id = publish_ack(
+                            acknowledger, args.ack_topic, cached_ack,
+                            args.ack_qos, ack_packet_id,
+                        )
+                    continue
                 message = reassembler.push(fragment)
                 if message is None:
                     continue
@@ -205,9 +258,11 @@ def main() -> int:
                 ack_cache.move_to_end(key)
                 if len(ack_cache) > MAX_ACK_CACHE:
                     ack_cache.popitem(last=False)
-                publish(acknowledger, args.ack_topic, encoded_ack, 1,
-                        ack_packet_id)
-                ack_packet_id = 1 if ack_packet_id == 0xFFFF else ack_packet_id + 1
+                if acknowledger is not None:
+                    ack_packet_id = publish_ack(
+                        acknowledger, args.ack_topic, encoded_ack,
+                        args.ack_qos, ack_packet_id,
+                    )
                 if args.mission_id is not None and \
                         message.mission_id != args.mission_id:
                     other_mission_records += 1
@@ -227,12 +282,15 @@ def main() -> int:
                     position = (f"lat={gps[1] / 1e7:.7f} "
                                 f"lon={gps[2] / 1e7:.7f}"
                                 if validity & 0x01 else "position=INVALID")
-                    print(
-                        f"GPS source={message.source_id:012X} "
-                        f"mission={message.mission_id} seq={message.message_sequence} "
-                        f"utc_ms={utc_ms} {position} "
-                        f"alt_m={gps[3] / 1000:.3f} valid=0x{validity:02X}"
-                    )
+                    if not args.quiet_records:
+                        print(
+                            f"GPS source={message.source_id:012X} "
+                            f"mission={message.mission_id} "
+                            f"seq={message.message_sequence} "
+                            f"utc_ms={utc_ms} {position} "
+                            f"alt_m={gps[3] / 1000:.3f} "
+                            f"valid=0x{validity:02X}"
+                        )
                 elif message.message_type == MESSAGE_REFLECTANCE:
                     if len(body) < _REFLECTANCE_PREFIX.size:
                         raise ValueError("truncated reflectance telemetry body")
@@ -240,13 +298,14 @@ def main() -> int:
                     sample_count = reflectance[5]
                     if len(body) != _REFLECTANCE_PREFIX.size + sample_count * 3:
                         raise ValueError("invalid reflectance telemetry body size")
-                    print(
-                        f"REFLECTANCE source={message.source_id:012X} "
-                        f"mission={message.mission_id} "
-                        f"seq={message.message_sequence} utc_ms={utc_ms} "
-                        f"samples={sample_count} valid={reflectance[6]} "
-                        f"sky_age_us={reflectance[4]}"
-                    )
+                    if not args.quiet_records:
+                        print(
+                            f"REFLECTANCE source={message.source_id:012X} "
+                            f"mission={message.mission_id} "
+                            f"seq={message.message_sequence} utc_ms={utc_ms} "
+                            f"samples={sample_count} valid={reflectance[6]} "
+                            f"sky_age_us={reflectance[4]}"
+                        )
     except (FragmentError, ValueError, OSError, RuntimeError) as exc:
         print(f"TELEMETRY INVALID: {exc}", file=sys.stderr)
         return 2

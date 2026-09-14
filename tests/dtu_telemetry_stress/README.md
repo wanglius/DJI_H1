@@ -4,10 +4,10 @@ This standalone firmware exercises the real production telemetry queue,
 serializer, DTF2 fragmentation, UART sender, downlink ACK parser, and PSRAM
 retention pool without the spectrometers, SD card, or A-board emulator.
 
-After a 60-second monitor-start window it generates, for exactly 10 seconds:
+After a 10-second monitor-start window it generates, for exactly 600 seconds:
 
-- one complete 711-sample v01 reflectance record every 148 ms (68 records);
-- one moving, time-valid v01 GPS record every 200 ms (50 records);
+- one complete 711-sample v01 reflectance record every 500 ms (1200 records);
+- one moving, time-valid v01 GPS record every 200 ms (3000 records);
 - UART1 traffic on GPIO17/18 at 460800 baud with no deliberate application
   gap between DTF2 fragments.
 
@@ -17,28 +17,39 @@ CRC-protected frames contiguously and lets the DTU's 1024-byte packet limit and
 reconstructs records independently of those boundaries and returns DTA1
 application acknowledgements.
 
-The DTU must first be provisioned for 460800 baud, a 1024-byte packet limit,
-QoS 0 uplink, and QoS 1 downlink. Then build/flash this project on COM6 and run:
+The stress profile matches production retention policy: a 512-entry PSRAM pool,
+a 3-second application-ACK timeout, one retry, and a 10-second maximum entry
+residency. The DTU must first be provisioned for 460800 baud, a 1024-byte
+packet limit, QoS 1 uplink, and a QoS 1 subscription to the downlink topic.
+
+For an ACK-policy A/B comparison, build each run with a distinct mission ID.
+Start the matching ground monitor before resetting the stress firmware. First
+run QoS 1 ACKs:
 
 ```powershell
 python tests/dtu_uart_bridge/monitor_telemetry.py `
     --host mqtt-mgnt.torchbearer.tech --mqtt-port 1883 `
-    --username DJI_H1_001 --duration 105 `
-    --mission-id 0x5354523209130003 `
-    --expect-qos 0 --expect-gps-min 50 --expect-reflectance-min 68
+    --username DJI_H1_001 --duration 720 --quiet-records `
+    --mission-id 0x5354523209140101 `
+    --expect-qos 1 --ack-qos 1 `
+    --expect-gps-min 3000 --expect-reflectance-min 1200
 ```
 
-The firmware waits up to 30 seconds after generation for retained messages to
-receive positive acknowledgements, then prints transmission counts, pool high
-watermark, timeouts/retries, and ACK RTT statistics. Once all 50 GPS and 68
-reflectance records are acknowledged, it queues a 24-spectrum backlog, calls
-the production shutdown-abort API, and verifies that the call returns within
-50 ms, the retained pool is reclaimed within one second, and later submissions
-are rejected. Its three-retry stress
-budget is deliberately higher than the current production default so this
-test can distinguish recoverable packet loss from a sustained throughput
-failure. This diagnostic image
-replaces the production application until normal firmware is flashed again.
+Then repeat with mission ID `0x5354523209140102` and `--ack-qos 0`. The firmware
+prints status every minute, waits up to 30 seconds after generation for retained
+messages to be acknowledged or expire, then reports delivery, retries, expiry,
+pool high-water mark, and ACK RTT. It finally queues a 24-spectrum backlog and
+verifies that the production shutdown-abort path reclaims it within one second.
+
+For the one-shot fire-and-forget comparison, configure with
+`-D DTU_STRESS_FIRE_AND_FORGET=1`, assign a fresh mission ID, and run the
+validator with `--no-ack`. The validator still CRC-checks, reassembles, and
+deduplicates complete messages, but produces no downlink traffic. In this mode
+the B board releases an entry only after every fragment has successfully left
+its UART; it performs no application retry.
+
+This diagnostic image replaces the production application until normal
+firmware is flashed again. Reflash `build-review` after the comparison.
 
 ## Earlier 1 Hz hardware results (2026-09-13)
 

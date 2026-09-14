@@ -44,7 +44,7 @@ def main() -> int:
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--username", default="")
     parser.add_argument("--topic", default="dji-h1/test/up")
-    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=1)
     parser.add_argument("--source-id", type=lambda value: int(value, 0),
                         default=0x12345678)
     parser.add_argument("--message-bytes", type=int, default=3172)

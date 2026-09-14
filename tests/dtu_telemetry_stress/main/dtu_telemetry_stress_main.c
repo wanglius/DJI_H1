@@ -17,24 +17,25 @@
 
 static const char *const TAG = "DTU_STRESS";
 
-#define TELEMETRY_POOL_LENGTH 128U
-#define ACK_TIMEOUT_MS 3000U
-#define MAX_RETRIES 3U
-
-#define TEST_START_DELAY_MS 60000U
-#define TEST_DURATION_US UINT64_C(10000000)
-#define REFLECTANCE_PERIOD_US UINT64_C(148000)
+#define TEST_START_DELAY_MS 10000U
+#define TEST_DURATION_US UINT64_C(600000000)
+#define REFLECTANCE_PERIOD_US UINT64_C(500000)
 #define GPS_PERIOD_US UINT64_C(200000)
 #define TEST_SAMPLE_COUNT 711U
-#define EXPECTED_REFLECTANCE_COUNT 68U
-#define EXPECTED_GPS_COUNT 50U
+#define EXPECTED_REFLECTANCE_COUNT 1200U
+#define EXPECTED_GPS_COUNT 3000U
 #define ABORT_BACKLOG_COUNT 24U
 #define TEST_SESSION_ID UINT32_C(0x53545231) /* "STR1" */
 #define TEST_SEGMENT_ID 1U
 #define TEST_UTC_START_MS UINT64_C(1789257600000)
-/* Unique to the cache-off qualification run; the host monitor filters on it
- * while continuing to ACK any older mission that arrives late. */
-#define TEST_MISSION_ID UINT64_C(0x5354523209130003)
+/* Override at configure time for each A/B run so delayed records from the
+ * preceding run remain distinguishable at the ground validator. */
+#ifndef DTU_STRESS_MISSION_ID
+#define DTU_STRESS_MISSION_ID UINT64_C(0x5354523209140001)
+#endif
+#ifndef DTU_STRESS_FIRE_AND_FORGET
+#define DTU_STRESS_FIRE_AND_FORGET 0
+#endif
 
 static reflectance_record_t s_reflectance;
 static gps_record_t s_gps;
@@ -116,7 +117,11 @@ static void make_gps(uint32_t sequence, uint64_t now_us,
     s_gps.data.rtk_solution = 2;
     s_gps.data.flight_status = 2;
     s_gps.data.display_mode = 6;
-    s_gps.data.battery_percent = (uint8_t)(95U - sequence / 2U);
+    /* Model a slow 95% -> 80% decline without unsigned wrap during 3000
+     * records of a ten-minute run. */
+    uint32_t battery_used = sequence / 200U;
+    if (battery_used > 15U) battery_used = 15U;
+    s_gps.data.battery_percent = (uint8_t)(95U - battery_used);
     s_gps.data.a_status = 1;
     s_gps.data.valid_flags = DRONE_VALID_POSITION | DRONE_VALID_ALTITUDE |
                              DRONE_VALID_UTC | DRONE_VALID_BATTERY;
@@ -130,13 +135,17 @@ static void print_status(const char *phase)
         (uint32_t)(status.acknowledgement_rtt_sum_us /
                    status.acknowledgements_received);
     ESP_LOGI(TAG,
-             "%s: healthy=%u GPS submit/ack/drop=%" PRIu32 "/%" PRIu32
-             "/%" PRIu32 " REF submit/ack/drop=%" PRIu32 "/%" PRIu32
-             "/%" PRIu32 " pool=%" PRIu32 "/%" PRIu32 " high=%" PRIu32
+             "%s: healthy=%u GPS submit/ack/drop/expire=%" PRIu32 "/%" PRIu32
+             "/%" PRIu32 "/%" PRIu32
+             " REF submit/ack/drop/expire=%" PRIu32 "/%" PRIu32
+             "/%" PRIu32 "/%" PRIu32
+             " pool=%" PRIu32 "/%" PRIu32 " high=%" PRIu32
              " attempts=%" PRIu32 " fragments=%" PRIu32 " bytes=%" PRIu32,
              phase, status.healthy, status.gps_submitted, status.gps_sent,
-             status.gps_queue_overflows, status.reflectance_submitted,
-             status.reflectance_sent, status.reflectance_queue_overflows,
+             status.gps_queue_overflows, status.gps_expired,
+             status.reflectance_submitted, status.reflectance_sent,
+             status.reflectance_queue_overflows,
+             status.reflectance_expired,
              status.pool_used, status.pool_capacity,
              status.pool_high_watermark, status.transmission_attempts,
              status.fragments_sent, status.bytes_sent);
@@ -158,10 +167,11 @@ static void print_status(const char *phase)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "DTU telemetry stress test: 10 s at 148 ms/full spectrum + 5 Hz GPS");
+    ESP_LOGI(TAG, "DTU telemetry stress test: 600 s at 2 Hz full spectrum + 5 Hz GPS; delivery=%s",
+             DTU_STRESS_FIRE_AND_FORGET ? "fire-and-forget" : "application-ACK");
     ESP_LOGI(TAG, "UART1 GPIO17/18 at %u baud, application fragment gap=%u ms",
              DJI_DTU_UART_BAUD_RATE, DJI_DTU_FRAGMENT_GAP_MS);
-    ESP_LOGI(TAG, "DTU must already be configured for 460800 baud, 1024-byte packet limit, QoS 0 uplink");
+    ESP_LOGI(TAG, "DTU must already be configured for 460800 baud, 1024-byte packet limit, QoS 1 uplink");
 
     ESP_ERROR_CHECK(esp_psram_is_initialized() ? ESP_OK : ESP_ERR_NOT_FOUND);
     ESP_LOGI(TAG, "PSRAM detected=%u bytes free=%u bytes",
@@ -176,9 +186,13 @@ void app_main(void)
         .baud_rate = DJI_DTU_UART_BAUD_RATE,
         .fragment_gap_ms = DJI_DTU_FRAGMENT_GAP_MS,
         .source_id = source_id,
-        .ack_timeout_ms = ACK_TIMEOUT_MS,
-        .max_retries = MAX_RETRIES,
-        .pool_length = TELEMETRY_POOL_LENGTH,
+        .ack_timeout_ms = DJI_DTU_ACK_TIMEOUT_MS,
+        .max_retries = DJI_DTU_MAX_RETRIES,
+        .delivery_mode = DTU_STRESS_FIRE_AND_FORGET
+            ? TELEMETRY_DELIVERY_FIRE_AND_FORGET
+            : TELEMETRY_DELIVERY_APPLICATION_ACK,
+        .pool_length = DJI_DTU_TELEMETRY_POOL_LENGTH,
+        .max_residency_ms = DJI_DTU_MAX_RESIDENCY_MS,
         /* This diagnostic intentionally exercises the uncapped transport. */
         .reflectance_interval_ms = 0,
         .timing_diagnostics = true,
@@ -189,7 +203,7 @@ void app_main(void)
              TEST_START_DELAY_MS / 1000U);
     vTaskDelay(pdMS_TO_TICKS(TEST_START_DELAY_MS));
 
-    uint64_t mission_id = TEST_MISSION_ID;
+    uint64_t mission_id = DTU_STRESS_MISSION_ID;
     ESP_ERROR_CHECK(telemetry_begin_mission(mission_id));
     ESP_LOGI(TAG, "BEGIN mission=%016" PRIX64, mission_id);
 
@@ -200,6 +214,7 @@ void app_main(void)
     uint32_t gps_sequence = 0;
     uint32_t reflectance_submit_failures = 0;
     uint32_t gps_submit_failures = 0;
+    uint64_t next_report_us = started_us + UINT64_C(60000000);
 
     while ((uint64_t)esp_timer_get_time() - started_us < TEST_DURATION_US) {
         uint64_t now_us = (uint64_t)esp_timer_get_time();
@@ -220,6 +235,10 @@ void app_main(void)
                 next_gps_us += GPS_PERIOD_US;
             } while (next_gps_us <= now_us);
         }
+        if (now_us >= next_report_us) {
+            print_status("periodic");
+            next_report_us += UINT64_C(60000000);
+        }
         vTaskDelay(1);
     }
 
@@ -228,7 +247,7 @@ void app_main(void)
              " GPS=%" PRIu32 " failed=%" PRIu32,
              reflectance_sequence, reflectance_submit_failures,
              gps_sequence, gps_submit_failures);
-    print_status("at 10 seconds");
+    print_status("after generation");
 
     /* Keep admission open while waiting so the same mission can stage a
      * deliberate shutdown backlog after its measured delivery is proven. */
@@ -252,14 +271,12 @@ void app_main(void)
              status.reflectance_sent, status.pool_used);
 
     uint32_t abort_backlog_admitted = 0;
-    if (delivery_pass) {
-        uint64_t now_us = (uint64_t)esp_timer_get_time();
-        for (uint32_t i = 0; i < ABORT_BACKLOG_COUNT; i++) {
-            make_reflectance(++reflectance_sequence, now_us + i,
-                             TEST_DURATION_US + i);
-            if (telemetry_submit_reflectance(&s_reflectance) == ESP_OK)
-                abort_backlog_admitted++;
-        }
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    for (uint32_t i = 0; i < ABORT_BACKLOG_COUNT; i++) {
+        make_reflectance(++reflectance_sequence, now_us + i,
+                         TEST_DURATION_US + i);
+        if (telemetry_submit_reflectance(&s_reflectance) == ESP_OK)
+            abort_backlog_admitted++;
     }
     telemetry_get_status(&status);
     uint32_t pending_before_abort = status.pool_used;

@@ -23,6 +23,7 @@ static const char *TAG = "TELEMETRY";
 #define TELEMETRY_ACK_STREAM_CAPACITY (TELEMETRY_ACK_WIRE_SIZE * 32U)
 #define TELEMETRY_MIN_POOL_LENGTH 16U
 #define TELEMETRY_MAX_POOL_LENGTH 2048U
+#define TELEMETRY_MAX_RESIDENCY_MS 3600000U
 #define TELEMETRY_MAX_REFLECTANCE_INTERVAL_MS 60000U
 #define TELEMETRY_POLL_MS 20U
 #define TELEMETRY_UART_TX_TIMEOUT_MS 1000U
@@ -45,6 +46,9 @@ typedef enum {
     ENTRY_IN_FLIGHT,
     ENTRY_RETRY_DUE,
     ENTRY_EXHAUSTED,
+    /* The pointer is still present in a FreeRTOS ready queue. Its consumer
+     * must dequeue this tombstone before the slot can return to the free list. */
+    ENTRY_EXPIRED,
 } telemetry_entry_state_t;
 
 typedef union {
@@ -58,6 +62,9 @@ typedef union {
  * without dedicating another multi-megabyte wire buffer in PSRAM. */
 typedef struct {
     telemetry_record_t record;
+    /** Local monotonic admission time. Record timestamps may be in another
+     * clock domain and therefore cannot define pool residency. */
+    int64_t admitted_us;
     int64_t first_tx_done_us;
     int64_t last_tx_done_us;
     int64_t acknowledgement_deadline_us;
@@ -207,12 +214,14 @@ static void release_entry(telemetry_entry_t *entry)
 static bool try_mark_admitted(telemetry_entry_t *entry, uint8_t message_type,
                               telemetry_entry_state_t state)
 {
+    int64_t admitted_us = esp_timer_get_time();
     taskENTER_CRITICAL(&s_lock);
     if (!s_accepting || s_abort_requested || s_status.mission_id == 0) {
         taskEXIT_CRITICAL(&s_lock);
         return false;
     }
     entry->message_type = message_type;
+    entry->admitted_us = admitted_us;
     entry->state = state;
     s_status.pool_used++;
     if (s_status.pool_used > s_status.pool_high_watermark)
@@ -320,6 +329,24 @@ static bool recovery_policy_self_test(void)
            recovery_probe_interval_ms(383, 512) == 200 &&
            recovery_probe_interval_ms(384, 512) == 100 &&
            recovery_probe_interval_ms(512, 512) == 100;
+}
+
+static bool residency_expired_at(int64_t admitted_us, int64_t now_us,
+                                 uint32_t max_residency_ms)
+{
+    if (max_residency_ms == 0 || admitted_us <= 0 || now_us < admitted_us)
+        return false;
+    return (uint64_t)(now_us - admitted_us) >=
+           (uint64_t)max_residency_ms * 1000ULL;
+}
+
+static bool residency_policy_self_test(void)
+{
+    return !residency_expired_at(100, 20000100, 0) &&
+           !residency_expired_at(0, 20000100, 10000) &&
+           !residency_expired_at(200, 100, 10000) &&
+           !residency_expired_at(100, 10000099, 10000) &&
+           residency_expired_at(100, 10000100, 10000);
 }
 
 static int64_t advance_reflectance_deadline(int64_t deadline_us,
@@ -552,6 +579,15 @@ static bool drain_downlink(TickType_t wait_ticks)
         note_uart_fault();
         return false;
     }
+    if (count > 0 &&
+        s_config.delivery_mode == TELEMETRY_DELIVERY_FIRE_AND_FORGET) {
+        /* No DTA1 is expected in this mode. Still drain the UART so stale
+         * downlink bytes cannot fill its RX ring and distort the stress test. */
+        taskENTER_CRITICAL(&s_lock);
+        s_status.downlink_bytes_received += (uint32_t)count;
+        taskEXIT_CRITICAL(&s_lock);
+        return true;
+    }
     if (count > 0) append_downlink(incoming, (size_t)count);
     telemetry_ack_t ack;
     while (take_next_ack(&ack)) process_ack(&ack);
@@ -565,7 +601,7 @@ static int64_t acknowledgement_timeout_us(uint16_t transmissions)
     return (int64_t)s_config.ack_timeout_ms * 1000LL * (1LL << shift);
 }
 
-static void update_expired_entries(int64_t now_us)
+static void update_ack_deadlines(int64_t now_us)
 {
     for (size_t i = 0; i < s_config.pool_length; i++) {
         telemetry_entry_t *entry = &s_pool[i];
@@ -581,6 +617,78 @@ static void update_expired_entries(int64_t now_us)
         taskEXIT_CRITICAL(&s_lock);
         if (expired && transmissions > s_config.max_retries)
             mark_exhausted(entry, "application ACK timeout");
+    }
+}
+
+/** Reclaim records that are too old to remain useful to the live observer.
+ * Queue-resident records become tombstones because releasing their slot while
+ * the queue still owns its pointer would permit use-after-recycle. All other
+ * idle states can be returned to the pool immediately. ENTRY_SENDING is owned
+ * by this task and is reconsidered on the next loop after transmission. */
+static void expire_stale_entries(int64_t now_us)
+{
+    if (s_config.max_residency_ms == 0) return;
+
+    for (size_t i = 0; i < s_config.pool_length; i++) {
+        telemetry_entry_t *entry = &s_pool[i];
+        bool reclaim = false;
+        bool invalid = false;
+        bool expired = false;
+        uint8_t message_type = 0;
+        uint32_t sequence = 0;
+        uint32_t expired_count = 0;
+        uint64_t age_ms = 0;
+
+        taskENTER_CRITICAL(&s_lock);
+        if (residency_expired_at(entry->admitted_us, now_us,
+                                 s_config.max_residency_ms)) {
+            message_type = entry->message_type;
+            if (message_type != TELEMETRY_MESSAGE_GPS &&
+                message_type != TELEMETRY_MESSAGE_REFLECTANCE) {
+                invalid = entry->state != ENTRY_FREE &&
+                          entry->state != ENTRY_FILLING;
+            } else if (entry->state == ENTRY_STAGED) {
+                if (s_pending_reflectance != entry) {
+                    invalid = true;
+                } else {
+                    s_pending_reflectance = NULL;
+                    entry->state = ENTRY_RECLAIMING;
+                    reclaim = true;
+                    expired = true;
+                }
+            } else if (entry->state == ENTRY_QUEUED) {
+                entry->state = ENTRY_EXPIRED;
+                expired = true;
+            } else if (entry->state == ENTRY_IN_FLIGHT ||
+                       entry->state == ENTRY_RETRY_DUE ||
+                       entry->state == ENTRY_EXHAUSTED) {
+                entry->state = ENTRY_RECLAIMING;
+                reclaim = true;
+                expired = true;
+            }
+
+            if (expired) {
+                sequence = entry_sequence(entry);
+                age_ms = (uint64_t)(now_us - entry->admitted_us) / 1000ULL;
+                if (message_type == TELEMETRY_MESSAGE_GPS)
+                    expired_count = ++s_status.gps_expired;
+                else
+                    expired_count = ++s_status.reflectance_expired;
+            }
+        }
+        taskEXIT_CRITICAL(&s_lock);
+
+        if (invalid) {
+            note_pool_fault("invalid entry while expiring stale telemetry");
+        } else if (expired &&
+                   (expired_count == 1U || expired_count % 100U == 0U)) {
+            ESP_LOGW(TAG,
+                     "Expired stale type=%u seq=%lu age=%llums; type total=%lu",
+                     (unsigned)message_type, (unsigned long)sequence,
+                     (unsigned long long)age_ms,
+                     (unsigned long)expired_count);
+        }
+        if (reclaim) release_entry(entry);
     }
 }
 
@@ -636,27 +744,35 @@ static telemetry_entry_t *take_recovery_probe_due(
 static telemetry_entry_t *take_queued(QueueHandle_t queue,
                                       uint8_t expected_message_type)
 {
-    telemetry_entry_t *entry = NULL;
-    if (xQueueReceive(queue, &entry, 0) != pdTRUE) return NULL;
-    if (!entry_belongs_to_pool(entry)) {
-        note_pool_fault("queued pointer outside pool");
-        return NULL;
-    }
-    taskENTER_CRITICAL(&s_lock);
-    if (entry->state != ENTRY_QUEUED &&
-        entry->state != ENTRY_ENQUEUING) {
+    while (true) {
+        telemetry_entry_t *entry = NULL;
+        if (xQueueReceive(queue, &entry, 0) != pdTRUE) return NULL;
+        if (!entry_belongs_to_pool(entry)) {
+            note_pool_fault("queued pointer outside pool");
+            return NULL;
+        }
+        taskENTER_CRITICAL(&s_lock);
+        bool expired = entry->state == ENTRY_EXPIRED;
+        bool valid_state = entry->state == ENTRY_QUEUED ||
+                           entry->state == ENTRY_ENQUEUING || expired;
+        bool valid_type = entry->message_type == expected_message_type;
+        if (valid_state && valid_type && !expired)
+            entry->state = ENTRY_SENDING;
         taskEXIT_CRITICAL(&s_lock);
-        note_pool_fault("non-queued entry on ready list");
-        return NULL;
+        if (!valid_state) {
+            note_pool_fault("non-queued entry on ready list");
+            return NULL;
+        }
+        if (!valid_type) {
+            note_pool_fault("message on wrong ready list");
+            return NULL;
+        }
+        if (expired) {
+            release_entry(entry);
+            continue;
+        }
+        return entry;
     }
-    if (entry->message_type != expected_message_type) {
-        taskEXIT_CRITICAL(&s_lock);
-        note_pool_fault("message on wrong ready list");
-        return NULL;
-    }
-    entry->state = ENTRY_SENDING;
-    taskEXIT_CRITICAL(&s_lock);
-    return entry;
 }
 
 static esp_err_t serialize_entry(telemetry_entry_t *entry, size_t *length)
@@ -747,6 +863,17 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
 
     if (abort_requested()) return ESP_ERR_INVALID_STATE;
     if (result == ESP_OK) {
+        if (s_config.delivery_mode ==
+            TELEMETRY_DELIVERY_FIRE_AND_FORGET) {
+            taskENTER_CRITICAL(&s_lock);
+            if (entry->message_type == TELEMETRY_MESSAGE_GPS)
+                s_status.gps_sent++;
+            else if (entry->message_type == TELEMETRY_MESSAGE_REFLECTANCE)
+                s_status.reflectance_sent++;
+            taskEXIT_CRITICAL(&s_lock);
+            release_entry(entry);
+            return ESP_OK;
+        }
         taskENTER_CRITICAL(&s_lock);
         entry->last_tx_done_us = timing.last_tx_done_us;
         if (!entry->counted_in_flight) {
@@ -766,6 +893,10 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
         return ESP_OK;
     }
 
+    if (s_config.delivery_mode == TELEMETRY_DELIVERY_FIRE_AND_FORGET) {
+        discard_failed_entry(entry, "one-shot UART transmission failed");
+        return result;
+    }
     taskENTER_CRITICAL(&s_lock);
     bool can_retry = entry->transmissions <= s_config.max_retries;
     if (can_retry) entry->state = ENTRY_RETRY_DUE;
@@ -846,7 +977,11 @@ static void telemetry_task(void *unused)
          * slots, rather than a single stop-and-wait current message. */
         while (drain_downlink(0)) {}
         int64_t now_us = esp_timer_get_time();
-        update_expired_entries(now_us);
+        /* Fresh ACKs win over expiry. Anything still retained beyond the
+         * residency window is then shed before another retry or new send. */
+        expire_stale_entries(now_us);
+        if (s_config.delivery_mode == TELEMETRY_DELIVERY_APPLICATION_ACK)
+            update_ack_deadlines(now_us);
         release_due_reflectance(now_us);
 
         /* GPS and ordinary retries precede recovery probes. A due probe
@@ -855,8 +990,11 @@ static void telemetry_task(void *unused)
          * globally capped at ten messages per second. */
         telemetry_entry_t *entry = take_queued(
             s_gps_queue, TELEMETRY_MESSAGE_GPS);
-        if (entry == NULL) entry = take_retry_due();
-        if (entry == NULL) {
+        if (entry == NULL &&
+            s_config.delivery_mode == TELEMETRY_DELIVERY_APPLICATION_ACK)
+            entry = take_retry_due();
+        if (entry == NULL &&
+            s_config.delivery_mode == TELEMETRY_DELIVERY_APPLICATION_ACK) {
             entry = take_recovery_probe_due(
                 esp_timer_get_time(), &recovery_cursor,
                 &next_recovery_probe_us);
@@ -961,6 +1099,7 @@ static esp_err_t stage_reflectance(const reflectance_record_t *record)
         return ESP_ERR_NO_MEM;
     }
     entry->record.reflectance = *record;
+    int64_t admitted_us = esp_timer_get_time();
 
     telemetry_entry_t *superseded = NULL;
     bool active;
@@ -974,6 +1113,7 @@ static esp_err_t stage_reflectance(const reflectance_record_t *record)
             invariant_ok = false;
         } else {
             entry->message_type = TELEMETRY_MESSAGE_REFLECTANCE;
+            entry->admitted_us = admitted_us;
             entry->state = ENTRY_STAGED;
             s_status.pool_used++;
             if (s_status.pool_used > s_status.pool_high_watermark)
@@ -1019,8 +1159,10 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
         (config->fragment_gap_ms != 0 && config->fragment_gap_ms < 6) ||
         config->source_id == 0 ||
         config->ack_timeout_ms == 0 || config->max_retries > 3 ||
+        config->delivery_mode > TELEMETRY_DELIVERY_FIRE_AND_FORGET ||
         config->pool_length < TELEMETRY_MIN_POOL_LENGTH ||
         config->pool_length > TELEMETRY_MAX_POOL_LENGTH ||
+        config->max_residency_ms > TELEMETRY_MAX_RESIDENCY_MS ||
         config->reflectance_interval_ms >
             TELEMETRY_MAX_REFLECTANCE_INTERVAL_MS ||
         (config->fragment_gap_ms != 0 &&
@@ -1028,7 +1170,8 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
         pdMS_TO_TICKS(config->ack_timeout_ms) == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!recovery_policy_self_test() || !reflectance_sampler_self_test()) {
+    if (!recovery_policy_self_test() || !reflectance_sampler_self_test() ||
+        !residency_policy_self_test()) {
         ESP_LOGE(TAG, "Telemetry policy self-test failed");
         return ESP_FAIL;
     }
@@ -1088,6 +1231,7 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     s_status.healthy = true;
     s_status.source_id = config->source_id;
     s_status.pool_capacity = config->pool_length;
+    s_status.max_residency_ms = config->max_residency_ms;
     s_accepting = false;
     s_sending = false;
     s_abort_requested = false;
@@ -1109,14 +1253,18 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
 
     ESP_LOGI(TAG,
              "DTU UART%d TX=GPIO%d RX=GPIO%d %lu 8N1; gap=%lums GPS=FIFO "
-             "source=%016llX ACK=%lums retries=%u reflectance=%s%lums; "
+             "source=%016llX delivery=%s ACK=%lums retries=%u retention=%lums "
+             "reflectance=%s%lums; "
              "async_pool=%u entries, "
              "%u bytes PSRAM",
              config->uart_port, config->tx_gpio, config->rx_gpio,
              (unsigned long)config->baud_rate,
              (unsigned long)config->fragment_gap_ms,
              (unsigned long long)config->source_id,
+             config->delivery_mode == TELEMETRY_DELIVERY_FIRE_AND_FORGET
+                 ? "fire-and-forget" : "application-ACK",
              (unsigned long)config->ack_timeout_ms, config->max_retries,
+             (unsigned long)config->max_residency_ms,
              config->reflectance_interval_ms == 0 ? "uncapped/" : "latest/",
              (unsigned long)config->reflectance_interval_ms,
              (unsigned)config->pool_length,
@@ -1166,6 +1314,7 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     s_status.source_id = s_config.source_id;
     s_status.mission_id = mission_id;
     s_status.pool_capacity = s_config.pool_length;
+    s_status.max_residency_ms = s_config.max_residency_ms;
     s_accepting = true;
     s_sending = false;
     s_submitters = 0;

@@ -1,5 +1,8 @@
 # A-board serial emulator
 
+For the production bench sequence, including the mandatory MQTT ground-validator
+readiness gate, follow [the emulator flight-test SOP](../../Docs/emulator_test_sop.md).
+
 For a complete takeoff/survey/return/landing mission on COM5, see
 [the flight emulator guide](FLIGHT_EMULATOR.md). The script below remains the
 short milestone regression test.
