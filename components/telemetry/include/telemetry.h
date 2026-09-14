@@ -28,6 +28,10 @@ typedef struct {
     uint8_t max_retries;
     /** Number of retained unacknowledged records allocated in PSRAM. */
     uint16_t pool_length;
+    /** Period of the latest-value reflectance sampler. Production uses
+     * 200 ms (5 Hz). Zero bypasses sampling for dedicated transport stress
+     * firmware; it should not be used by the production application. */
+    uint32_t reflectance_interval_ms;
     /** Emit one compact microsecond timing record per delivery attempt. */
     bool timing_diagnostics;
 } telemetry_config_t;
@@ -45,7 +49,13 @@ typedef struct {
     uint32_t gps_superseded;
     /** GPS records rejected because the shared retained pool was full. */
     uint32_t gps_queue_overflows;
+    /** Valid calculated records offered by the measurement pipeline. */
+    uint32_t reflectance_offered;
+    /** Records admitted by the 5 Hz latest-value sampler. */
     uint32_t reflectance_submitted;
+    /** Older candidates intentionally replaced before their sampling tick.
+     * This is expected downsampling, not delivery degradation. */
+    uint32_t reflectance_rate_limited;
     /** GPS/reflectance "sent" counters mean positively acknowledged complete
      * application messages, preserving the pre-windowing status semantics. */
     uint32_t reflectance_sent;
@@ -101,10 +111,12 @@ esp_err_t telemetry_start(const telemetry_config_t *config);
  */
 esp_err_t telemetry_begin_mission(uint64_t mission_id);
 
-/** GPS and reflectance are nonblocking bounded FIFO submissions backed by one
- * retained PSRAM pool. Neither silently overwrites an older record. A full
- * pool returns ESP_ERR_NO_MEM and counts a dropped live telemetry record
- * without stopping later submissions or SD recording.
+/** GPS and reflectance are nonblocking submissions backed by one retained
+ * PSRAM pool. GPS remains FIFO. Reflectance uses a configured latest-value
+ * sampling period before entering the reliable FIFO; intentional replacement
+ * is counted separately and is not an error. A full pool returns
+ * ESP_ERR_NO_MEM and counts a dropped live telemetry record without stopping
+ * later submissions or SD recording.
  */
 esp_err_t telemetry_submit_gps(const gps_record_t *record);
 esp_err_t telemetry_submit_reflectance(

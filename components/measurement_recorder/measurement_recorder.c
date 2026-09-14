@@ -531,7 +531,9 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"gps_submitted\": %" PRIu32
         ", \"gps_sent\": %" PRIu32 ", \"gps_superseded\": %" PRIu32
         ", \"gps_queue_overflows\": %" PRIu32
+        ", \"reflectance_offered\": %" PRIu32
         ", \"reflectance_submitted\": %" PRIu32
+        ", \"reflectance_rate_limited\": %" PRIu32
         ", \"reflectance_sent\": %" PRIu32
         ", \"reflectance_queue_overflows\": %" PRIu32
         ", \"pool_capacity\": %" PRIu32
@@ -583,7 +585,9 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.shutdown_aborted ? "true" : "false",
         telemetry.gps_submitted, telemetry.gps_sent,
         telemetry.gps_superseded, telemetry.gps_queue_overflows,
+        telemetry.reflectance_offered,
         telemetry.reflectance_submitted,
+        telemetry.reflectance_rate_limited,
         telemetry.reflectance_sent, telemetry.reflectance_queue_overflows,
         telemetry.pool_capacity, telemetry.pool_used,
         telemetry.pool_high_watermark, telemetry.messages_in_flight,

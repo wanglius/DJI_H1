@@ -17,7 +17,7 @@ reassembles them. It never changes timestamps or measurement fields.
   allocated once in PSRAM. Only pointers cross the FreeRTOS ready/free queues.
   A slot remains owned until a matching positive application ACK arrives or a
   shutdown abort deliberately discards it.
-- The caller of the future MQTT publish API enqueues a complete logical message;
+- The caller of the MQTT publish API offers a complete logical message;
   acquisition and calculation tasks must never wait for UART or cellular I/O.
 - Integers are serialized explicitly in little-endian order. Compiler struct
   layout is never written to the wire.
@@ -66,15 +66,22 @@ production publisher will send GPS and reflectance only.
 The `telemetry` component owns UART1 on GPIO17/GPIO18 and is the only task that
 writes application data to the DTU. The measurement recorder gives it finalized
 v01 GPS and reflectance records without ever waiting for UART or cellular I/O.
-Every received 5 Hz GPS record and every reflectance result enters its own FIFO
-while occupying one slot in the shared retained pool. GPS is served first so a
-reflectance/retry backlog cannot age the flight track, but neither stream
-silently overwrites an older accepted record. Pool exhaustion drops and counts
-only the new live-telemetry copy, then accepts later records once
-acknowledgements release slots. It does not latch infrastructure health or
-affect the authoritative SD write. The loss remains visible to the A board as
-mission-level data degradation. A future SD-backed replay service is required
-if every record must reach the broker through an arbitrarily long outage.
+Every received 5 Hz GPS record enters its FIFO. Calculated reflectance remains
+full-rate on SD, while telemetry keeps one latest-value candidate and admits at
+most one candidate every 200 ms (5 Hz) to its reliable FIFO. A newer candidate
+within the same interval intentionally supersedes the older one. This
+rate-limited count is diagnostic, not data-path degradation. The original
+ground timestamp and record sequence remain unchanged, so the receiver can
+identify exactly which calculated records were selected.
+
+GPS is served first so a reflectance/retry backlog cannot age the flight track.
+Once a record enters either reliable FIFO, it is never silently overwritten.
+Pool exhaustion drops and counts only the new live-telemetry copy, then accepts
+later records once acknowledgements release slots. It does not latch
+infrastructure health or affect the authoritative SD write. The loss remains
+visible to the A board as mission-level data degradation. A future SD-backed
+replay service is required if every selected record must reach the broker
+through an arbitrarily long outage.
 
 The task serializes records with the same `data_records` functions used for SD,
 calls `telemetry_fragment_plan_init()` once, then
@@ -92,6 +99,10 @@ Current production policy:
   topic remains QoS 1;
 - every accepted 5 Hz A-to-B GPS record is retained and transmitted in FIFO
   order, with GPS ready records scheduled ahead of reflectance/retry backlog;
+- new reflectance telemetry is selected on a 200 ms mission-monotonic cadence.
+  Each tick admits only the newest unsent calculated record; empty ticks send
+  nothing and missed ticks are not replayed as a burst. `MISSION.JSON` reports
+  offered, admitted, intentionally rate-limited, and acknowledged counts;
 - GPS and reflectance share a 512-entry PSRAM retention pool (roughly 1.6 MiB);
   queue exhaustion is a visible, heartbeat-degrading drop rather than a silent
   overwrite;

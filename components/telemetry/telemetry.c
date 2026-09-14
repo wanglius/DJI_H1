@@ -23,6 +23,7 @@ static const char *TAG = "TELEMETRY";
 #define TELEMETRY_ACK_STREAM_CAPACITY (TELEMETRY_ACK_WIRE_SIZE * 32U)
 #define TELEMETRY_MIN_POOL_LENGTH 16U
 #define TELEMETRY_MAX_POOL_LENGTH 2048U
+#define TELEMETRY_MAX_REFLECTANCE_INTERVAL_MS 60000U
 #define TELEMETRY_POLL_MS 20U
 #define TELEMETRY_UART_TX_TIMEOUT_MS 1000U
 #define TELEMETRY_RECOVERY_RETRY_DELAY_MS 30000U
@@ -36,6 +37,8 @@ static const char *TAG = "TELEMETRY";
 typedef enum {
     ENTRY_FREE = 0,
     ENTRY_FILLING,
+    ENTRY_STAGED,
+    ENTRY_RECLAIMING,
     ENTRY_ENQUEUING,
     ENTRY_QUEUED,
     ENTRY_SENDING,
@@ -93,6 +96,11 @@ static bool s_accepting;
 static bool s_sending;
 static bool s_abort_requested;
 static uint32_t s_submitters;
+/* At most one calculated reflectance waits for the next production sampling
+ * tick. The slot is part of s_pool so shutdown accounting and bounded-memory
+ * guarantees remain identical to queued and in-flight records. */
+static telemetry_entry_t *s_pending_reflectance;
+static int64_t s_next_reflectance_release_us;
 
 /* Only telemetry_task touches these workspaces. A full reflectance record is
  * intentionally kept off the small internal-RAM RTOS stack. */
@@ -269,7 +277,7 @@ static void purge_all_entries(void)
         uint8_t state = s_pool[i].state;
         taskEXIT_CRITICAL(&s_lock);
         if (state != ENTRY_FREE && state != ENTRY_FILLING &&
-            state != ENTRY_ENQUEUING)
+            state != ENTRY_RECLAIMING && state != ENTRY_ENQUEUING)
             release_entry(&s_pool[i]);
     }
 }
@@ -312,6 +320,24 @@ static bool recovery_policy_self_test(void)
            recovery_probe_interval_ms(383, 512) == 200 &&
            recovery_probe_interval_ms(384, 512) == 100 &&
            recovery_probe_interval_ms(512, 512) == 100;
+}
+
+static int64_t advance_reflectance_deadline(int64_t deadline_us,
+                                            int64_t now_us,
+                                            int64_t period_us)
+{
+    if (deadline_us <= 0) return now_us + period_us;
+    if (now_us < deadline_us) return deadline_us;
+    int64_t elapsed_periods = (now_us - deadline_us) / period_us + 1;
+    return deadline_us + elapsed_periods * period_us;
+}
+
+static bool reflectance_sampler_self_test(void)
+{
+    return advance_reflectance_deadline(200, 199, 200) == 200 &&
+           advance_reflectance_deadline(200, 200, 200) == 400 &&
+           advance_reflectance_deadline(200, 601, 200) == 800 &&
+           advance_reflectance_deadline(0, 123, 200) == 323;
 }
 
 static esp_err_t emit_fragment(const uint8_t *fragment, size_t length,
@@ -748,6 +774,51 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
     return result;
 }
 
+/** Move at most one latest-value candidate into the reliable transmit FIFO.
+ * Missed cadence slots are not replayed: a delayed worker advances directly
+ * past them, which prevents a burst from defeating the configured rate cap. */
+static void release_due_reflectance(int64_t now_us)
+{
+    if (s_config.reflectance_interval_ms == 0) return;
+    int64_t period_us = (int64_t)s_config.reflectance_interval_ms * 1000LL;
+    telemetry_entry_t *entry = NULL;
+    bool invalid_state = false;
+
+    taskENTER_CRITICAL(&s_lock);
+    if (s_next_reflectance_release_us > 0 &&
+        now_us >= s_next_reflectance_release_us) {
+        s_next_reflectance_release_us = advance_reflectance_deadline(
+            s_next_reflectance_release_us, now_us, period_us);
+        entry = s_pending_reflectance;
+        if (entry != NULL) {
+            if (entry->state != ENTRY_STAGED) {
+                invalid_state = true;
+                entry = NULL;
+            } else {
+                s_pending_reflectance = NULL;
+                entry->state = ENTRY_ENQUEUING;
+            }
+        }
+    }
+    taskEXIT_CRITICAL(&s_lock);
+
+    if (invalid_state) {
+        note_pool_fault("pending reflectance is not staged");
+        return;
+    }
+    if (entry == NULL) return;
+    if (xQueueSend(s_ready_queue, &entry, 0) == pdTRUE) {
+        taskENTER_CRITICAL(&s_lock);
+        if (entry->state == ENTRY_ENQUEUING)
+            entry->state = ENTRY_QUEUED;
+        s_status.reflectance_submitted++;
+        taskEXIT_CRITICAL(&s_lock);
+        return;
+    }
+    note_pool_fault("ready list overflow while releasing sample");
+    release_entry(entry);
+}
+
 static void telemetry_task(void *unused)
 {
     (void)unused;
@@ -758,6 +829,10 @@ static void telemetry_task(void *unused)
         if (abort_requested()) {
             xQueueReset(s_gps_queue);
             xQueueReset(s_ready_queue);
+            taskENTER_CRITICAL(&s_lock);
+            s_pending_reflectance = NULL;
+            s_next_reflectance_release_us = 0;
+            taskEXIT_CRITICAL(&s_lock);
             purge_all_entries();
             taskENTER_CRITICAL(&s_lock);
             s_sending = false;
@@ -770,7 +845,9 @@ static void telemetry_task(void *unused)
          * duplicate and out-of-order DTA1 frames are matched against all live
          * slots, rather than a single stop-and-wait current message. */
         while (drain_downlink(0)) {}
-        update_expired_entries(esp_timer_get_time());
+        int64_t now_us = esp_timer_get_time();
+        update_expired_entries(now_us);
+        release_due_reflectance(now_us);
 
         /* GPS and ordinary retries precede recovery probes. A due probe
          * precedes new reflectance so continuous acquisition cannot starve old
@@ -870,6 +947,58 @@ static esp_err_t enqueue_reflectance(const reflectance_record_t *record)
     return ESP_ERR_NO_MEM;
 }
 
+static esp_err_t stage_reflectance(const reflectance_record_t *record)
+{
+    telemetry_entry_t *entry = acquire_entry();
+    if (entry == NULL) {
+        taskENTER_CRITICAL(&s_lock);
+        uint32_t dropped = ++s_status.reflectance_queue_overflows;
+        taskEXIT_CRITICAL(&s_lock);
+        if (dropped == 1 || dropped % 100U == 0) {
+            ESP_LOGW(TAG, "Telemetry pool full; reflectance dropped=%lu",
+                     (unsigned long)dropped);
+        }
+        return ESP_ERR_NO_MEM;
+    }
+    entry->record.reflectance = *record;
+
+    telemetry_entry_t *superseded = NULL;
+    bool active;
+    bool invariant_ok = true;
+    taskENTER_CRITICAL(&s_lock);
+    active = s_accepting && !s_abort_requested &&
+             s_status.mission_id != 0;
+    if (active) {
+        superseded = s_pending_reflectance;
+        if (superseded != NULL && superseded->state != ENTRY_STAGED) {
+            invariant_ok = false;
+        } else {
+            entry->message_type = TELEMETRY_MESSAGE_REFLECTANCE;
+            entry->state = ENTRY_STAGED;
+            s_status.pool_used++;
+            if (s_status.pool_used > s_status.pool_high_watermark)
+                s_status.pool_high_watermark = s_status.pool_used;
+            s_pending_reflectance = entry;
+            if (superseded != NULL) {
+                /* RECLAIMING remains pool-owned but tells abort-side cleanup
+                 * that this producer is responsible for returning the slot. */
+                superseded->state = ENTRY_RECLAIMING;
+                s_status.reflectance_rate_limited++;
+            }
+        }
+    }
+    taskEXIT_CRITICAL(&s_lock);
+
+    if (!active || !invariant_ok) {
+        release_entry(entry);
+        if (!invariant_ok)
+            note_pool_fault("invalid latest-reflectance candidate");
+        return !active ? ESP_ERR_INVALID_STATE : ESP_FAIL;
+    }
+    if (superseded != NULL) release_entry(superseded);
+    return ESP_OK;
+}
+
 static void delete_resources(bool driver_installed)
 {
     if (driver_installed) (void)uart_driver_delete(s_config.uart_port);
@@ -892,13 +1021,15 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
         config->ack_timeout_ms == 0 || config->max_retries > 3 ||
         config->pool_length < TELEMETRY_MIN_POOL_LENGTH ||
         config->pool_length > TELEMETRY_MAX_POOL_LENGTH ||
+        config->reflectance_interval_ms >
+            TELEMETRY_MAX_REFLECTANCE_INTERVAL_MS ||
         (config->fragment_gap_ms != 0 &&
          pdMS_TO_TICKS(config->fragment_gap_ms) == 0) ||
         pdMS_TO_TICKS(config->ack_timeout_ms) == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!recovery_policy_self_test()) {
-        ESP_LOGE(TAG, "Telemetry recovery policy self-test failed");
+    if (!recovery_policy_self_test() || !reflectance_sampler_self_test()) {
+        ESP_LOGE(TAG, "Telemetry policy self-test failed");
         return ESP_FAIL;
     }
     if (s_task != NULL) return ESP_ERR_INVALID_STATE;
@@ -961,6 +1092,8 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     s_sending = false;
     s_abort_requested = false;
     s_submitters = 0;
+    s_pending_reflectance = NULL;
+    s_next_reflectance_release_us = 0;
     s_ack_stream_length = 0;
     taskEXIT_CRITICAL(&s_lock);
     if (xTaskCreatePinnedToCore(
@@ -976,13 +1109,16 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
 
     ESP_LOGI(TAG,
              "DTU UART%d TX=GPIO%d RX=GPIO%d %lu 8N1; gap=%lums GPS=FIFO "
-             "source=%016llX ACK=%lums retries=%u; async_pool=%u entries, "
+             "source=%016llX ACK=%lums retries=%u reflectance=%s%lums; "
+             "async_pool=%u entries, "
              "%u bytes PSRAM",
              config->uart_port, config->tx_gpio, config->rx_gpio,
              (unsigned long)config->baud_rate,
              (unsigned long)config->fragment_gap_ms,
              (unsigned long long)config->source_id,
              (unsigned long)config->ack_timeout_ms, config->max_retries,
+             config->reflectance_interval_ms == 0 ? "uncapped/" : "latest/",
+             (unsigned long)config->reflectance_interval_ms,
              (unsigned)config->pool_length,
              (unsigned)(config->pool_length * sizeof(*s_pool)));
     return ESP_OK;
@@ -1004,6 +1140,11 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     }
 
     xQueueReset(s_gps_queue);
+    int64_t first_reflectance_release_us = 0;
+    if (s_config.reflectance_interval_ms != 0) {
+        first_reflectance_release_us = esp_timer_get_time() +
+            (int64_t)s_config.reflectance_interval_ms * 1000LL;
+    }
     taskENTER_CRITICAL(&s_lock);
     /* Power-off is terminal for this boot. Recheck under the publication lock
      * because an abort may arrive after the queue/free-list observations. */
@@ -1028,6 +1169,8 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     s_accepting = true;
     s_sending = false;
     s_submitters = 0;
+    s_pending_reflectance = NULL;
+    s_next_reflectance_release_us = first_reflectance_release_us;
     taskEXIT_CRITICAL(&s_lock);
     return ESP_OK;
 }
@@ -1055,10 +1198,14 @@ esp_err_t telemetry_submit_reflectance(const reflectance_record_t *record)
     }
     taskENTER_CRITICAL(&s_lock);
     bool active = s_task != NULL && s_accepting && s_status.mission_id != 0;
-    if (active) s_submitters++;
+    if (active) {
+        s_submitters++;
+        s_status.reflectance_offered++;
+    }
     taskEXIT_CRITICAL(&s_lock);
     if (!active) return ESP_ERR_INVALID_STATE;
-    esp_err_t result = enqueue_reflectance(record);
+    esp_err_t result = s_config.reflectance_interval_ms == 0
+        ? enqueue_reflectance(record) : stage_reflectance(record);
     taskENTER_CRITICAL(&s_lock);
     s_submitters--;
     taskEXIT_CRITICAL(&s_lock);

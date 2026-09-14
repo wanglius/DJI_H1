@@ -160,7 +160,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "DTU telemetry stress test: 10 s at 148 ms/full spectrum + 5 Hz GPS");
     ESP_LOGI(TAG, "UART1 GPIO17/18 at %u baud, application fragment gap=%u ms",
-             DTU_BAUD_RATE, DTU_FRAGMENT_GAP_MS);
+             DJI_DTU_UART_BAUD_RATE, DJI_DTU_FRAGMENT_GAP_MS);
     ESP_LOGI(TAG, "DTU must already be configured for 460800 baud, 1024-byte packet limit, QoS 0 uplink");
 
     ESP_ERROR_CHECK(esp_psram_is_initialized() ? ESP_OK : ESP_ERR_NOT_FOUND);
@@ -179,6 +179,8 @@ void app_main(void)
         .ack_timeout_ms = ACK_TIMEOUT_MS,
         .max_retries = MAX_RETRIES,
         .pool_length = TELEMETRY_POOL_LENGTH,
+        /* This diagnostic intentionally exercises the uncapped transport. */
+        .reflectance_interval_ms = 0,
         .timing_diagnostics = true,
     };
     ESP_ERROR_CHECK(telemetry_start(&config));

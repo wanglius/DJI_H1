@@ -43,6 +43,11 @@ different or stale message key) and `acknowledgements_negative` (matching ACK
 with a nonzero cloud application status). `shutdown_aborted=true` means live
 telemetry was intentionally cancelled by the prepare-power-off policy so SD
 files could be finalized first; it is not itself a telemetry fault.
+`reflectance_offered` counts calculated records presented to telemetry,
+`reflectance_submitted` counts records selected by the configured live cadence,
+and `reflectance_rate_limited` counts older pending candidates intentionally
+superseded before a sampling tick. Rate limiting is expected and does not make
+`delivery_degraded` true.
 
 The protocol intentionally provides no B-readable flight key: section 4.9 says
 that `session_id` is opaque. The B boot-to-poweroff lifecycle therefore defines
