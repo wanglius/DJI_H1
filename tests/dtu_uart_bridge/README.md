@@ -110,8 +110,9 @@ python tests/dtu_uart_bridge/verify_dtu_mqtt_path.py `
 The verifier sends a unique serial payload through the DTU and confirms it on
 the configured uplink topic. It then publishes a different unique payload to
 the downlink topic and confirms the same bytes arrive on the serial port.
-Use `--uplink-bytes 3172` to exercise one full-size v01 reflectance record's
-payload volume. Because the DTU packetizer is capped at 1024 bytes, the verifier
+Use `--uplink-bytes 2233` to exercise the current 711-sample v01 reflectance
+payload volume, or `--uplink-bytes 3172` for the schema's 1024-sample maximum.
+Because the DTU packetizer is capped at 1024 bytes, the verifier
 reassembles consecutive MQTT payloads and reports their count while requiring
 the configured uplink QoS (QoS 1 by default). Its downlink payload defaults to
 QoS 0, matching the production DTA1 path; use `--downlink-qos 1` only for a
@@ -123,12 +124,12 @@ through the hardware path, run:
 ```powershell
 python tests/dtu_uart_bridge/verify_fragmented_telemetry.py `
     --serial-port COM6 --host mqtt.example.com --mqtt-port 1883 `
-    --username device_test --message-bytes 3172
+    --username device_test --message-bytes 2233
 ```
 
-This sends the four bounded application fragments separately, recovers them
-even if the DTU changes their MQTT boundaries, and requires the final payload
-to match the source byte-for-byte. The MQTT receiver runs concurrently so QoS
+This sends the current record's three bounded application fragments separately,
+recovers them even if the DTU changes their MQTT boundaries, and requires the
+final payload to match the source byte-for-byte. The MQTT receiver runs concurrently so QoS
 1 acknowledgements are not delayed while the serial burst is being generated.
 For a paced comparison test, add `--message-count 12 --fragment-gap-ms 100`.
 Production uses a zero application-level gap: DTF2 provides the logical-message

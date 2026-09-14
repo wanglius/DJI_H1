@@ -36,9 +36,10 @@ static int64_t reserve_shutdown_time(int64_t deadline_us, int64_t reserve_us)
 }
 
 /* Error mapping is B-defined: 1 SD, 2 initialization, 3 acquisition/lifecycle,
- * 4 shutdown, 5 measurement-data degradation (decode failures, recorder
- * pressure drops, rejected calculations, telemetry delivery degradation or
- * infrastructure failure, or conflicting A identities). */
+ * 4 shutdown, 5 measurement/data-delivery degradation (acquisition errors,
+ * recorder pressure drops, rejected calculations, telemetry loss or
+ * infrastructure failure, or conflicting A identities). Protocol CRC/timeout
+ * events are logged separately and do not currently latch this status. */
 static bool known_session(uint32_t session)
 {
     size_t count = s_session_count < SESSION_LIMIT ? s_session_count : SESSION_LIMIT;

@@ -15,8 +15,9 @@ reassembles them. It never changes timestamps or measurement fields.
 - The ESP32 implementation performs no per-message allocation. A configurable
   shared GPS/reflectance pool (512 entries in the production board profile) is
   allocated once in PSRAM. Only pointers cross the FreeRTOS ready/free queues.
-  A slot remains owned until a matching positive application ACK arrives or a
-  shutdown abort deliberately discards it.
+  A slot remains owned until a matching application disposition, the 10-second
+  production residency deadline, a permanent local failure, or a shutdown
+  abort releases it.
 - The caller of the MQTT publish API offers a complete logical message;
   acquisition and calculation tasks must never wait for UART or cellular I/O.
 - Integers are serialized explicitly in little-endian order. Compiler struct
@@ -54,8 +55,10 @@ the header and fragment payload.
 | variable | 4 | Fragment CRC-32 |
 
 The 976-byte maximum follows from `1024 - 44 - 4`. A 98-byte GPS record uses
-one 146-byte fragment. A 3172-byte reflectance record uses four fragments with
-wire sizes `1024, 1024, 1024, 292`.
+one 146-byte fragment. The current 711-sample reflectance record is 2233 bytes
+and uses three fragments with wire sizes `1024, 1024, 329`. The schema maximum
+of 1024 samples is 3172 bytes and uses four fragments with wire sizes
+`1024, 1024, 1024, 292`.
 
 Message-type values intentionally match the existing measurement record types:
 GPS `1`, raw spectrum `2`, reflectance `3`, and operation log `4`. The initial
