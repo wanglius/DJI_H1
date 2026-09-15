@@ -171,7 +171,9 @@ static esp_err_t h1_receive_packet(
     uint8_t *buffer,
     size_t buffer_size,
     size_t *packet_length,
-    uint32_t timeout_ms)
+    uint32_t timeout_ms,
+    h1_cancel_requested_fn cancel_requested,
+    void *cancel_context)
 {
     if (dev == NULL ||
         buffer == NULL ||
@@ -192,6 +194,10 @@ static esp_err_t h1_receive_packet(
 
 
     while (esp_timer_get_time() < deadline_us) {
+
+        if (cancel_requested != NULL && cancel_requested(cancel_context)) {
+            return ESP_ERR_INVALID_STATE;
+        }
 
         uint8_t level = 0;
 
@@ -780,7 +786,9 @@ esp_err_t h1_get_device_info(
             response,
             sizeof(response),
             &response_length,
-            1000
+            1000,
+            NULL,
+            NULL
         );
 
     if (ret != ESP_OK) {
@@ -892,7 +900,9 @@ esp_err_t h1_set_exposure_mode(
             response,
             sizeof(response),
             &response_length,
-            1000
+            1000,
+            NULL,
+            NULL
         );
 
     if (ret != ESP_OK) {
@@ -992,7 +1002,9 @@ esp_err_t h1_get_exposure_mode(
             response,
             sizeof(response),
             &response_length,
-            1000
+            1000,
+            NULL,
+            NULL
         );
 
     if (ret != ESP_OK) {
@@ -1122,7 +1134,9 @@ esp_err_t h1_get_single_spectrum(
             response,
             rx_buffer_size,
             &response_length,
-            7000
+            7000,
+            NULL,
+            NULL
         );
 
     if (ret != ESP_OK) {
@@ -1434,6 +1448,17 @@ esp_err_t h1_read_stream_frame(
     h1_spectrum_frame_t *frame,
     uint32_t timeout_ms)
 {
+    return h1_read_stream_frame_interruptible(
+        dev, frame, timeout_ms, NULL, NULL);
+}
+
+esp_err_t h1_read_stream_frame_interruptible(
+    h1_device_t *dev,
+    h1_spectrum_frame_t *frame,
+    uint32_t timeout_ms,
+    h1_cancel_requested_fn cancel_requested,
+    void *cancel_context)
+{
     if (dev == NULL ||
         frame == NULL) {
 
@@ -1457,7 +1482,9 @@ esp_err_t h1_read_stream_frame(
             dev->rx_packet,
             sizeof(dev->rx_packet),
             &response_length,
-            timeout_ms
+            timeout_ms,
+            cancel_requested,
+            cancel_context
         );
 
 

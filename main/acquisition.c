@@ -137,6 +137,13 @@ static const char *status_name(uint8_t status)
     }
 }
 
+static bool acquisition_read_cancelled(void *argument)
+{
+    sensor_context_t *ctx = (sensor_context_t *)argument;
+    return !__atomic_load_n(&ctx->run, __ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE);
+}
+
 static void acquisition_task(void *arg)
 {
     sensor_context_t *ctx = (sensor_context_t *)arg;
@@ -151,10 +158,14 @@ static void acquisition_task(void *arg)
 
     while (__atomic_load_n(&ctx->run, __ATOMIC_ACQUIRE)) {
         int64_t receive_start_us = esp_timer_get_time();
-        esp_err_t ret = h1_read_stream_frame(
-            &ctx->device, &ctx->frame, FRAME_TIMEOUT_MS
+        esp_err_t ret = h1_read_stream_frame_interruptible(
+            &ctx->device, &ctx->frame, FRAME_TIMEOUT_MS,
+            acquisition_read_cancelled, ctx
         );
         int64_t now_us = esp_timer_get_time();
+        /* A completed frame racing with STOP is intentionally discarded. Raw
+         * admission must become finite as soon as terminal shutdown begins. */
+        if (acquisition_read_cancelled(ctx)) break;
         if (ret != ESP_OK) {
             ctx->frame_errors++;
             taskENTER_CRITICAL(&s_status_lock);

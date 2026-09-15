@@ -79,6 +79,10 @@ typedef struct {
 
 } h1_spectrum_frame_t;
 
+/** Cooperative cancellation predicate for a blocking stream-frame receive.
+ * It is called from the reader task and must be nonblocking. */
+typedef bool (*h1_cancel_requested_fn)(void *context);
+
 
 esp_err_t h1_init(
     h1_device_t *dev,
@@ -124,6 +128,18 @@ esp_err_t h1_read_stream_frame(
     h1_device_t *dev,
     h1_spectrum_frame_t *frame,
     uint32_t timeout_ms
+);
+
+/** Read one stream frame while allowing the lifecycle owner to cancel the
+ * in-progress receive. Cancellation preserves the partial packet only until
+ * this call returns and reports ESP_ERR_INVALID_STATE; the owner must then
+ * stop the stream through the normal ordered cleanup path. */
+esp_err_t h1_read_stream_frame_interruptible(
+    h1_device_t *dev,
+    h1_spectrum_frame_t *frame,
+    uint32_t timeout_ms,
+    h1_cancel_requested_fn cancel_requested,
+    void *cancel_context
 );
 
 esp_err_t h1_stop_stream(
