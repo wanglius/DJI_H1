@@ -41,7 +41,9 @@ _Static_assert(sizeof(record_time_t) == 32, "record_time_t must be 32 bytes");
 esp_err_t clock_sync_init(void);
 
 /** Nonblocking producer API for the A-board UART task. b_receive_us denotes
- * completion of the CRC-verified realtime frame, not its first UART byte. */
+ * completion of the CRC-verified realtime frame, not its first UART byte.
+ * a_monotonic_ms is the position-sample time; repeated values are deliberately
+ * ignored by the estimator and do not refresh synchronization age. */
 esp_err_t clock_sync_submit(const ab_realtime_data_t *data,
                             int64_t b_receive_us);
 

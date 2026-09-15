@@ -670,7 +670,7 @@ utc_ms = utc_sec × 1000 + utc_msec
 
 任务目录创建时通常还没有 UTC。`MISSION.JSON` 会在第一次得到有效投影时冻结任务起始 UTC，并保存 `started_sync_generation`；以后同步模型即使重建，也不会用新 generation 静默改写起始时间。更新时间则同时保存自己的 `updated_sync_generation`，允许两者不同。
 
-每个实时数据包到达 B 板 UART 时提交一条时间观测。系统只在每个锁定 generation 中设置一次 POSIX 墙钟，避免反复调整系统时间。
+每个实时数据包到达 B 板 UART 时尝试提交时间观测，但协议中的 `mono_ms` 是经纬度采样时刻而不是报文发送时刻。相同 `mono_ms` 的重复定位报文仍照常写入 GPS 文件并进入遥测，时间拟合器则忽略它们，且不刷新同步年龄；这避免合法的旧定位复用被误判成时钟跳变。不同定位样本从采样到发送仍可能有可变延迟，因此现有 A/B 映射属于受延迟限制的估计；若后续要求精密同步，协议必须增加明确的报文发送时间戳或独立授时交互。系统只在每个锁定 generation 中设置一次 POSIX 墙钟，避免反复调整系统时间。
 
 协议没有 PPS，因此绝对 UTC 精度预计只能达到约 ±100–200 ms，不能宣称亚毫秒同步。科学数据中的 `utc_ms` 始终是 Unix UTC 毫秒。任务本地时区由 `CONFIG_DJI_H1_TIMEZONE_NAME` 与 `CONFIG_DJI_H1_TIMEZONE_OFFSET_MINUTES` 配置，默认 `Asia/Shanghai`、UTC+08:00；`MISSION.JSON` 保存该配置，`EVENTS.JSONL` 每条事件也保存名称和分钟偏移。FAT 时间戳只有 2 s 分辨率且不携带时区，因此固件按该固定偏移写入本地日历字段，使同一时区的 Windows 正确显示修改时间。
 

@@ -62,6 +62,12 @@ typedef struct {
     bool utc_valid;
 } sync_snapshot_t;
 
+typedef enum {
+    A_TIME_FORWARD,
+    A_TIME_REPEATED,
+    A_TIME_BACKWARD,
+} a_time_order_t;
+
 static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
 static portMUX_TYPE s_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -118,6 +124,14 @@ static void publish(const sync_snapshot_t *snapshot)
     taskEXIT_CRITICAL(&s_snapshot_lock);
 }
 
+static a_time_order_t classify_a_time(uint32_t previous, uint32_t current)
+{
+    uint32_t delta = current - previous;
+    if (delta == 0) return A_TIME_REPEATED;
+    if (delta > UINT32_MAX / 2U) return A_TIME_BACKWARD;
+    return A_TIME_FORWARD;
+}
+
 static bool extend_a_time(uint32_t raw, uint64_t *extended)
 {
     if (!s_have_raw) {
@@ -126,7 +140,8 @@ static bool extend_a_time(uint32_t raw, uint64_t *extended)
         s_extended_ms = raw;
     } else {
         uint32_t delta = raw - s_last_raw;
-        if (delta > UINT32_MAX / 2U) return false; /* Backward jump/A reset. */
+        if (classify_a_time(s_last_raw, raw) == A_TIME_BACKWARD)
+            return false; /* Backward jump/A reset. */
         s_extended_ms += delta; /* Correct across the uint32 forward wrap. */
         s_last_raw = raw;
     }
@@ -252,6 +267,14 @@ static bool utc_discontinuous(const sync_snapshot_t *model,
 static void process_observation(sync_snapshot_t *model,
                                 const sync_observation_t *observation)
 {
+    /* Protocol mono_ms is the position sample time, not the realtime frame's
+     * transmission time. A may legitimately repeat the same still-valid
+     * position in later frames. Those frames remain available to the GPS
+     * recorder, but must neither bias this fit nor refresh its age. */
+    if (s_have_raw &&
+        classify_a_time(s_last_raw, observation->a_raw_ms) == A_TIME_REPEATED)
+        return;
+
     uint64_t extended;
     if (!extend_a_time(observation->a_raw_ms, &extended)) {
         reset_estimator(model, "A monotonic timer moved backward");
@@ -414,9 +437,15 @@ esp_err_t clock_sync_self_test(void)
     const uint16_t milliseconds = 999U;
     uint64_t utc = (uint64_t)seconds * 1000ULL + milliseconds;
     if (utc != 1767225600999ULL || sizeof(record_time_t) != 32) return ESP_FAIL;
-    /* Unsigned subtraction is the documented forward-wrap extension rule. */
+    /* Sample ordering must distinguish a repeated navigation sample from a
+     * new timing observation while retaining normal uint32 forward wrap. */
+    if (classify_a_time(1000U, 1000U) != A_TIME_REPEATED ||
+        classify_a_time(1000U, 1200U) != A_TIME_FORWARD ||
+        classify_a_time(1200U, 1000U) != A_TIME_BACKWARD)
+        return ESP_FAIL;
     uint32_t before = UINT32_MAX - 99U, after = 100U;
-    if ((uint32_t)(after - before) != 200U) return ESP_FAIL;
+    if ((uint32_t)(after - before) != 200U ||
+        classify_a_time(before, after) != A_TIME_FORWARD) return ESP_FAIL;
     sync_snapshot_t model = {.utc_valid = true, .utc_offset_ms = 1000000};
     if (utc_discontinuous(&model, 1000, 1001000) ||
         !utc_discontinuous(&model, 1000, 1002500)) return ESP_FAIL;

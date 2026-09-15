@@ -19,7 +19,9 @@ during a temporary A-to-B link interruption, or if the A-board clock restarts.
 
 - B monotonic microseconds from `esp_timer_get_time()` are always authoritative
   for local ordering.
-- A `uint32_t mono_ms` is extended across forward wrap to a 64-bit timeline.
+- A `uint32_t mono_ms` is the latitude/longitude sample time, not the realtime
+  frame transmission time, and is extended across forward wrap to a 64-bit
+  timeline.
 - Valid A `utc_sec` and `utc_msec` are combined as
   `uint64_t(utc_sec) * 1000 + utc_msec` and correlated through A monotonic time.
 
@@ -34,12 +36,15 @@ submits a small observation without blocking. This prevents timekeeping from
 delaying UART parsing, heartbeat transmission or acquisition. A priority-6
 clock task consumes the queue and:
 
-1. Extends the A-board 32-bit monotonic counter across normal rollover.
-2. Maintains a 32-sample linear fit between A milliseconds and B microseconds.
-3. Uses the median observed UTC offset to reject individual timing outliers.
-4. Rejects fit residuals over 50 ms and UTC-offset jumps over one second.
-5. Publishes a compact snapshot that record producers can read safely.
-6. Sets the POSIX wall clock once when a UTC-valid generation reaches `LOCKED`.
+1. Discards repeated `mono_ms` values from the clock fit without discarding the
+   corresponding GPS records. A repeated position sample is not a new timing
+   observation and does not refresh synchronization age.
+2. Extends each new A-board 32-bit monotonic value across normal rollover.
+3. Maintains a 32-sample linear fit between A milliseconds and B microseconds.
+4. Uses the median observed UTC offset to reject individual timing outliers.
+5. Rejects fit residuals over 50 ms and UTC-offset jumps over one second.
+6. Publishes a compact snapshot that record producers can read safely.
+7. Sets the POSIX wall clock once when a UTC-valid generation reaches `LOCKED`.
 
 A backward A timer jump, as opposed to a normal unsigned rollover, resets the
 model and begins a new synchronization generation.
@@ -125,6 +130,10 @@ of an already recorded `utc_ms` value.
 - A short link outage enters holdover, allowing explicitly marked extrapolation.
 - A long outage invalidates correlated A and UTC values.
 - A timer reset, implausible fit or large UTC discontinuity starts a new model.
+- Distinct navigation samples are still correlated with frame receive time, so
+  variable A-side sampling-to-transmission latency limits absolute A/B accuracy.
+  A future protocol revision needs an explicit frame-transmission timestamp or
+  dedicated timing exchange for precision synchronization.
 - No synchronization failure may stop the independent 1 Hz heartbeat task.
 
 ## Current scope
