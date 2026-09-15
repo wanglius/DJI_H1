@@ -291,7 +291,6 @@ static void control_task(void *unused)
          * otherwise its capacity refresh would touch an already unmounted SD.
          * Retained active resources on failure must never qualify as safe. */
         bool shutdown = s_power_off && !s_pending && !s_busy && !s_safe;
-        bool healthy = s_error == 0;
         int64_t shutdown_deadline_us = s_shutdown_deadline_us;
         taskEXIT_CRITICAL(&s_lock);
         if (shutdown) {
@@ -301,7 +300,11 @@ static void control_task(void *unused)
             if (result == ESP_OK && sd_card_is_mounted())
                 result = sd_card_unmount();
             taskENTER_CRITICAL(&s_lock);
-            s_safe = healthy && result == ESP_OK;
+            /* safe_power_off reports physical persistence safety, not whether
+             * the completed mission was fault-free. Preserve any earlier
+             * subsystem error in b_state/error_code while allowing A to cut
+             * power once every file is closed and the card is unmounted. */
+            s_safe = result == ESP_OK;
             if (result != ESP_OK) s_error = 4;
             taskEXIT_CRITICAL(&s_lock);
             ESP_LOGI(TAG, "Shutdown complete: safe=%u result=%s", s_safe,

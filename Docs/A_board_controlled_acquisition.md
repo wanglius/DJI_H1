@@ -34,9 +34,11 @@ is retained for that standalone bench harness; duration zero is command-driven.
   in-progress telemetry, cancels acquisition, drains/closes the authoritative SD
   files, and unmounts SD. The received grace value is enforced as an absolute
   monotonic deadline for task/barrier waits; repeated requests cannot extend it.
-  Safe=1 requires successful cleanup, no latched lifecycle failure, and
-  successful unmount. A owns the physical power switch. Software never claims
-  safety merely because the grace period expired.
+  Safe=1 requires successful cleanup and unmount. A prior mission or subsystem
+  fault remains reported through `b_state`/`error_code`, but does not prevent
+  the independent persistence-safety flag once every file is closed. A owns
+  the physical power switch. Software never claims safety merely because the
+  grace period expired.
 - Raw and reflectance files drain, synchronize, and close before unmount.
 
 ## Heartbeat meaning
@@ -48,7 +50,7 @@ is retained for that standalone bench harness; duration zero is command-driven.
 | frame_count | Successful ground spectra in the current acquisition session |
 | session_id | Accepted session during preparation/run/cleanup; zero after completion |
 | storage_free_pct | FAT free/total bytes, measured at initialization and after each run |
-| safe_power_off | Actual cleanup/unmount completion, never a synthetic timer |
+| safe_power_off | Actual cleanup/unmount completion, independent of prior mission health and never a synthetic timer |
 
 Capacity is cached outside the UART task and refreshed after each run. Error codes are
 B-defined: 1=SD initialization/capacity, 2=bridge/H1 initialization,
