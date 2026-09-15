@@ -43,9 +43,9 @@ typedef struct {
      * delivery cannot turn the pool into an ever-older backlog. Zero disables
      * expiry and is intended only for dedicated transport diagnostics. */
     uint32_t max_residency_ms;
-    /** Period of the latest-value reflectance sampler. Production uses
-     * 500 ms (2 Hz). Zero bypasses sampling for dedicated transport stress
-     * firmware; it should not be used by the production application. */
+    /** Period of the latest-value reflectance sampler. The board profile owns
+     * the qualified production value. Zero bypasses sampling for dedicated
+     * transport stress firmware; production must use a nonzero interval. */
     uint32_t reflectance_interval_ms;
     /** Maximum GPS records per telemetry-only DGB1 batch. */
     uint16_t gps_batch_max_records;

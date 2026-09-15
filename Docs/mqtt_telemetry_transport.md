@@ -109,7 +109,7 @@ individual DHR1 copy continues independently to GPS_TRACK.BIN. A batch seals at
 ten records, two seconds after its first record, or at a metadata/mission
 boundary. Calculated reflectance remains
 full-rate on SD, while telemetry keeps one latest-value candidate and admits at
-most one candidate every 500 ms (2 Hz) to its reliable FIFO. A newer candidate
+most one candidate every 250 ms (4 Hz) to its reliable FIFO. A newer candidate
 within the same interval intentionally supersedes the older one. This
 rate-limited count is diagnostic, not data-path degradation. The original
 ground timestamp and record sequence remain unchanged, so the receiver can
@@ -150,7 +150,7 @@ Current production policy:
   batch. Production seals at 10 records or 2000 ms, whichever occurs first;
   partial batches also seal at session/segment changes and orderly mission
   finish. GPS batches remain ahead of reflectance/retry backlog;
-- new reflectance telemetry is selected on a 500 ms mission-monotonic cadence.
+- new reflectance telemetry is selected on a 250 ms mission-monotonic cadence.
   Each tick admits only the newest unsent calculated record; empty ticks send
   nothing and missed ticks are not replayed as a burst. `MISSION.JSON` reports
   offered, admitted, intentionally rate-limited, and acknowledged counts;
@@ -257,16 +257,25 @@ an integrity mechanism.
 
 ### Qualified production rate
 
-The 2026-09-14 controlled bridge tests used the real 98-byte GPS and 2233-byte,
-711-sample reflectance payload sizes, GPS at 5 Hz, QoS 1, zero application gap,
-and a 460800-baud DTU UART. A 60-second 2 Hz reflectance run followed by a
-60-second drain delivered all 300 GPS and 120 reflectance messages; reflectance
-p95 latency was 485 ms. A 2.5 Hz bridge run delivered every message, but its p95
-latency rose to 1438 ms; a subsequent 10-minute full-stack mission exposed ACK
-latency above the 3-second retry deadline and delivered only 537 of 805 selected
-reflectance records. At 3 Hz, GPS delivery fell to 83.3% and reflectance to 65%
-despite the full drain. Production therefore uses the conservative 2 Hz rate
-(one latest candidate every 500 ms) pending long-duration field qualification.
+The 2026-09-14 controlled bridge tests used one DTF2 message per 98-byte GPS
+record together with real 2233-byte, 711-sample reflectance payloads, QoS 1,
+zero application gap, and a 460800-baud DTU UART. Although a 60-second 2 Hz run
+delivered all messages, 2.5 Hz and 3 Hz tests exposed multi-second ACK latency
+and long-run loss. Those results describe the obsolete per-GPS-message traffic
+pattern, not the current DGB1 sender.
+
+After DGB1 reduced GPS message/ACK count by about 90%, production was qualified
+again on 2026-09-15. In the decisive ten-minute full-stack run, the H1 ground
+source sustained about 6.5--6.7 Hz through four acquisition segments while the
+latest-value sampler admitted 1277 records over 324 active seconds (about
+3.94 Hz). The ground validator received and ACKed all 1277 reflectance records
+and all 2910 GPS source records in 295 DGB1 batches. Reflectance ACK RTT was
+286 ms average, 404 ms p95, and 779 ms maximum; retained-pool occupancy peaked
+at 7 of 512. There were no telemetry timeouts, retries, expirations, overflows,
+or incomplete reassemblies, and the mission ended with `inflight=0` and
+`buffered=0`. The qualified production rate is therefore 4 Hz (one latest
+candidate every 250 ms). This remains subject to requalification with the real
+A board and the cellular conditions of the deployment area.
 
 ## Receiver contract
 

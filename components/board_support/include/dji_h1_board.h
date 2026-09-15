@@ -44,11 +44,10 @@
  * DGB1 telemetry message. GPS_TRACK.BIN remains individual DHR1 records. */
 #define DJI_DTU_GPS_BATCH_MAX_RECORDS 10
 #define DJI_DTU_GPS_BATCH_MAX_DELAY_MS 2000
-/* Select the newest calculated reflectance at each 500 ms cadence (2 Hz).
- * A full-stack 2.5 Hz mission exposed application-ACK congestion, so 2 Hz is
- * the conservative field baseline. Calculated and raw spectra remain
- * full-rate on the SD card. */
-#define DJI_DTU_REFLECTANCE_INTERVAL_MS 500
+/* Qualified 4 Hz latest-value telemetry cadence. DGB1 batching leaves enough
+ * transport headroom for this rate while the SD recording path remains full
+ * rate and independent. */
+#define DJI_DTU_REFLECTANCE_INTERVAL_MS 250
 
 #ifdef CONFIG_DJI_H1_TELEMETRY_TIMING_DIAGNOSTICS
 #define DJI_DTU_TIMING_DIAGNOSTICS true
