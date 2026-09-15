@@ -14,5 +14,5 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "."
     REQUIRES ab_protocol calculation clock_sync data_records drone_data
-             telemetry_transport
+             gps_batch telemetry_transport
 )

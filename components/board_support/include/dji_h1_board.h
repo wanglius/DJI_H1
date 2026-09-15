@@ -40,6 +40,10 @@
 /* Preserve the normal 3 s + 6 s acknowledgement/retry window, then prefer
  * fresh flight data over retaining an obsolete cloud-delivery backlog. */
 #define DJI_DTU_MAX_RESIDENCY_MS 10000
+/* Combine two seconds of the 5 Hz A-board navigation stream into one compact
+ * DGB1 telemetry message. GPS_TRACK.BIN remains individual DHR1 records. */
+#define DJI_DTU_GPS_BATCH_MAX_RECORDS 10
+#define DJI_DTU_GPS_BATCH_MAX_DELAY_MS 2000
 /* Select the newest calculated reflectance at each 500 ms cadence (2 Hz).
  * A full-stack 2.5 Hz mission exposed application-ACK congestion, so 2 Hz is
  * the conservative field baseline. Calculated and raw spectra remain

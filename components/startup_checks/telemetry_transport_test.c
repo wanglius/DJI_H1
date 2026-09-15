@@ -2,7 +2,9 @@
 
 #include <string.h>
 
+#include "data_records.h"
 #include "esp_log.h"
+#include "gps_batch.h"
 #include "telemetry_transport.h"
 
 static const char *TAG = "TELEM_TEST";
@@ -123,6 +125,66 @@ esp_err_t telemetry_transport_self_test(void)
               &plan, 0, fragment, gps_wire_length - 1, &gps_wire_length) ==
               ESP_ERR_INVALID_SIZE,
           "small output rejection");
+
+    static gps_batch_t batch;
+    static uint8_t batch_wire[GPS_BATCH_WIRE_SIZE(GPS_BATCH_MAX_RECORDS)];
+    gps_batch_reset(&batch);
+    for (uint32_t index = 0; index < GPS_BATCH_MAX_RECORDS; index++) {
+        gps_record_t record = {0};
+        record_time_t timestamp = {
+            .b_monotonic_us = UINT64_C(1000000) + index * 200000U,
+            .a_monotonic_ms = 5000U + index * 200U,
+            .utc_ms = UINT64_C(1789430400000) + index * 200U,
+            .sync_age_ms = index,
+            .sync_generation = 2,
+            .sync_state = CLOCK_SYNC_LOCKED,
+            .valid_flags = RECORD_TIME_VALID_B_MONOTONIC |
+                           RECORD_TIME_VALID_A_MONOTONIC |
+                           RECORD_TIME_VALID_UTC,
+        };
+        data_record_header_init(&record.header, DATA_RECORD_GPS,
+                                GPS_RECORD_WIRE_SIZE, index + 10U,
+                                7, 3, &timestamp);
+        record.protocol_sequence = (uint8_t)(0x80U + index);
+        record.data.latitude_e7 = 311234567 + (int32_t)index;
+        record.data.longitude_e7 = 1211234567 + (int32_t)index;
+        record.data.altitude_relative_mm = 120000 + (int32_t)index;
+        record.data.utc_seconds = 1789430400U;
+        record.data.a_monotonic_ms = 5000U + index * 200U;
+        record.data.utc_milliseconds = (uint16_t)(index * 200U % 1000U);
+        record.data.valid_flags = 0x0FU;
+        CHECK(gps_batch_append(&batch, &record) == ESP_OK,
+              "GPS batch append");
+    }
+    CHECK(gps_batch_is_full(&batch, GPS_BATCH_MAX_RECORDS) &&
+              gps_batch_message_sequence(&batch) == 10U,
+          "GPS batch identity");
+    size_t batch_length = 0;
+    CHECK(gps_batch_serialize(&batch, batch_wire, sizeof(batch_wire),
+                              &batch_length) == ESP_OK &&
+              batch_length == 744U &&
+              batch_length <= TELEMETRY_FRAGMENT_PAYLOAD_MAX,
+          "ten-record GPS batch fits one fragment");
+    gps_batch_view_t batch_view;
+    CHECK(gps_batch_decode(batch_wire, batch_length, &batch_view) == ESP_OK &&
+              batch_view.record_count == GPS_BATCH_MAX_RECORDS,
+          "GPS batch decode");
+    for (uint16_t index = 0; index < GPS_BATCH_MAX_RECORDS; index++) {
+        uint8_t reconstructed[GPS_RECORD_WIRE_SIZE];
+        uint8_t canonical[GPS_RECORD_WIRE_SIZE];
+        size_t canonical_length = 0;
+        CHECK(gps_batch_decode_record(&batch_view, index, reconstructed) ==
+                  ESP_OK &&
+                  data_record_serialize_gps(&batch.records[index], canonical,
+                      sizeof(canonical), &canonical_length) == ESP_OK &&
+                  canonical_length == sizeof(canonical) &&
+                  memcmp(reconstructed, canonical, sizeof(canonical)) == 0,
+              "GPS batch lossless reconstruction");
+    }
+    batch_wire[batch_length - 1U] ^= 1U;
+    CHECK(gps_batch_decode(batch_wire, batch_length, &batch_view) ==
+              ESP_ERR_INVALID_CRC,
+          "GPS batch CRC rejection");
 
     telemetry_ack_t expected_ack = {
         .source_id = UINT64_C(0x123456789ABC),

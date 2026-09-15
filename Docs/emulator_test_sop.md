@@ -125,8 +125,12 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
   --username DJI_H1_001 `
   --topic dji-h1/test/up --ack-topic dji-h1/test/down `
   --duration 120 --expect-qos 1 --ack-qos 0 `
-  --expect-gps-min 200 --expect-reflectance-min 40
+  --expect-gps-min 200 --expect-reflectance-min 30
 ```
+
+The normal scenario contains only about 19 seconds of active acquisition split
+across two segments. At the production 2 Hz reflectance cap, 30 is a meaningful
+lower bound; 40 would exceed what this mission can normally select for uplink.
 
 The validator connects two clients, waits for the uplink SUBACK, and pings both
 connections. Uplink measurement records remain QoS 1. DTA1 acknowledgements
@@ -135,7 +139,7 @@ application ACK is lost; this prevents broker PUBACK latency from blocking the
 receive loop. Only then does the validator print:
 
 ```text
-TELEMETRY READY host=mqtt-mgnt.torchbearer.tech:1883 topic=dji-h1/test/up ack_topic=dji-h1/test/down uplink_qos=1 ack_qos=0
+TELEMETRY READY host=mqtt-mgnt.torchbearer.tech:1883 topic=dji-h1/test/up ack_topic=dji-h1/test/down uplink_qos=1 ack=qos0
 ```
 
 This exact line is the ground-system readiness indication. Confirm that the
@@ -179,15 +183,16 @@ different program during the run.
 
 During the mission, verify that:
 
-- the validator continuously prints `GPS` records and prints `REFLECTANCE`
-  records during acquisition segments;
+- the validator continuously prints `GPS_BATCH` messages (or counts their
+  reconstructed GPS records in quiet mode) and prints `REFLECTANCE` records
+  during acquisition segments;
 - the flight runner continues to receive 1 Hz heartbeats;
 - there is no `TELEMETRY INVALID`, MCU panic, watchdog, or unexpected reboot;
 - a temporary telemetry backlog recovers instead of growing without bound;
 - expected endurance incidents are reported by the emulator and recovered.
 
 Do not judge telemetry health from MQTTX alone. A message visible in MQTTX has
-reached that subscriber, but it has not necessarily passed DTF2/DHR1 validation
+reached that subscriber, but it has not necessarily passed DTF2/DGB1/DHR1 validation
 or received a DTA1 acknowledgement.
 
 If the ground validator stops during flight:

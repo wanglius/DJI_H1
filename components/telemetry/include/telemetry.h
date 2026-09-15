@@ -47,6 +47,11 @@ typedef struct {
      * 500 ms (2 Hz). Zero bypasses sampling for dedicated transport stress
      * firmware; it should not be used by the production application. */
     uint32_t reflectance_interval_ms;
+    /** Maximum GPS records per telemetry-only DGB1 batch. */
+    uint16_t gps_batch_max_records;
+    /** Seal a partial GPS batch this long after its first record was admitted.
+     * This bounds live-position latency even if the 5 Hz source pauses. */
+    uint32_t gps_batch_max_delay_ms;
     /** Emit one compact microsecond timing record per delivery attempt. */
     bool timing_diagnostics;
 } telemetry_config_t;
@@ -58,7 +63,13 @@ typedef struct {
     bool healthy;
     uint64_t source_id;
     uint64_t mission_id;
+    uint16_t gps_batch_max_records;
+    uint32_t gps_batch_max_delay_ms;
     uint32_t gps_submitted;
+    /** DGB1 messages admitted to the reliable transmit queue. */
+    uint32_t gps_batches_submitted;
+    /** Submitted DGB1 messages containing fewer than gps_batch_max_records. */
+    uint32_t gps_partial_batches;
     uint32_t gps_sent;
     /** Retained for mission-summary compatibility; FIFO GPS never supersedes. */
     uint32_t gps_superseded;
@@ -66,6 +77,11 @@ typedef struct {
     uint32_t gps_queue_overflows;
     /** GPS records deliberately discarded after exceeding max_residency_ms. */
     uint32_t gps_expired;
+    uint32_t gps_batches_sent;
+    uint32_t gps_batches_expired;
+    /** GPS source records contained in pool entries deliberately abandoned by
+     * the terminal shutdown forecast. */
+    uint32_t gps_records_abandoned_shutdown;
     /** Valid calculated records offered by the measurement pipeline. */
     uint32_t reflectance_offered;
     /** Records admitted by the configured latest-value sampler. */
@@ -134,9 +150,10 @@ esp_err_t telemetry_start(const telemetry_config_t *config);
 esp_err_t telemetry_begin_mission(uint64_t mission_id);
 
 /** GPS and reflectance are nonblocking submissions backed by one retained
- * PSRAM pool. GPS remains FIFO. Reflectance uses a configured latest-value
- * sampling period before entering the reliable FIFO; intentional replacement
- * is counted separately and is not an error. A full pool returns
+ * PSRAM pool. GPS records remain ordered but are losslessly sealed into DGB1
+ * batches before entering their FIFO. Reflectance uses a configured
+ * latest-value sampling period before entering the reliable FIFO; intentional
+ * replacement is counted separately and is not an error. A full pool returns
  * ESP_ERR_NO_MEM and counts a dropped live telemetry record without stopping
  * later submissions or SD recording. Every admitted record also has a bounded
  * residency; expiration is counted as delivery degradation but never latches

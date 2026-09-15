@@ -149,9 +149,10 @@ python tests/dtu_uart_bridge/measure_input_rate.py `
     --report build-review/dtu-input-rate-qos1.json
 ```
 
-The default sweep runs four 10-second stages: GPS at 5 Hz throughout, with
+The default sweep runs four 10-second stages: full ten-record DGB1 payloads at
+0.5 Hz throughout (equivalent to the production 5 Hz GPS source), with
 reflectance at 0, 1, 2, then 5 Hz. Payloads are deterministic test bytes, but
-their sizes are exactly the current production v01 sizes: 98-byte GPS records
+their sizes are exactly the current production sizes: 744-byte DGB1 GPS batches
 and 2,233-byte, 711-sample reflectance records. They use the real DTF2 encoder,
 producing one and three application fragments respectively, with zero
 inter-fragment gap. Add `--reflectance-samples 1024` to exercise the schema's
@@ -167,7 +168,7 @@ fragment duplicates, and schedule lag per stage. The default pass threshold is
 Useful focused variants are:
 
 ```powershell
-# Longer 0/1/2/5 Hz comparison.
+# Longer 0/1/2/5 Hz reflectance comparison with 0.5 Hz GPS batches.
 python tests/dtu_uart_bridge/measure_input_rate.py --serial-port COM6 `
     --host mqtt.example.com --username device_test --expect-qos 1 `
     --stage-seconds 30 --drain-seconds 60
@@ -195,8 +196,12 @@ python tests/dtu_uart_bridge/monitor_telemetry.py `
 
 It does not use COM6. It subscribes to the uplink topic, handles
 arbitrary DTU chunk boundaries and duplicates, validates both DTF2 and
-DHR1 CRCs, publishes `DTA1` application acknowledgements on the downlink topic,
-and reports record counts plus intentionally skipped source-record sequences.
+DHR1 CRCs plus the telemetry-only DGB1 GPS batch, publishes one `DTA1`
+application acknowledgement per complete logical message on the downlink
+topic, and reports source-record counts, GPS batch counts, partial batches, and
+intentionally skipped source-record sequences. Production DGB1 messages contain
+up to ten GPS records and always fit one 792-byte DTF2 fragment; legacy type-1
+individual GPS remains accepted so stale pre-batch traffic can drain.
 The uplink remains QoS 1, while DTA1 defaults to QoS 0 so the validator never
 serializes uplink consumption behind a broker PUBACK. A lost DTA1 is safe: the
 B board retains and retries the corresponding idempotent logical message.

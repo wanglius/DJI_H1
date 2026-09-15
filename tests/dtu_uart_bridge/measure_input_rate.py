@@ -2,7 +2,7 @@
 
 The ESP32 must be running the transparent DTU UART bridge firmware.  This
 probe deliberately sends synthetic payloads: their wire sizes and DTF2
-fragmentation match production GPS and v01 reflectance records, while keeping
+fragmentation match production DGB1 GPS batches and v01 reflectance records, while keeping
 the measurement independent of acquisition, SD-card, and application-ACK
 behavior.
 """
@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / "tools" / "mission_viewer"))
 sys.path.insert(0, str(THIS_DIR))
 
 from dji_h1_viewer.telemetry import (  # noqa: E402
-    MESSAGE_GPS,
+    MESSAGE_GPS_BATCH,
     MESSAGE_REFLECTANCE,
     TelemetryFragmentStreamDecoder,
     TelemetryReassembler,
@@ -42,9 +42,10 @@ from mqtt_broker_probe import (  # noqa: E402
 )
 
 
-# Exact v01 serialized record sizes from measurement_records.h.  The payloads
-# are synthetic because this test isolates transparent-link capacity.
-GPS_PAYLOAD_BYTES = 60 + 34 + 4
+# Exact production DGB1 maximum: 16-byte batch header, one shared 24-byte DHR1
+# prefix, ten 70-byte record suffixes, and a four-byte batch CRC. The payload
+# is synthetic because this test isolates transparent-link capacity.
+GPS_PAYLOAD_BYTES = 16 + 24 + 10 * 70 + 4
 DEFAULT_REFLECTANCE_SAMPLES = 711
 MAX_REFLECTANCE_SAMPLES = 1024
 PING_INTERVAL_SECONDS = 10.0
@@ -60,7 +61,8 @@ class Stage:
 
     @property
     def name(self) -> str:
-        return f"gps_{self.gps_hz:g}Hz_reflectance_{self.reflectance_hz:g}Hz"
+        return (f"gps_batch_{self.gps_hz:g}Hz_"
+                f"reflectance_{self.reflectance_hz:g}Hz")
 
 
 @dataclass(frozen=True)
@@ -138,7 +140,7 @@ def disconnect(connection: socket.socket | None) -> None:
 
 
 def _message_label(message_type: int) -> str:
-    return "gps" if message_type == MESSAGE_GPS else "reflectance"
+    return "gps_batch" if message_type == MESSAGE_GPS_BATCH else "reflectance"
 
 
 def _build_report(
@@ -152,7 +154,7 @@ def _build_report(
     for stage in stages:
         type_reports: dict[str, object] = {}
         stage_passed = True
-        for message_type in (MESSAGE_GPS, MESSAGE_REFLECTANCE):
+        for message_type in (MESSAGE_GPS_BATCH, MESSAGE_REFLECTANCE):
             selected = {
                 key: offer for key, offer in offers.items()
                 if offer.stage_index == stage.index and
@@ -174,7 +176,7 @@ def _build_report(
                 "received": received_count,
                 "missing": offered_count - received_count,
                 "delivery_percent": delivery,
-                "target_hz": (stage.gps_hz if message_type == MESSAGE_GPS
+                "target_hz": (stage.gps_hz if message_type == MESSAGE_GPS_BATCH
                               else stage.reflectance_hz),
                 "offered_hz": offered_count / stage.duration_seconds,
                 "fragments_offered": sum(
@@ -257,7 +259,11 @@ def main() -> int:
     parser.add_argument("--username", default="")
     parser.add_argument("--topic", default="dji-h1/test/up")
     parser.add_argument("--expect-qos", type=int, choices=(0, 1), default=1)
-    parser.add_argument("--gps-hz", type=float, default=5.0)
+    parser.add_argument(
+        "--gps-batch-hz", "--gps-hz", dest="gps_hz", type=float, default=0.5,
+        help=("DGB1 batch message rate; production 5 Hz source GPS becomes "
+              "0.5 Hz ten-record batches (legacy alias: --gps-hz)"),
+    )
     parser.add_argument("--reflectance-samples", type=int,
                         default=DEFAULT_REFLECTANCE_SAMPLES)
     parser.add_argument("--reflectance-rates", type=parse_rates,
@@ -278,7 +284,7 @@ def main() -> int:
         if not math.isfinite(value):
             parser.error(f"--{name.replace('_', '-')} must be finite")
     if args.gps_hz < 0 or args.gps_hz > 100:
-        parser.error("--gps-hz must be in 0..100")
+        parser.error("--gps-batch-hz must be in 0..100")
     if not 1 <= args.reflectance_samples <= MAX_REFLECTANCE_SAMPLES:
         parser.error(
             f"--reflectance-samples must be in 1..{MAX_REFLECTANCE_SAMPLES}"
@@ -416,7 +422,7 @@ def main() -> int:
         )
         receiver.start()
 
-        sequence = {MESSAGE_GPS: run_seed & 0xFFFFFFFF,
+        sequence = {MESSAGE_GPS_BATCH: run_seed & 0xFFFFFFFF,
                     MESSAGE_REFLECTANCE: (run_seed + 0x40000000) & 0xFFFFFFFF}
         with serial.Serial(args.serial_port, args.baud, timeout=0.1) as port:
             port.dtr = False
@@ -433,7 +439,7 @@ def main() -> int:
                 stage_start = time.monotonic()
                 events: list[tuple[float, int]] = []
                 for message_type, rate in (
-                    (MESSAGE_GPS, stage.gps_hz),
+                    (MESSAGE_GPS_BATCH, stage.gps_hz),
                     (MESSAGE_REFLECTANCE, stage.reflectance_hz),
                 ):
                     if rate <= 0:
@@ -456,7 +462,7 @@ def main() -> int:
                     send_start = time.monotonic()
                     message_sequence = sequence[message_type]
                     sequence[message_type] = (message_sequence + 1) & 0xFFFFFFFF
-                    size = (GPS_PAYLOAD_BYTES if message_type == MESSAGE_GPS
+                    size = (GPS_PAYLOAD_BYTES if message_type == MESSAGE_GPS_BATCH
                             else reflectance_bytes)
                     payload = synthetic_payload(
                         size, stage.mission_id, message_type, message_sequence,
@@ -509,7 +515,7 @@ def main() -> int:
             "topic": args.topic,
             "expected_qos": args.expect_qos,
             "source_id": args.source_id,
-            "gps_payload_bytes": GPS_PAYLOAD_BYTES,
+            "gps_batch_payload_bytes": GPS_PAYLOAD_BYTES,
             "reflectance_sample_count": args.reflectance_samples,
             "reflectance_payload_bytes": reflectance_bytes,
             "fragment_gap_ms": args.fragment_gap_ms,

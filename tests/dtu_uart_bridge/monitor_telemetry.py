@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "mission_viewer"))
 
 from dji_h1_viewer.telemetry import (  # noqa: E402
-    MESSAGE_GPS, MESSAGE_REFLECTANCE, FragmentError,
+    MESSAGE_GPS, MESSAGE_GPS_BATCH, MESSAGE_REFLECTANCE, FragmentError,
     TelemetryFragmentStreamDecoder, TelemetryReassembler,
-    encode_acknowledgement,
+    decode_gps_batch, encode_acknowledgement,
 )
 from mqtt_broker_probe import (  # noqa: E402
     connect_client, ping, publish, receive_publish, send_packet, subscribe,
@@ -172,6 +172,8 @@ def main() -> int:
         timeout_seconds=30.0, max_inflight=args.max_inflight,
     )
     counts = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}
+    gps_batches = 0
+    gps_partial_batches = 0
     observed_sequences: dict[tuple[int, int, int], set[int]] = {}
     # Retain enough recently completed identities to answer the ESP32's
     # bounded retransmission after a lost downlink ACK, without leaking memory
@@ -242,14 +244,31 @@ def main() -> int:
                 message = reassembler.push(fragment)
                 if message is None:
                     continue
-                if message.message_type not in counts:
+                if message.message_type not in (
+                        MESSAGE_GPS, MESSAGE_GPS_BATCH,
+                        MESSAGE_REFLECTANCE):
                     raise ValueError(
                         f"unsupported telemetry type {message.message_type}"
                     )
-                fields, body = validate_record(
-                    message.payload, message.message_type,
-                    message.message_sequence,
-                )
+                gps_records: tuple[tuple[tuple[int, ...], bytes], ...] = ()
+                fields: tuple[int, ...] | None = None
+                body: bytes | None = None
+                if message.message_type == MESSAGE_GPS_BATCH:
+                    reconstructed = decode_gps_batch(message.payload)
+                    decoded_records = []
+                    for record in reconstructed:
+                        record_fields = _RECORD_HEADER.unpack_from(record)
+                        sequence = record_fields[8]
+                        decoded_records.append(validate_record(
+                            record, MESSAGE_GPS, sequence))
+                    gps_records = tuple(decoded_records)
+                    if gps_records[0][0][8] != message.message_sequence:
+                        raise ValueError("DTF2/DGB1 batch identity mismatch")
+                else:
+                    fields, body = validate_record(
+                        message.payload, message.message_type,
+                        message.message_sequence,
+                    )
                 # Acknowledge every fully validated record, including a stale
                 # mission left in the DTU. Filtering affects only the reported
                 # test population and never prevents old traffic from draining.
@@ -265,14 +284,44 @@ def main() -> int:
                     )
                 if args.mission_id is not None and \
                         message.mission_id != args.mission_id:
-                    other_mission_records += 1
+                    other_mission_records += (
+                        len(gps_records) if gps_records else 1)
                     continue
+                if message.message_type == MESSAGE_GPS_BATCH:
+                    sequence_key = (message.source_id, message.mission_id,
+                                    MESSAGE_GPS)
+                    sequences = observed_sequences.setdefault(
+                        sequence_key, set())
+                    sequences.update(item[0][8] for item in gps_records)
+                    counts[MESSAGE_GPS] += len(gps_records)
+                    gps_batches += 1
+                    if len(gps_records) < 10:
+                        gps_partial_batches += 1
+                    if not args.quiet_records:
+                        first_fields, first_body = gps_records[0]
+                        last_fields, _last_body = gps_records[-1]
+                        first_gps = _GPS_BODY.unpack(first_body)
+                        validity = first_gps[-1]
+                        position = (f"lat={first_gps[1] / 1e7:.7f} "
+                                    f"lon={first_gps[2] / 1e7:.7f}"
+                                    if validity & 0x01 else
+                                    "position=INVALID")
+                        print(
+                            f"GPS_BATCH source={message.source_id:012X} "
+                            f"mission={message.mission_id} "
+                            f"seq={first_fields[8]}..{last_fields[8]} "
+                            f"count={len(gps_records)} "
+                            f"utc_ms={first_fields[11]}..{last_fields[11]} "
+                            f"first_{position}"
+                        )
+                    continue
+
+                assert fields is not None and body is not None
                 sequence_key = (message.source_id, message.mission_id,
                                 message.message_type)
                 observed_sequences.setdefault(sequence_key, set()).add(
-                    message.message_sequence
-                )
-                counts[message.message_type] = counts.get(message.message_type, 0) + 1
+                    message.message_sequence)
+                counts[message.message_type] += 1
                 utc_ms = fields[11]
                 if message.message_type == MESSAGE_GPS:
                     if len(body) != _GPS_BODY.size:
@@ -328,7 +377,9 @@ def main() -> int:
     print(
         "TELEMETRY SUMMARY "
         f"mqtt_messages={mqtt_messages} mqtt_bytes={mqtt_bytes} "
-        f"gps={gps_count} reflectance={reflectance_count} "
+        f"gps={gps_count} gps_batches={gps_batches} "
+        f"gps_partial_batches={gps_partial_batches} "
+        f"reflectance={reflectance_count} "
         f"other_mission_records={other_mission_records} "
         f"gps_source_records_skipped={source_records_skipped[MESSAGE_GPS]} "
         f"reflectance_source_records_skipped="

@@ -28,6 +28,8 @@ typedef enum {
     TELEMETRY_MESSAGE_RAW_SPECTRUM = 2,
     TELEMETRY_MESSAGE_REFLECTANCE = 3,
     TELEMETRY_MESSAGE_OPERATION_LOG = 4,
+    /** Telemetry-only DGB1 container holding 1..10 GPS DHR1 records. */
+    TELEMETRY_MESSAGE_GPS_BATCH = 5,
 } telemetry_message_type_t;
 
 /** Immutable description prepared once for a complete logical message. */

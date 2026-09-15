@@ -24,6 +24,23 @@ MESSAGE_GPS = 1
 MESSAGE_RAW_SPECTRUM = 2
 MESSAGE_REFLECTANCE = 3
 MESSAGE_OPERATION_LOG = 4
+MESSAGE_GPS_BATCH = 5
+
+GPS_BATCH_MAGIC = 0x31424744  # Little-endian bytes: DGB1.
+GPS_BATCH_VERSION = 1
+GPS_BATCH_HEADER_SIZE = 16
+GPS_BATCH_SHARED_PREFIX_SIZE = 24
+GPS_RECORD_WIRE_SIZE = 98
+GPS_BATCH_SAMPLE_SUFFIX_SIZE = GPS_RECORD_WIRE_SIZE - \
+    GPS_BATCH_SHARED_PREFIX_SIZE - 4
+GPS_BATCH_TRAILER_SIZE = 4
+GPS_BATCH_MAX_RECORDS = 10
+_GPS_BATCH_HEADER = struct.Struct("<IHHIHH")
+_DHR_SHARED_PREFIX = struct.Struct("<IHHIIIHH")
+_DHR_RECORD_MAGIC = 0x31524844
+_DHR_RECORD_VERSION = 1
+_DHR_GPS_TYPE = 1
+_DHR_HEADER_SIZE = 60
 
 _HEADER = struct.Struct("<IBBHQQIIIHHHH")
 _CRC = struct.Struct("<I")
@@ -38,6 +55,108 @@ _ACK = struct.Struct("<IBBHQQIIHHI")
 
 class FragmentError(ValueError):
     """Raised when fragment framing or reassembly integrity is invalid."""
+
+
+def _sequence_is_forward(previous: int, current: int) -> bool:
+    distance = (current - previous) & 0xFFFFFFFF
+    return 0 < distance < 0x80000000
+
+
+def _validate_gps_record(record: bytes) -> tuple[bytes, int]:
+    record = _copy_bytes(record, "GPS record")
+    if len(record) != GPS_RECORD_WIRE_SIZE:
+        raise FragmentError("GPS record must be exactly 98 bytes")
+    stored_crc, = _CRC.unpack_from(record, len(record) - _CRC.size)
+    if zlib.crc32(record[:-_CRC.size]) & 0xFFFFFFFF != stored_crc:
+        raise FragmentError("GPS DHR1 CRC mismatch")
+    (magic, version, record_type, header_size, record_size, _session,
+     _segment, _flags) = _DHR_SHARED_PREFIX.unpack_from(record)
+    if (magic != _DHR_RECORD_MAGIC or version != _DHR_RECORD_VERSION or
+            record_type != _DHR_GPS_TYPE or header_size != _DHR_HEADER_SIZE or
+            record_size != GPS_RECORD_WIRE_SIZE):
+        raise FragmentError("invalid GPS DHR1 shared metadata")
+    sequence, = struct.unpack_from("<I", record, GPS_BATCH_SHARED_PREFIX_SIZE)
+    return record[:GPS_BATCH_SHARED_PREFIX_SIZE], sequence
+
+
+def encode_gps_batch(records: object) -> bytes:
+    """Compact 1..10 canonical GPS DHR1 records into one DGB1 payload."""
+    try:
+        copied = tuple(_copy_bytes(item, "GPS record") for item in records)
+    except TypeError as exc:
+        raise FragmentError("records must be an iterable of bytes") from exc
+    if not 1 <= len(copied) <= GPS_BATCH_MAX_RECORDS:
+        raise FragmentError("GPS batch must contain 1..10 records")
+
+    shared_prefix: bytes | None = None
+    previous_sequence: int | None = None
+    suffixes: list[bytes] = []
+    for record in copied:
+        prefix, sequence = _validate_gps_record(record)
+        if shared_prefix is None:
+            shared_prefix = prefix
+        elif prefix != shared_prefix:
+            raise FragmentError("GPS batch records do not share DHR1 metadata")
+        if previous_sequence is not None and not _sequence_is_forward(
+                previous_sequence, sequence):
+            raise FragmentError("GPS batch record sequences are not forward")
+        previous_sequence = sequence
+        suffixes.append(record[GPS_BATCH_SHARED_PREFIX_SIZE:-_CRC.size])
+    assert shared_prefix is not None
+    wire_size = (GPS_BATCH_HEADER_SIZE + GPS_BATCH_SHARED_PREFIX_SIZE +
+                 len(copied) * GPS_BATCH_SAMPLE_SUFFIX_SIZE +
+                 GPS_BATCH_TRAILER_SIZE)
+    without_crc = (
+        _GPS_BATCH_HEADER.pack(
+            GPS_BATCH_MAGIC, GPS_BATCH_VERSION, GPS_BATCH_HEADER_SIZE,
+            wire_size, len(copied), GPS_RECORD_WIRE_SIZE,
+        ) + shared_prefix + b"".join(suffixes)
+    )
+    return without_crc + _CRC.pack(zlib.crc32(without_crc) & 0xFFFFFFFF)
+
+
+def decode_gps_batch(payload: bytes) -> tuple[bytes, ...]:
+    """Validate DGB1 and reconstruct canonical, CRC-protected GPS records."""
+    payload = _copy_bytes(payload, "GPS batch")
+    minimum = (GPS_BATCH_HEADER_SIZE + GPS_BATCH_SHARED_PREFIX_SIZE +
+               GPS_BATCH_SAMPLE_SUFFIX_SIZE + GPS_BATCH_TRAILER_SIZE)
+    maximum = (GPS_BATCH_HEADER_SIZE + GPS_BATCH_SHARED_PREFIX_SIZE +
+               GPS_BATCH_MAX_RECORDS * GPS_BATCH_SAMPLE_SUFFIX_SIZE +
+               GPS_BATCH_TRAILER_SIZE)
+    if not minimum <= len(payload) <= maximum:
+        raise FragmentError("invalid GPS batch length")
+    stored_crc, = _CRC.unpack_from(payload, len(payload) - _CRC.size)
+    if zlib.crc32(payload[:-_CRC.size]) & 0xFFFFFFFF != stored_crc:
+        raise FragmentError("GPS batch CRC mismatch")
+    magic, version, header_size, wire_size, count, record_size = \
+        _GPS_BATCH_HEADER.unpack_from(payload)
+    expected_size = (GPS_BATCH_HEADER_SIZE + GPS_BATCH_SHARED_PREFIX_SIZE +
+                     count * GPS_BATCH_SAMPLE_SUFFIX_SIZE +
+                     GPS_BATCH_TRAILER_SIZE)
+    if (magic != GPS_BATCH_MAGIC or version != GPS_BATCH_VERSION or
+            header_size != GPS_BATCH_HEADER_SIZE or wire_size != len(payload) or
+            not 1 <= count <= GPS_BATCH_MAX_RECORDS or
+            record_size != GPS_RECORD_WIRE_SIZE or len(payload) != expected_size):
+        raise FragmentError("invalid GPS batch metadata")
+
+    prefix_start = GPS_BATCH_HEADER_SIZE
+    suffix_start = prefix_start + GPS_BATCH_SHARED_PREFIX_SIZE
+    shared_prefix = payload[prefix_start:suffix_start]
+    records: list[bytes] = []
+    previous_sequence: int | None = None
+    for index in range(count):
+        start = suffix_start + index * GPS_BATCH_SAMPLE_SUFFIX_SIZE
+        without_crc = shared_prefix + payload[
+            start:start + GPS_BATCH_SAMPLE_SUFFIX_SIZE]
+        record = without_crc + _CRC.pack(
+            zlib.crc32(without_crc) & 0xFFFFFFFF)
+        _prefix, sequence = _validate_gps_record(record)
+        if previous_sequence is not None and not _sequence_is_forward(
+                previous_sequence, sequence):
+            raise FragmentError("GPS batch record sequences are not forward")
+        previous_sequence = sequence
+        records.append(record)
+    return tuple(records)
 
 
 def _copy_bytes(value: object, description: str) -> bytes:

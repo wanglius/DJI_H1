@@ -53,6 +53,15 @@ time that a live record may occupy the telemetry pool; `gps_expired` and
 nonzero expiration count makes `delivery_degraded` true, but does not imply an
 SD-recording failure or an unhealthy telemetry component.
 
+GPS telemetry batching does not alter this persistent format. Every GPS sample
+is still written as its own 98-byte DHR1 record with its own CRC. The telemetry-
+only DGB1 container shares repeated header bytes across as many as ten records;
+`gps_submitted`, `gps_sent`, and `gps_expired` remain source-record counts,
+whereas `gps_batches_submitted`, `gps_batches_sent`,
+`gps_batches_expired`, and `gps_partial_batches` describe containers. The
+configured count and 2000 ms sealing deadline are checkpointed as
+`gps_batch_max_records` and `gps_batch_max_delay_ms`.
+
 The protocol intentionally provides no B-readable flight key: section 4.9 says
 that `session_id` is opaque. The B boot-to-poweroff lifecycle therefore defines
 the local flight directory. The first non-empty handshake serial is latched as

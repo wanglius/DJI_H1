@@ -22,7 +22,7 @@ from measure_input_rate import (  # noqa: E402
     synthetic_payload,
 )
 from dji_h1_viewer.telemetry import (  # noqa: E402
-    MESSAGE_GPS,
+    MESSAGE_GPS_BATCH,
     MESSAGE_REFLECTANCE,
     fragment_message,
 )
@@ -30,15 +30,16 @@ from dji_h1_viewer.telemetry import (  # noqa: E402
 
 class InputRateProbeTests(unittest.TestCase):
     def test_production_sizes_have_expected_fragment_counts(self) -> None:
-        gps = synthetic_payload(GPS_PAYLOAD_BYTES, 1, MESSAGE_GPS, 2)
+        gps = synthetic_payload(GPS_PAYLOAD_BYTES, 1, MESSAGE_GPS_BATCH, 2)
         reflectance = synthetic_payload(
             reflectance_payload_bytes(DEFAULT_REFLECTANCE_SAMPLES),
             1, MESSAGE_REFLECTANCE, 3,
         )
 
-        self.assertEqual(len(gps), 98)
+        self.assertEqual(len(gps), 744)
         self.assertEqual(len(reflectance), 2233)
-        self.assertEqual(len(fragment_message(MESSAGE_GPS, 1, 2, gps)), 1)
+        gps_fragment, = fragment_message(MESSAGE_GPS_BATCH, 1, 2, gps)
+        self.assertEqual(len(gps_fragment), 792)
         self.assertEqual(
             len(fragment_message(MESSAGE_REFLECTANCE, 1, 3, reflectance)), 3
         )
@@ -58,25 +59,25 @@ class InputRateProbeTests(unittest.TestCase):
 
     def test_report_fails_only_the_under_threshold_stage(self) -> None:
         stage = Stage(0, 100, 0, 0, 10)
-        payload = synthetic_payload(20, 100, MESSAGE_GPS, 7)
+        payload = synthetic_payload(20, 100, MESSAGE_GPS_BATCH, 7)
         from measure_input_rate import Offer
         offers = {
-            (100, MESSAGE_GPS, 7): Offer(
-                0, MESSAGE_GPS, 7, payload, 1.0, 1, 68, 0.0,
+            (100, MESSAGE_GPS_BATCH, 7): Offer(
+                0, MESSAGE_GPS_BATCH, 7, payload, 1.0, 1, 68, 0.0,
             ),
-            (100, MESSAGE_GPS, 8): Offer(
-                0, MESSAGE_GPS, 8, payload, 2.0, 1, 68, 0.0,
+            (100, MESSAGE_GPS_BATCH, 8): Offer(
+                0, MESSAGE_GPS_BATCH, 8, payload, 2.0, 1, 68, 0.0,
             ),
         }
 
         report, passed = _build_report(
-            [stage], offers, {(100, MESSAGE_GPS, 7): 1.5},
+            [stage], offers, {(100, MESSAGE_GPS_BATCH, 7): 1.5},
             1, 68, 1, 0, 2.0, 99.0,
         )
 
         self.assertFalse(passed)
         self.assertFalse(report["stages"][0]["passed"])
-        gps = report["stages"][0]["messages"]["gps"]
+        gps = report["stages"][0]["messages"]["gps_batch"]
         self.assertEqual(gps["delivery_percent"], 50.0)
         self.assertEqual(gps["missing"], 1)
 

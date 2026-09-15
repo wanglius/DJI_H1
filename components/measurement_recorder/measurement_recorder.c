@@ -531,9 +531,16 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"delivery_degraded\": %s"
         ", \"shutdown_aborted\": %s"
         ", \"gps_submitted\": %" PRIu32
+        ", \"gps_batch_max_records\": %u"
+        ", \"gps_batch_max_delay_ms\": %" PRIu32
+        ", \"gps_batches_submitted\": %" PRIu32
+        ", \"gps_partial_batches\": %" PRIu32
         ", \"gps_sent\": %" PRIu32 ", \"gps_superseded\": %" PRIu32
         ", \"gps_queue_overflows\": %" PRIu32
         ", \"gps_expired\": %" PRIu32
+        ", \"gps_batches_sent\": %" PRIu32
+        ", \"gps_batches_expired\": %" PRIu32
+        ", \"gps_records_abandoned_shutdown\": %" PRIu32
         ", \"reflectance_offered\": %" PRIu32
         ", \"reflectance_submitted\": %" PRIu32
         ", \"reflectance_rate_limited\": %" PRIu32
@@ -588,9 +595,14 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.healthy ? "true" : "false",
         telemetry_delivery_degraded ? "true" : "false",
         telemetry.shutdown_aborted ? "true" : "false",
-        telemetry.gps_submitted, telemetry.gps_sent,
+        telemetry.gps_submitted, telemetry.gps_batch_max_records,
+        telemetry.gps_batch_max_delay_ms,
+        telemetry.gps_batches_submitted, telemetry.gps_partial_batches,
+        telemetry.gps_sent,
         telemetry.gps_superseded, telemetry.gps_queue_overflows,
-        telemetry.gps_expired,
+        telemetry.gps_expired, telemetry.gps_batches_sent,
+        telemetry.gps_batches_expired,
+        telemetry.gps_records_abandoned_shutdown,
         telemetry.reflectance_offered,
         telemetry.reflectance_submitted,
         telemetry.reflectance_rate_limited,

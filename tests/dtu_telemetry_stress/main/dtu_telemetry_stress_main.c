@@ -195,6 +195,8 @@ void app_main(void)
         .max_residency_ms = DJI_DTU_MAX_RESIDENCY_MS,
         /* This diagnostic intentionally exercises the uncapped transport. */
         .reflectance_interval_ms = 0,
+        .gps_batch_max_records = DJI_DTU_GPS_BATCH_MAX_RECORDS,
+        .gps_batch_max_delay_ms = DJI_DTU_GPS_BATCH_MAX_DELAY_MS,
         .timing_diagnostics = true,
     };
     ESP_ERROR_CHECK(telemetry_start(&config));

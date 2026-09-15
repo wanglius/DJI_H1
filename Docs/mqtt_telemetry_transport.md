@@ -1,9 +1,10 @@
 # MQTT telemetry transport format v02
 
-The B board publishes GPS and calculated reflectance records through one MQTT
-uplink topic. The original measurement record remains the logical payload; this
-transport layer only divides large byte strings into DTU-safe fragments and
-reassembles them. It never changes timestamps or measurement fields.
+The B board publishes compact GPS batches and calculated reflectance records
+through one MQTT uplink topic. Reflectance retains its original DHR1 logical
+payload. GPS_TRACK.BIN likewise remains individual 98-byte DHR1 records, but the
+live path losslessly packs up to ten adjacent records into one DGB1 payload
+before DTF2 framing. No timestamp or navigation field is discarded.
 
 ## Design boundaries
 
@@ -54,22 +55,59 @@ the header and fragment payload.
 | 44 | 0..976 | Fragment payload |
 | variable | 4 | Fragment CRC-32 |
 
-The 976-byte maximum follows from `1024 - 44 - 4`. A 98-byte GPS record uses
-one 146-byte fragment. The current 711-sample reflectance record is 2233 bytes
+The 976-byte maximum follows from `1024 - 44 - 4`. A legacy 98-byte individual
+GPS message uses one 146-byte fragment. A production ten-record DGB1 batch is
+744 bytes and produces one 792-byte DTF2 fragment. The current 711-sample
+reflectance record is 2233 bytes
 and uses three fragments with wire sizes `1024, 1024, 329`. The schema maximum
 of 1024 samples is 3172 bytes and uses four fragments with wire sizes
 `1024, 1024, 1024, 292`.
 
-Message-type values intentionally match the existing measurement record types:
-GPS `1`, raw spectrum `2`, reflectance `3`, and operation log `4`. The initial
-production publisher will send GPS and reflectance only.
+Message-type values 1 through 4 intentionally match the existing measurement
+record types: legacy individual GPS `1`, raw spectrum `2`, reflectance `3`, and
+operation log `4`. DGB1 GPS batch is the telemetry-only extension type `5`.
+Production publishes types 5 and 3. Receivers continue accepting type 1 so
+stale data from pre-batch firmware can drain during migration.
+
+## GPS batch payload format (DGB1 v01)
+
+DGB1 compresses repeated DHR1 bytes; it does not numerically compress or
+approximate measurements. The existing DHR1 serializer first produces each
+canonical 98-byte GPS record. All records in a batch must have an identical
+24-byte DHR1 prefix (magic through record flags). DGB1 stores that prefix once,
+then stores the 70 bytes from record sequence through the end of the GPS body
+for every sample. Individual four-byte DHR1 CRCs are replaced by one batch CRC.
+The ground decoder reconstructs each original 94-byte DHR1 body and recalculates
+its individual CRC, yielding the exact canonical 98-byte record again.
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic `DGB1` |
+| 4 | 2 | Batch format version (`1`) |
+| 6 | 2 | Batch header size (`16`) |
+| 8 | 4 | Complete DGB1 payload size |
+| 12 | 2 | Record count (`1..10`) |
+| 14 | 2 | Reconstructed DHR1 record size (`98`) |
+| 16 | 24 | Shared DHR1 prefix: magic, version, type, sizes, session, segment, flags |
+| 40 | `70 × count` | Ordered per-record suffixes: record sequence, full synchronized timestamp, protocol sequence/reserved bytes, and all 30 A-board navigation bytes |
+| variable | 4 | IEEE CRC-32 over every preceding DGB1 byte |
+
+The payload size is `44 + 70 × count`: 114 bytes for one record and 744 bytes
+for ten. Including the 48-byte DTF2 overhead, a full batch is 792 bytes and
+therefore always one fragment. Record sequences must move strictly forward
+(wrap is supported); gaps are retained and remain visible to the receiver.
+Session, segment, or common-header changes seal the existing partial batch
+before the new record is admitted.
 
 ## Production sender
 
 The `telemetry` component owns UART1 on GPIO17/GPIO18 and is the only task that
 writes application data to the DTU. The measurement recorder gives it finalized
 v01 GPS and reflectance records without ever waiting for UART or cellular I/O.
-Every received 5 Hz GPS record enters its FIFO. Calculated reflectance remains
+Every received 5 Hz GPS record is appended to a telemetry-only batch while its
+individual DHR1 copy continues independently to GPS_TRACK.BIN. A batch seals at
+ten records, two seconds after its first record, or at a metadata/mission
+boundary. Calculated reflectance remains
 full-rate on SD, while telemetry keeps one latest-value candidate and admits at
 most one candidate every 500 ms (2 Hz) to its reliable FIFO. A newer candidate
 within the same interval intentionally supersedes the older one. This
@@ -77,8 +115,9 @@ rate-limited count is diagnostic, not data-path degradation. The original
 ground timestamp and record sequence remain unchanged, so the receiver can
 identify exactly which calculated records were selected.
 
-GPS is served first so a reflectance/retry backlog cannot age the flight track.
-Every admitted record is retained until a positive application ACK or the
+GPS batches are served first so a reflectance/retry backlog cannot age the
+flight track. Every admitted batch/record is retained until a positive
+application ACK or the
 configured freshness deadline, whichever comes first. Production measures the
 deadline from local pool admission (not the record's synchronized timestamp)
 and expires an entry after 10 seconds. This deliberately trades a small,
@@ -107,8 +146,10 @@ Current production policy:
   by the B-board timeout/retry and 10-second residency policy, so blocking the
   ground receiver on another broker PUBACK adds load without improving the
   end-to-end acceptance guarantee;
-- every accepted 5 Hz A-to-B GPS record is retained and transmitted in FIFO
-  order, with GPS ready records scheduled ahead of reflectance/retry backlog;
+- every accepted 5 Hz A-to-B GPS record is retained in order inside a DGB1
+  batch. Production seals at 10 records or 2000 ms, whichever occurs first;
+  partial batches also seal at session/segment changes and orderly mission
+  finish. GPS batches remain ahead of reflectance/retry backlog;
 - new reflectance telemetry is selected on a 500 ms mission-monotonic cadence.
   Each tick admits only the newest unsent calculated record; empty ticks send
   nothing and missed ticks are not replayed as a burst. `MISSION.JSON` reports
@@ -119,9 +160,11 @@ Current production policy:
 - production pool residency is limited to 10 seconds. Staged, queued,
   in-flight, retry-due, and exhausted entries are expired safely; queued
   entries use a tombstone until their FreeRTOS queue pointer is consumed.
-  `gps_expired` and `reflectance_expired` expose the resulting live-delivery
-  gaps in the heartbeat and `MISSION.JSON`. A late ACK for a released entry is
-  harmlessly counted as mismatched;
+  `gps_expired` counts contained GPS source records while
+  `gps_batches_expired` counts their DGB1 containers;
+  `reflectance_expired` exposes reflectance gaps. All appear in
+  `MISSION.JSON`, and record-level loss still degrades the heartbeat. A late
+  ACK for a released entry is harmlessly counted as mismatched;
 - the task transmits new messages continuously and does not wait for DTA1
   between messages. Positive ACKs may arrive late, duplicated, or out of order;
 - exhausted acknowledgement retries increment `messages_failed` once and
@@ -130,7 +173,7 @@ Current production policy:
   residency limit is disabled or configured long enough. With the production
   10-second freshness policy, the old slot expires before that recovery phase;
   live data is preferred to delayed replay. Recovery otherwise runs behind new
-  GPS and ordinary retries but ahead of new reflectance, with a global rate
+  GPS batches and ordinary retries but ahead of new reflectance, with a global rate
   adapting from 1 to at most 10 messages/s according to pool pressure;
 - a matching negative application ACK or a permanent local serialization/
   framing failure releases the slot immediately because retransmitting the same
@@ -165,7 +208,9 @@ validator/service publishes the 40-byte `DTA1` at MQTT QoS 0 so ACK generation
 does not block uplink consumption while waiting for a second broker PUBACK. The
 B-board application retry covers an ACK lost on this QoS 0 leg. The
 acknowledgement is published on the configured downlink topic only after the
-complete DTF2 message and inner DHR1 record pass validation. It echoes the
+complete DTF2 message and its inner DHR1 or DGB1 payload pass validation. For
+DGB1, all contained records must reconstruct and validate before the single
+batch ACK is emitted. It echoes the
 source ID, mission ID, type, sequence, and complete-message CRC. The ESP32
 matches each ACK against every retained in-flight slot. An ACK deadline schedules
 the whole logical message for retry without blocking transmission of unrelated
@@ -187,7 +232,8 @@ without changing source code.
 
 At final power-off, telemetry is deliberately abandoned as soon as the B board
 receives the `0x30` forecast. Admission closes, both ready queues are cleared
-immediately, and the worker reclaims queued and in-flight pool entries. An
+immediately, the unsealed partial GPS batch is discarded, and the worker
+reclaims queued and in-flight pool entries. An
 in-progress sequence checks cancellation between fragments; only bytes already
 accepted by the UART hardware may finish shifting. The abort API never waits
 for UART drain, MQTT acknowledgements, or retry deadlines, so cloud delivery
@@ -236,6 +282,8 @@ indices are present and the complete-message length and CRC have passed.
 Incomplete assemblies expire after a bounded timeout. The receiver also bounds
 the number of simultaneous assemblies, maximum declared message size, and its
 recent-completion deduplication cache, so corrupt or hostile identifiers cannot
-grow memory without limit. A completed payload is then passed unchanged to the
-existing GPS or reflectance record decoder, which validates the inner `DHR1`
-record and its own CRC.
+grow memory without limit. A completed reflectance or legacy GPS payload is
+passed unchanged to the DHR1 decoder. A DGB1 payload is checked for magic,
+version, declared bounds, count, shared DHR metadata, forward sequences, and
+batch CRC; only then is it expanded into ordinary individually CRC-protected
+GPS records for downstream use.

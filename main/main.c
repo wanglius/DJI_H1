@@ -96,6 +96,8 @@ void app_main(void)
         .pool_length = DJI_DTU_TELEMETRY_POOL_LENGTH,
         .max_residency_ms = DJI_DTU_MAX_RESIDENCY_MS,
         .reflectance_interval_ms = DJI_DTU_REFLECTANCE_INTERVAL_MS,
+        .gps_batch_max_records = DJI_DTU_GPS_BATCH_MAX_RECORDS,
+        .gps_batch_max_delay_ms = DJI_DTU_GPS_BATCH_MAX_DELAY_MS,
         .timing_diagnostics = DJI_DTU_TIMING_DIAGNOSTICS,
     };
     ESP_ERROR_CHECK(telemetry_start(&telemetry));

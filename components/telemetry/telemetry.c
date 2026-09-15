@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "gps_batch.h"
 #include "telemetry_transport.h"
 
 static const char *TAG = "TELEMETRY";
@@ -25,6 +26,7 @@ static const char *TAG = "TELEMETRY";
 #define TELEMETRY_MAX_POOL_LENGTH 2048U
 #define TELEMETRY_MAX_RESIDENCY_MS 3600000U
 #define TELEMETRY_MAX_REFLECTANCE_INTERVAL_MS 60000U
+#define TELEMETRY_MAX_GPS_BATCH_DELAY_MS 60000U
 #define TELEMETRY_POLL_MS 20U
 #define TELEMETRY_UART_TX_TIMEOUT_MS 1000U
 #define TELEMETRY_RECOVERY_RETRY_DELAY_MS 30000U
@@ -52,14 +54,15 @@ typedef enum {
 } telemetry_entry_state_t;
 
 typedef union {
-    gps_record_t gps;
+    gps_batch_t gps_batch;
     reflectance_record_t reflectance;
 } telemetry_record_t;
 
-/** A slot owns one immutable logical message from admission until a matching
- * positive DTA1 acknowledgement (or deliberate mission abort). Keeping the
- * record, rather than only its serialized bytes, makes retries deterministic
- * without dedicating another multi-megabyte wire buffer in PSRAM. */
+/** A slot owns one logical message from admission until a matching positive
+ * DTA1 acknowledgement (or deliberate mission abort). A staged GPS batch is
+ * append-only until sealed; queued and later states are immutable. Keeping the
+ * source representation makes retries deterministic without dedicating
+ * another multi-megabyte wire buffer in PSRAM. */
 typedef struct {
     telemetry_record_t record;
     /** Local monotonic admission time. Record timestamps may be in another
@@ -103,6 +106,9 @@ static bool s_accepting;
 static bool s_sending;
 static bool s_abort_requested;
 static uint32_t s_submitters;
+/* The first record reserves one retained-pool slot. Later records are appended
+ * in place until the configured count/deadline seals the immutable message. */
+static telemetry_entry_t *s_pending_gps_batch;
 /* At most one calculated reflectance waits for the next production sampling
  * tick. The slot is part of s_pool so shutdown accounting and bounded-memory
  * guarantees remain identical to queued and in-flight records. */
@@ -115,6 +121,8 @@ static uint8_t s_record_buffer[TELEMETRY_RECORD_BUFFER_SIZE];
 static uint8_t s_fragment_buffer[TELEMETRY_FRAGMENT_WIRE_MAX_SIZE];
 static uint8_t s_ack_stream[TELEMETRY_ACK_STREAM_CAPACITY];
 static size_t s_ack_stream_length;
+
+static uint32_t entry_sequence(const telemetry_entry_t *entry);
 
 static bool abort_requested(void)
 {
@@ -147,6 +155,17 @@ static void note_serialization_fault(void)
     s_status.healthy = false;
     s_status.serialization_errors++;
     taskEXIT_CRITICAL(&s_lock);
+}
+
+static bool is_gps_entry(const telemetry_entry_t *entry)
+{
+    return entry != NULL &&
+           entry->message_type == TELEMETRY_MESSAGE_GPS_BATCH;
+}
+
+static uint16_t entry_gps_record_count(const telemetry_entry_t *entry)
+{
+    return is_gps_entry(entry) ? entry->record.gps_batch.record_count : 0;
 }
 
 static bool entry_belongs_to_pool(const telemetry_entry_t *entry)
@@ -245,9 +264,7 @@ static void mark_exhausted(telemetry_entry_t *entry, const char *reason)
     }
     taskEXIT_CRITICAL(&s_lock);
     if (first_failure) {
-        uint32_t sequence = entry->message_type == TELEMETRY_MESSAGE_GPS
-            ? entry->record.gps.header.record_sequence
-            : entry->record.reflectance.header.record_sequence;
+        uint32_t sequence = entry_sequence(entry);
         ESP_LOGW(TAG, "Retaining exhausted type=%u seq=%lu: %s",
                  (unsigned)entry->message_type, (unsigned long)sequence,
                  reason);
@@ -265,9 +282,7 @@ static void discard_failed_entry(telemetry_entry_t *entry, const char *reason)
     }
     taskEXIT_CRITICAL(&s_lock);
     if (first_failure) {
-        uint32_t sequence = entry->message_type == TELEMETRY_MESSAGE_GPS
-            ? entry->record.gps.header.record_sequence
-            : entry->record.reflectance.header.record_sequence;
+        uint32_t sequence = entry_sequence(entry);
         ESP_LOGW(TAG, "Discarding failed type=%u seq=%lu: %s",
                  (unsigned)entry->message_type, (unsigned long)sequence,
                  reason);
@@ -293,15 +308,15 @@ static void purge_all_entries(void)
 
 static uint32_t entry_sequence(const telemetry_entry_t *entry)
 {
-    return entry->message_type == TELEMETRY_MESSAGE_GPS
-        ? entry->record.gps.header.record_sequence
+    return is_gps_entry(entry)
+        ? gps_batch_message_sequence(&entry->record.gps_batch)
         : entry->record.reflectance.header.record_sequence;
 }
 
 static uint64_t entry_timestamp_us(const telemetry_entry_t *entry)
 {
-    return entry->message_type == TELEMETRY_MESSAGE_GPS
-        ? entry->record.gps.header.timestamp.b_monotonic_us
+    return is_gps_entry(entry)
+        ? gps_batch_first_timestamp_us(&entry->record.gps_batch)
         : entry->record.reflectance.header.timestamp.b_monotonic_us;
 }
 
@@ -551,10 +566,12 @@ static void process_ack(const telemetry_ack_t *ack)
     if (rtt_us > s_status.acknowledgement_rtt_max_us)
         s_status.acknowledgement_rtt_max_us = rtt_us;
     s_status.acknowledgement_rtt_sum_us += rtt_us;
-    if (message_type == TELEMETRY_MESSAGE_GPS)
-        s_status.gps_sent++;
-    else if (message_type == TELEMETRY_MESSAGE_REFLECTANCE)
+    if (message_type == TELEMETRY_MESSAGE_GPS_BATCH) {
+        s_status.gps_sent += entry_gps_record_count(entry);
+        s_status.gps_batches_sent++;
+    } else if (message_type == TELEMETRY_MESSAGE_REFLECTANCE) {
         s_status.reflectance_sent++;
+    }
     uint32_t pool_used = s_status.pool_used;
     uint32_t in_flight = s_status.messages_in_flight;
     taskEXIT_CRITICAL(&s_lock);
@@ -643,15 +660,18 @@ static void expire_stale_entries(int64_t now_us)
         if (residency_expired_at(entry->admitted_us, now_us,
                                  s_config.max_residency_ms)) {
             message_type = entry->message_type;
-            if (message_type != TELEMETRY_MESSAGE_GPS &&
+            if (message_type != TELEMETRY_MESSAGE_GPS_BATCH &&
                 message_type != TELEMETRY_MESSAGE_REFLECTANCE) {
                 invalid = entry->state != ENTRY_FREE &&
                           entry->state != ENTRY_FILLING;
             } else if (entry->state == ENTRY_STAGED) {
-                if (s_pending_reflectance != entry) {
+                telemetry_entry_t **pending =
+                    message_type == TELEMETRY_MESSAGE_GPS_BATCH
+                        ? &s_pending_gps_batch : &s_pending_reflectance;
+                if (*pending != entry) {
                     invalid = true;
                 } else {
-                    s_pending_reflectance = NULL;
+                    *pending = NULL;
                     entry->state = ENTRY_RECLAIMING;
                     reclaim = true;
                     expired = true;
@@ -670,10 +690,13 @@ static void expire_stale_entries(int64_t now_us)
             if (expired) {
                 sequence = entry_sequence(entry);
                 age_ms = (uint64_t)(now_us - entry->admitted_us) / 1000ULL;
-                if (message_type == TELEMETRY_MESSAGE_GPS)
-                    expired_count = ++s_status.gps_expired;
-                else
+                if (message_type == TELEMETRY_MESSAGE_GPS_BATCH) {
+                    uint16_t records = entry_gps_record_count(entry);
+                    s_status.gps_expired += records;
+                    expired_count = ++s_status.gps_batches_expired;
+                } else {
                     expired_count = ++s_status.reflectance_expired;
+                }
             }
         }
         taskEXIT_CRITICAL(&s_lock);
@@ -777,9 +800,9 @@ static telemetry_entry_t *take_queued(QueueHandle_t queue,
 
 static esp_err_t serialize_entry(telemetry_entry_t *entry, size_t *length)
 {
-    if (entry->message_type == TELEMETRY_MESSAGE_GPS) {
-        return data_record_serialize_gps(&entry->record.gps, s_record_buffer,
-                                         sizeof(s_record_buffer), length);
+    if (entry->message_type == TELEMETRY_MESSAGE_GPS_BATCH) {
+        return gps_batch_serialize(&entry->record.gps_batch, s_record_buffer,
+                                   sizeof(s_record_buffer), length);
     }
     if (entry->message_type == TELEMETRY_MESSAGE_REFLECTANCE) {
         return data_record_serialize_reflectance(
@@ -866,10 +889,12 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
         if (s_config.delivery_mode ==
             TELEMETRY_DELIVERY_FIRE_AND_FORGET) {
             taskENTER_CRITICAL(&s_lock);
-            if (entry->message_type == TELEMETRY_MESSAGE_GPS)
-                s_status.gps_sent++;
-            else if (entry->message_type == TELEMETRY_MESSAGE_REFLECTANCE)
+            if (entry->message_type == TELEMETRY_MESSAGE_GPS_BATCH) {
+                s_status.gps_sent += entry_gps_record_count(entry);
+                s_status.gps_batches_sent++;
+            } else if (entry->message_type == TELEMETRY_MESSAGE_REFLECTANCE) {
                 s_status.reflectance_sent++;
+            }
             taskEXIT_CRITICAL(&s_lock);
             release_entry(entry);
             return ESP_OK;
@@ -950,6 +975,66 @@ static void release_due_reflectance(int64_t now_us)
     release_entry(entry);
 }
 
+static esp_err_t queue_gps_batch(telemetry_entry_t *entry)
+{
+    if (!is_gps_entry(entry) || entry->record.gps_batch.record_count == 0) {
+        note_pool_fault("empty or mistyped GPS batch queued");
+        if (entry != NULL) release_entry(entry);
+        return ESP_FAIL;
+    }
+    /* Once published to the worker queue, ownership may transfer immediately.
+     * Snapshot everything the producer still needs before xQueueSend(). */
+    const uint16_t record_count = entry->record.gps_batch.record_count;
+    if (xQueueSend(s_gps_queue, &entry, 0) == pdTRUE) {
+        taskENTER_CRITICAL(&s_lock);
+        if (entry->state == ENTRY_ENQUEUING)
+            entry->state = ENTRY_QUEUED;
+        s_status.gps_batches_submitted++;
+        if (record_count < s_config.gps_batch_max_records) {
+            s_status.gps_partial_batches++;
+        }
+        taskEXIT_CRITICAL(&s_lock);
+        return ESP_OK;
+    }
+    note_pool_fault("GPS batch ready list overflow");
+    release_entry(entry);
+    return ESP_FAIL;
+}
+
+/** Seal a count-, age-, or finish-limited partial batch. The admission time is
+ * the first contained GPS arrival, so batching consumes part of (rather than
+ * extending) the configured retained-pool residency budget. */
+static void release_due_gps_batch(int64_t now_us)
+{
+    telemetry_entry_t *entry = NULL;
+    bool invalid_state = false;
+    taskENTER_CRITICAL(&s_lock);
+    if (s_pending_gps_batch != NULL) {
+        telemetry_entry_t *pending = s_pending_gps_batch;
+        bool full = gps_batch_is_full(
+            &pending->record.gps_batch, s_config.gps_batch_max_records);
+        bool due = now_us >= pending->admitted_us &&
+            (uint64_t)(now_us - pending->admitted_us) >=
+                (uint64_t)s_config.gps_batch_max_delay_ms * 1000ULL;
+        bool finishing = !s_accepting && s_submitters == 0;
+        if (full || due || finishing) {
+            if (pending->state != ENTRY_STAGED) {
+                invalid_state = true;
+            } else {
+                s_pending_gps_batch = NULL;
+                pending->state = ENTRY_ENQUEUING;
+                entry = pending;
+            }
+        }
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    if (invalid_state) {
+        note_pool_fault("pending GPS batch is not staged");
+        return;
+    }
+    if (entry != NULL) (void)queue_gps_batch(entry);
+}
+
 static void telemetry_task(void *unused)
 {
     (void)unused;
@@ -961,6 +1046,7 @@ static void telemetry_task(void *unused)
             xQueueReset(s_gps_queue);
             xQueueReset(s_ready_queue);
             taskENTER_CRITICAL(&s_lock);
+            s_pending_gps_batch = NULL;
             s_pending_reflectance = NULL;
             s_next_reflectance_release_us = 0;
             taskEXIT_CRITICAL(&s_lock);
@@ -977,6 +1063,7 @@ static void telemetry_task(void *unused)
          * slots, rather than a single stop-and-wait current message. */
         while (drain_downlink(0)) {}
         int64_t now_us = esp_timer_get_time();
+        release_due_gps_batch(now_us);
         /* Fresh ACKs win over expiry. Anything still retained beyond the
          * residency window is then shed before another retry or new send. */
         expire_stale_entries(now_us);
@@ -989,7 +1076,7 @@ static void telemetry_task(void *unused)
          * retained slots. Probe rate rises with pool pressure, but remains
          * globally capped at ten messages per second. */
         telemetry_entry_t *entry = take_queued(
-            s_gps_queue, TELEMETRY_MESSAGE_GPS);
+            s_gps_queue, TELEMETRY_MESSAGE_GPS_BATCH);
         if (entry == NULL &&
             s_config.delivery_mode == TELEMETRY_DELIVERY_APPLICATION_ACK)
             entry = take_retry_due();
@@ -1020,34 +1107,99 @@ static void telemetry_task(void *unused)
 
 static esp_err_t enqueue_gps(const gps_record_t *record)
 {
-    telemetry_entry_t *entry = acquire_entry();
-    if (entry != NULL) {
-        entry->record.gps = *record;
-        if (!try_mark_admitted(entry, TELEMETRY_MESSAGE_GPS,
-                               ENTRY_ENQUEUING)) {
-            release_entry(entry);
-            return ESP_ERR_INVALID_STATE;
+    /* A metadata transition (most commonly idle/session/segment) seals the
+     * old partial batch before this record starts a new one. At most two loop
+     * passes are normally needed; the loop also makes a future second producer
+     * safe without holding the cross-core spinlock across free-queue access. */
+    while (true) {
+        telemetry_entry_t *sealed = NULL;
+        esp_err_t append_result = ESP_ERR_NOT_FOUND;
+        taskENTER_CRITICAL(&s_lock);
+        telemetry_entry_t *pending = s_pending_gps_batch;
+        if (pending != NULL) {
+            if (pending->state != ENTRY_STAGED) {
+                taskEXIT_CRITICAL(&s_lock);
+                note_pool_fault("invalid staged GPS batch");
+                return ESP_FAIL;
+            }
+            append_result = gps_batch_append(
+                &pending->record.gps_batch, record);
+            if (append_result == ESP_OK) {
+                s_status.gps_submitted++;
+                if (gps_batch_is_full(&pending->record.gps_batch,
+                                      s_config.gps_batch_max_records)) {
+                    s_pending_gps_batch = NULL;
+                    pending->state = ENTRY_ENQUEUING;
+                    sealed = pending;
+                }
+            } else if (append_result == ESP_ERR_INVALID_STATE) {
+                /* Shared DHR metadata changed. Preserve both sides by sealing
+                 * the old batch and retrying this record as the next batch. */
+                s_pending_gps_batch = NULL;
+                pending->state = ENTRY_ENQUEUING;
+                sealed = pending;
+            }
         }
-        if (xQueueSend(s_gps_queue, &entry, 0) == pdTRUE) {
-            taskENTER_CRITICAL(&s_lock);
-            if (entry->state == ENTRY_ENQUEUING)
-                entry->state = ENTRY_QUEUED;
-            s_status.gps_submitted++;
-            taskEXIT_CRITICAL(&s_lock);
-            return ESP_OK;
+        taskEXIT_CRITICAL(&s_lock);
+        if (sealed != NULL) {
+            esp_err_t result = queue_gps_batch(sealed);
+            if (result != ESP_OK) return result;
+            if (append_result == ESP_OK) return ESP_OK;
+            continue;
         }
-        note_pool_fault("GPS ready list overflow");
-        release_entry(entry);
-    }
+        if (append_result == ESP_OK) return ESP_OK;
+        if (append_result != ESP_ERR_NOT_FOUND) return append_result;
 
-    taskENTER_CRITICAL(&s_lock);
-    uint32_t dropped = ++s_status.gps_queue_overflows;
-    taskEXIT_CRITICAL(&s_lock);
-    if (dropped == 1 || dropped % 100U == 0) {
-        ESP_LOGW(TAG, "Telemetry pool full; GPS dropped=%lu",
-                 (unsigned long)dropped);
+        telemetry_entry_t *candidate = acquire_entry();
+        if (candidate == NULL) {
+            taskENTER_CRITICAL(&s_lock);
+            uint32_t dropped = ++s_status.gps_queue_overflows;
+            taskEXIT_CRITICAL(&s_lock);
+            if (dropped == 1 || dropped % 100U == 0) {
+                ESP_LOGW(TAG, "Telemetry pool full; GPS dropped=%lu",
+                         (unsigned long)dropped);
+            }
+            return ESP_ERR_NO_MEM;
+        }
+        gps_batch_reset(&candidate->record.gps_batch);
+        esp_err_t result = gps_batch_append(
+            &candidate->record.gps_batch, record);
+        if (result != ESP_OK) {
+            release_entry(candidate);
+            return result;
+        }
+
+        bool installed = false;
+        bool active = false;
+        bool immediately_full = false;
+        int64_t admitted_us = esp_timer_get_time();
+        taskENTER_CRITICAL(&s_lock);
+        active = s_accepting && !s_abort_requested &&
+                 s_status.mission_id != 0;
+        if (active && s_pending_gps_batch == NULL) {
+            candidate->message_type = TELEMETRY_MESSAGE_GPS_BATCH;
+            candidate->admitted_us = admitted_us;
+            candidate->state = ENTRY_STAGED;
+            s_status.pool_used++;
+            if (s_status.pool_used > s_status.pool_high_watermark)
+                s_status.pool_high_watermark = s_status.pool_used;
+            s_status.gps_submitted++;
+            s_pending_gps_batch = candidate;
+            installed = true;
+            immediately_full = s_config.gps_batch_max_records == 1;
+            if (immediately_full) {
+                s_pending_gps_batch = NULL;
+                candidate->state = ENTRY_ENQUEUING;
+            }
+        }
+        taskEXIT_CRITICAL(&s_lock);
+        if (!installed) {
+            release_entry(candidate);
+            if (!active) return ESP_ERR_INVALID_STATE;
+            continue;
+        }
+        return immediately_full ? queue_gps_batch(candidate) : ESP_OK;
     }
-    return ESP_ERR_NO_MEM;
 }
 
 static esp_err_t enqueue_reflectance(const reflectance_record_t *record)
@@ -1159,14 +1311,22 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
         (config->fragment_gap_ms != 0 && config->fragment_gap_ms < 6) ||
         config->source_id == 0 ||
         config->ack_timeout_ms == 0 || config->max_retries > 3 ||
+        config->delivery_mode < TELEMETRY_DELIVERY_APPLICATION_ACK ||
         config->delivery_mode > TELEMETRY_DELIVERY_FIRE_AND_FORGET ||
         config->pool_length < TELEMETRY_MIN_POOL_LENGTH ||
         config->pool_length > TELEMETRY_MAX_POOL_LENGTH ||
         config->max_residency_ms > TELEMETRY_MAX_RESIDENCY_MS ||
         config->reflectance_interval_ms >
             TELEMETRY_MAX_REFLECTANCE_INTERVAL_MS ||
+        config->gps_batch_max_records == 0 ||
+        config->gps_batch_max_records > GPS_BATCH_MAX_RECORDS ||
+        config->gps_batch_max_delay_ms == 0 ||
+        config->gps_batch_max_delay_ms > TELEMETRY_MAX_GPS_BATCH_DELAY_MS ||
+        (config->max_residency_ms != 0 &&
+         config->gps_batch_max_delay_ms > config->max_residency_ms) ||
         (config->fragment_gap_ms != 0 &&
          pdMS_TO_TICKS(config->fragment_gap_ms) == 0) ||
+        pdMS_TO_TICKS(config->gps_batch_max_delay_ms) == 0 ||
         pdMS_TO_TICKS(config->ack_timeout_ms) == 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1232,10 +1392,13 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     s_status.source_id = config->source_id;
     s_status.pool_capacity = config->pool_length;
     s_status.max_residency_ms = config->max_residency_ms;
+    s_status.gps_batch_max_records = config->gps_batch_max_records;
+    s_status.gps_batch_max_delay_ms = config->gps_batch_max_delay_ms;
     s_accepting = false;
     s_sending = false;
     s_abort_requested = false;
     s_submitters = 0;
+    s_pending_gps_batch = NULL;
     s_pending_reflectance = NULL;
     s_next_reflectance_release_us = 0;
     s_ack_stream_length = 0;
@@ -1252,7 +1415,8 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     }
 
     ESP_LOGI(TAG,
-             "DTU UART%d TX=GPIO%d RX=GPIO%d %lu 8N1; gap=%lums GPS=FIFO "
+             "DTU UART%d TX=GPIO%d RX=GPIO%d %lu 8N1; gap=%lums "
+             "GPS=DGB1/%u/%lums "
              "source=%016llX delivery=%s ACK=%lums retries=%u retention=%lums "
              "reflectance=%s%lums; "
              "async_pool=%u entries, "
@@ -1260,6 +1424,8 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
              config->uart_port, config->tx_gpio, config->rx_gpio,
              (unsigned long)config->baud_rate,
              (unsigned long)config->fragment_gap_ms,
+             (unsigned)config->gps_batch_max_records,
+             (unsigned long)config->gps_batch_max_delay_ms,
              (unsigned long long)config->source_id,
              config->delivery_mode == TELEMETRY_DELIVERY_FIRE_AND_FORGET
                  ? "fire-and-forget" : "application-ACK",
@@ -1279,7 +1445,8 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     taskENTER_CRITICAL(&s_lock);
     bool available = s_status.mission_id == 0 && !s_accepting &&
                      !s_abort_requested && s_submitters == 0 &&
-                     s_status.pool_used == 0;
+                     s_status.pool_used == 0 &&
+                     s_pending_gps_batch == NULL;
     taskEXIT_CRITICAL(&s_lock);
     if (!available || uxQueueMessagesWaiting(s_gps_queue) != 0 ||
         uxQueueMessagesWaiting(s_ready_queue) != 0 ||
@@ -1315,9 +1482,12 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     s_status.mission_id = mission_id;
     s_status.pool_capacity = s_config.pool_length;
     s_status.max_residency_ms = s_config.max_residency_ms;
+    s_status.gps_batch_max_records = s_config.gps_batch_max_records;
+    s_status.gps_batch_max_delay_ms = s_config.gps_batch_max_delay_ms;
     s_accepting = true;
     s_sending = false;
     s_submitters = 0;
+    s_pending_gps_batch = NULL;
     s_pending_reflectance = NULL;
     s_next_reflectance_release_us = first_reflectance_release_us;
     taskEXIT_CRITICAL(&s_lock);
@@ -1365,7 +1535,8 @@ static bool mission_delivery_drained(void)
 {
     taskENTER_CRITICAL(&s_lock);
     bool idle_before = !s_sending && s_submitters == 0 &&
-                       s_status.pool_used == 0;
+                       s_status.pool_used == 0 &&
+                       s_pending_gps_batch == NULL;
     taskEXIT_CRITICAL(&s_lock);
     if (!idle_before) return false;
     if (uxQueueMessagesWaiting(s_gps_queue) != 0 ||
@@ -1374,7 +1545,8 @@ static bool mission_delivery_drained(void)
     }
     taskENTER_CRITICAL(&s_lock);
     bool idle_after = !s_sending && s_submitters == 0 &&
-                      s_status.pool_used == 0;
+                      s_status.pool_used == 0 &&
+                      s_pending_gps_batch == NULL;
     taskEXIT_CRITICAL(&s_lock);
     return idle_after;
 }
@@ -1416,8 +1588,18 @@ esp_err_t telemetry_abort_mission(void)
     s_accepting = false;
     s_abort_requested = true;
     s_status.shutdown_aborted = true;
-    if (first_abort)
+    if (first_abort) {
         s_status.messages_abandoned_shutdown += s_status.pool_used;
+        for (size_t i = 0; i < s_config.pool_length; i++) {
+            if (is_gps_entry(&s_pool[i]) &&
+                s_pool[i].state != ENTRY_FREE &&
+                s_pool[i].state != ENTRY_FILLING) {
+                s_status.gps_records_abandoned_shutdown +=
+                    entry_gps_record_count(&s_pool[i]);
+            }
+        }
+    }
+    s_pending_gps_batch = NULL;
     taskEXIT_CRITICAL(&s_lock);
     /* Remove every not-yet-dequeued pointer immediately. The worker owns pool
      * reclamation and observes s_abort_requested between fragments, so this

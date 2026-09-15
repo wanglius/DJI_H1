@@ -13,10 +13,11 @@ sys.path.insert(0, str(ROOT / "tools" / "mission_viewer"))
 from dji_h1_viewer.telemetry import (  # noqa: E402
     ACK_STATUS_ACCEPTED, ACK_STATUS_PERMANENT_REJECTION,
     FRAGMENT_HEADER_SIZE, FRAGMENT_MAGIC, FRAGMENT_PAYLOAD_MAX,
-    FRAGMENT_WIRE_MAX_SIZE, FragmentError, MESSAGE_GPS, MESSAGE_REFLECTANCE,
+    FRAGMENT_WIRE_MAX_SIZE, FragmentError, GPS_BATCH_MAX_RECORDS,
+    MESSAGE_GPS, MESSAGE_GPS_BATCH, MESSAGE_REFLECTANCE,
     TelemetryFragmentStreamDecoder, TelemetryReassembler,
-    decode_acknowledgement, decode_fragment, encode_acknowledgement,
-    fragment_message,
+    decode_acknowledgement, decode_fragment, decode_gps_batch,
+    encode_acknowledgement, encode_gps_batch, fragment_message,
 )
 
 
@@ -31,7 +32,69 @@ def _validly_tamper_fragment(encoded: bytes, payload_offset: int = 0) -> bytes:
     return bytes(damaged)
 
 
+_RECORD_HEADER = struct.Struct("<IHHIIIHHIQQQIHBB")
+_GPS_BODY = struct.Struct("<B3xiiiIIH8B")
+
+
+def _gps_record(sequence: int, *, session: int = 7,
+                segment: int = 2) -> bytes:
+    body = _GPS_BODY.pack(
+        sequence & 0xFF, 311234567 + sequence, 1211234567 + sequence,
+        120000 + sequence, 1789430400, 5000 + sequence * 200,
+        sequence * 200 % 1000, 3, 4, 2, 1, 6, 88, 0, 15,
+    )
+    header = _RECORD_HEADER.pack(
+        0x31524844, 1, MESSAGE_GPS, _RECORD_HEADER.size, 98,
+        session, segment, 0, sequence,
+        1_000_000 + sequence * 200_000,
+        5_000 + sequence * 200,
+        1_789_430_400_000 + sequence * 200,
+        sequence, 2, 2, 7,
+    )
+    without_crc = header + body
+    return without_crc + struct.pack(
+        "<I", zlib.crc32(without_crc) & 0xFFFFFFFF)
+
+
 class TelemetryTransportTests(unittest.TestCase):
+    def test_ten_gps_records_compress_into_one_fragment_losslessly(self) -> None:
+        records = tuple(_gps_record(index) for index in range(10, 20))
+        batch = encode_gps_batch(records)
+        self.assertEqual(len(batch), 744)
+        self.assertEqual(decode_gps_batch(batch), records)
+        encoded, = fragment_message(
+            MESSAGE_GPS_BATCH, 42, 10, batch,
+            source_id=0x123456789ABC,
+        )
+        self.assertEqual(len(encoded), 792)
+        message = TelemetryReassembler().push(encoded)
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertEqual(message.message_type, MESSAGE_GPS_BATCH)
+        self.assertEqual(decode_gps_batch(message.payload), records)
+
+    def test_partial_gps_batch_and_crc_validation(self) -> None:
+        # A source-side loss remains visible as a sequence gap; batching must
+        # preserve it without rejecting the later valid record.
+        records = (_gps_record(20), _gps_record(22))
+        encoded = encode_gps_batch(records)
+        self.assertEqual(decode_gps_batch(encoded), records)
+        damaged = bytearray(encoded)
+        damaged[-1] ^= 1
+        with self.assertRaisesRegex(FragmentError, "GPS batch CRC"):
+            decode_gps_batch(damaged)
+
+    def test_gps_batch_rejects_metadata_transition_and_nonforward_sequence(
+            self) -> None:
+        with self.assertRaisesRegex(FragmentError, "share DHR1 metadata"):
+            encode_gps_batch((_gps_record(1), _gps_record(2, segment=3)))
+        with self.assertRaisesRegex(FragmentError, "not forward"):
+            encode_gps_batch((_gps_record(2), _gps_record(1)))
+        with self.assertRaisesRegex(FragmentError, "1..10"):
+            encode_gps_batch(tuple(
+                _gps_record(index) for index in
+                range(1, GPS_BATCH_MAX_RECORDS + 2)))
+
     def test_gps_fits_one_fragment(self) -> None:
         payload = _payload(98)
         encoded, = fragment_message(MESSAGE_GPS, 7, 12, payload)
