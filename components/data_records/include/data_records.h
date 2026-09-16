@@ -32,6 +32,9 @@ esp_err_t data_record_serialize_reflectance(
 esp_err_t data_record_serialize_gps(const gps_record_t *record,
                                     void *output, size_t output_capacity,
                                     size_t *output_length);
+esp_err_t data_record_serialize_operation_event(
+    const operation_event_record_t *record, void *output,
+    size_t output_capacity, size_t *output_length);
 
 #ifdef __cplusplus
 }

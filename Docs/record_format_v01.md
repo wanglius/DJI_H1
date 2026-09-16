@@ -49,7 +49,10 @@ and `reflectance_rate_limited` counts older pending candidates intentionally
 superseded before a sampling tick. Rate limiting is expected and does not make
 `delivery_degraded` true. `max_residency_ms` records the configured maximum
 time that a live record may occupy the telemetry pool; `gps_expired` and
-`reflectance_expired` count records deliberately shed after that age. Any
+`reflectance_expired` count records deliberately shed after that age.
+`events_offered`, `events_submitted`, `events_sent`,
+`event_queue_overflows`, and `events_expired` provide the equivalent accounting
+for compact live operation events. Any
 nonzero expiration count makes `delivery_degraded` true, but does not imply an
 SD-recording failure or an unhealthy telemetry component.
 
@@ -92,6 +95,22 @@ That mission-level setting applies to every binary record in the folder without
 changing v01 or redundantly storing the same offset in every spectrum. Operation
 events repeat `timezone_name` and `utc_offset_minutes` because JSONL lines are
 designed to remain useful when recovered independently.
+
+## Live operation-event record
+
+`EVENTS.JSONL` remains the complete authoritative SD event history and is not
+replaced by a binary SD file. For MQTT only, a major event is represented as a
+76-byte DHR1 type-4 record: the 60-byte common header, followed by little-endian
+`event_code:uint16`, `severity:uint8`, zero `reserved:uint8`,
+`argument0:uint32`, `argument1:int32`, and the normal four-byte DHR1 CRC.
+Severity values are info `0`, warning `1`, error `2`, and critical `3`.
+
+The compact form carries the same event sequence, session/segment identity and
+synchronized timestamp as the JSONL line. High-frequency CRC, parser-timeout,
+and clock-drop events send the first and every hundredth occurrence live;
+reflectance-rejection JSONL creation is already limited to the first and every
+hundredth rejected calculation. These policies reduce live alarm floods but do
+not remove or coalesce records in `EVENTS.JSONL`.
 
 ## Measurement interpretation and durability
 

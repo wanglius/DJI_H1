@@ -1,6 +1,6 @@
 # DJI_H1 无人机载双光谱仪项目交接手册
 
-> 文档状态：按 `main` 分支 DGB1 GPS 合包与 4 Hz 饱和遥测资格里程碑（2026-09-15）整理
+> 文档状态：4 Hz 遥测已完成饱和资格；当前工作区候选版改为 5 Hz 并增加实时重大事件，尚待硬件复测（2026-09-16）
 > 适用对象：首次接手本项目的嵌入式、上位机、数据处理及联调工程师
 > 目的：说明当前系统能做什么、如何运行、数据如何流动、如何验证，以及仍有哪些风险和待办事项
 
@@ -54,7 +54,7 @@ A 板模拟器 ──UART0──> B 板状态机
                                       └── MISSION.JSON
 ```
 
-4G DTU/MQTT 实时上传链路已经接入：A 板 5 Hz GPS 在 SD 卡上仍逐条保存为 98 字节 DHR1，但遥测把最多 10 条相邻 GPS 无损压成一个 DGB1 消息（满 10 条或首条等待 2 秒即封包），从而把正常 GPS 消息和 DTA1 数量降到原来的约十分之一。反射率在 SD 卡保持全速记录，实时遥测每 250 ms 只选择最新一帧（上限 4 Hz）。两类消息共用 PSRAM 保留池，UART 连续发送，云端 DTA1 确认后才释放。测量上行保持 MQTT QoS 1；DTA1 下行使用 QoS 0，丢失的 ACK 由 B 板应用层重试和 10 秒最大驻留策略处理。网络拥塞不得阻塞采集或 SD 写入。2026-09-15 已在专用板、YY-M200 和真实 EMQX 链路上完成 DGB1 及 4 Hz 饱和长航次资格测试；最终高照度十分钟任务在地面完整恢复 2910 条 GPS 和全部 1277 条已选反射率，零 GPS 序号缺口、零未完成重组，并安全收尾。完整设计、线格式、计数器和实测数据见第 7.1 节。
+4G DTU/MQTT 实时上传链路已经接入：A 板 5 Hz GPS 在 SD 卡上仍逐条保存为 98 字节 DHR1，但遥测把最多 10 条相邻 GPS 无损压成一个 DGB1 消息（满 10 条或首条等待 2 秒即封包），从而把正常 GPS 消息和 DTA1 数量降到原来的约十分之一。反射率在 SD 卡保持全速记录；当前候选固件每 200 ms 选择最新一帧（上限 5 Hz），并以 DHR1 类型 4 实时上传握手、采集启停、断链/恢复等重大事件。三类消息共用 PSRAM 保留池，事件使用独立高优先级队列，云端 DTA1 确认后才释放。测量上行保持 MQTT QoS 1；DTA1 下行使用 QoS 0，丢失的 ACK 由 B 板应用层重试和 10 秒最大驻留策略处理。网络拥塞不得阻塞采集或 SD 写入。2026-09-15 已在专用板、YY-M200 和真实 EMQX 链路上完成 DGB1 及 4 Hz 饱和长航次资格测试；最终高照度十分钟任务在地面完整恢复 2910 条 GPS 和全部 1277 条已选反射率。该结果只资格了 4 Hz；5 Hz 和实时事件仍须重新完成 60 秒及十分钟硬件测试。完整设计、线格式、计数器和实测数据见第 7.1 节。
 
 地面 live viewer 使用同一套 Python 解码器，但 MQTT 传输、DTF2/记录处理和 Qt 展示已经分成三个独立执行阶段。Paho 回调只复制 payload 到 512 项有界 ingress queue 后立即返回；decoder worker 完成重组、CRC、去重和 live store 更新；独立 ACK worker 发布 DTA1；Qt 每秒只读取带 revision 的不可变快照。队列满时会计数并故意不发 DTA1，由 B 板既有重试/驻留策略恢复，不能伪造接纳成功。2026-09-16 的 EMQX 四路 trace 曾捕获一次 2.635 s 地面 PUBACK 停顿：broker 在此期间持续接收和转发上行，证明旧版同步 Paho callback/地面链路是可隔离瓶颈；上述重构已通过 host 测试，但仍需下一次真实十分钟任务确认 callback、processor 和 ACK queue 峰值均保持有界。
 
@@ -62,7 +62,7 @@ A 板模拟器 ──UART0──> B 板状态机
 
 - GitHub：`https://github.com/wanglius/DJI_H1.git`
 - 主分支：`main`
-- 本文整理时基线：本文所在的 DGB1 GPS 合包与 4 Hz 饱和遥测资格提交
+- 本文整理时基线：4 Hz 已资格基线之上的 5 Hz + 实时重大事件候选改动
 - ESP-IDF：v5.5.5
 - 主要语言：C、Python、Markdown
 - 固件目标：ESP32-S3
@@ -205,7 +205,7 @@ SC16 初始化完成后，固件固定等待 500 ms，再准备两台 H1。该�
 | `measurement_recorder` | 固定内存池、消息队列、单 SD 写任务、多文件记录、周期刷盘与收尾 |
 | `sd_card` | SD 挂载、目录、文件、刷盘、修改时间和原子替换的串行化封装 |
 | `telemetry_transport` | DTF2 分片、CRC、DTA1 编解码；与 UART、MQTT 和任务调度无关的纯传输线格式 |
-| `telemetry` | 512 项 PSRAM 保留池、4 Hz 反射率选择、5 Hz GPS 的 10 条/2 秒批处理、UART1 独占发送、ACK 匹配、重试、过期和断电放弃 |
+| `telemetry` | 512 项 PSRAM 保留池、候选 5 Hz 反射率选择、重大事件优先队列、5 Hz GPS 的 10 条/2 秒批处理、UART1 独占发送、ACK 匹配、重试、过期和断电放弃 |
 
 重要的不变量：`CONFIG_FATFS_FS_LOCK=0`，项目依赖 `sd_card` 组件内部互斥锁保护 FatFs。卡挂载后，其他模块不得绕过该组件直接调用 `fopen()`、`write()` 等访问 `/sdcard`，否则多任务访问可能破坏文件系统一致性。
 
@@ -238,12 +238,13 @@ SC16 初始化完成后，固件固定等待 500 ms，再准备两台 H1。该�
 
 #### 7.1.1 定位和职责边界
 
-遥测是 SD 记录之外的“实时观察副本”，不是任务数据的权威存储。当前上传两类测量语义：
+遥测是 SD 记录之外的“实时观察副本”，不是任务数据的权威存储。当前上传三类语义：
 
 - `GPS_BATCH`（消息类型 5）：最多 10 条已经完成的 v01 GPS 记录组成的 DGB1 无损批次；消息类型 1 只为兼容旧固件留下；
-- `REFLECTANCE`（消息类型 3）：地面帧与因果天空帧计算完成后的完整反射率记录。
+- `REFLECTANCE`（消息类型 3）：地面帧与因果天空帧计算完成后的完整反射率记录；
+- `OPERATION_LOG`（消息类型 4）：握手、采集启停、断电预告、A/B 链路丢失/恢复等带时间戳和严重度的重大事件。
 
-原始 A/B 光谱和操作事件目前只写 SD，不经 4G 上传。GPS 和反射率在 `measurement_recorder` 边界分叉成 SD 与遥测两条独立路径；两条路径不承诺先后次序，遥测副本进入池也不等于 SD 已经落盘。提交给 `telemetry` 的记录内容在其整个保留期内保持不可变。因此必须一直保持以下边界：
+原始 A/B 光谱仍只写 SD，不经 4G 上传。`EVENTS.JSONL` 保留完整事件历史；实时类型 4 只是重大事件副本，高频诊断事件只上传首次和每第 100 次。GPS、反射率和事件在 `measurement_recorder` 边界分叉成 SD 与遥测两条独立路径；两条路径不承诺先后次序，遥测副本进入池也不等于 SD 已经落盘。提交给 `telemetry` 的记录内容在其整个保留期内保持不可变。因此必须一直保持以下边界：
 
 ```text
 A 板 5 Hz 定位 ──> measurement_recorder ──> GPS_TRACK.BIN（逐条 DHR1，权威）
@@ -251,7 +252,10 @@ A 板 5 Hz 定位 ──> measurement_recorder ──> GPS_TRACK.BIN（逐条 DH
                                                    └─> DTF2 ──> DTU ──> MQTT
 
 H1-A/H1-B ──> calculation ──> measurement_recorder ──> REFLECTANCE.BIN（全速、权威）
-                                  └─> latest-value 4 Hz ──> telemetry pool
+                                  └─> latest-value 5 Hz ──> telemetry pool
+
+状态机/诊断 ──> measurement_recorder ──> EVENTS.JSONL（完整、权威）
+                                      └─> 重大事件优先 FIFO ──> telemetry pool
 ```
 
 网络拥塞、DTU 断线、ACK 丢失、池满或条目过期都不得阻塞 H1、`ab_link` 或 SD writer。SD 成功写入和 MQTT 成功送达是两个独立结论；任何地面软件都不得用“MQTT 中看到了数据”替代 SD 任务文件的完整性检查。
@@ -271,7 +275,7 @@ H1-A/H1-B ──> calculation ──> measurement_recorder ──> REFLECTANCE.B
 | 上行 MQTT QoS | 1 |
 | 下行 DTA1 发布 QoS | 0 |
 | GPS 输入/遥测目标 | 5 Hz / 全部记录进入 DGB1，最多 10 条或 2000 ms 一包 |
-| 反射率 SD/遥测 | 全速记录 / 每 250 ms 选最新一条，最高 4 Hz |
+| 反射率 SD/遥测 | 全速记录 / 每 200 ms 选最新一条，候选最高 5 Hz（未资格） |
 | PSRAM 保留池 | 512 项，约 1.6 MiB |
 | 首次 ACK 超时 | 3000 ms |
 | 正常重试 | 1 次；第二次等待名义上为 6000 ms |
@@ -291,8 +295,8 @@ DTU 是透明串口模块，MQTT broker、端口、client ID、用户名、上/�
 
 - `source_id`：启动时读取 ESP32 出厂 48 位 MAC，按网络可读顺序装入非零 `uint64_t`；它标识物理 B 板，不依赖 SD 卡或固件版本；
 - `mission_id`：任务目录成功打开后，由两个 `esp_random()` 组合出新的非零 64 位值，并写入 `MISSION.JSON`；它不同于 `F_####`，换卡、格式化或目录编号重复也不应复用；
-- `message_type`：旧版单条 GPS 为 1，反射率为 3，DGB1 GPS 批次为 5；1..4 与 `data_record_type_t` 对齐，5 是纯遥测扩展；
-- `message_sequence`：反射率沿用 v01 内层记录 sequence；DGB1 使用批次第一条 GPS 的 record sequence。反射率经过 latest-value 选择后，地面看到序号间隙是正常现象，不能据此把未选择上传的帧误报成 SD 丢帧。
+- `message_type`：旧版单条 GPS 为 1，反射率为 3，操作事件为 4，DGB1 GPS 批次为 5；1..4 与 `data_record_type_t` 对齐，5 是纯遥测扩展；
+- `message_sequence`：反射率和事件沿用各自 v01 内层记录 sequence；DGB1 使用批次第一条 GPS 的 record sequence。反射率经过 latest-value 选择后，地面看到序号间隙是正常现象，不能据此把未选择上传的帧误报成 SD 丢帧。
 
 接收端去重、重组和 ACK 必须使用上述身份以及完整消息 CRC。仅按 sequence 去重会把不同设备、不同任务或不同类型的数据错误合并。
 
@@ -303,16 +307,18 @@ GPS 不做 latest-value 覆盖：每个被 A/B 链路接受并成功封装的 5 
 反射率采用“时间格最新值”策略：
 
 1. 每个有效计算结果都计入 `reflectance_offered`，并始终写入 SD；
-2. 当前 250 ms 时间格内只在池中暂存最新候选；
+2. 当前 200 ms 时间格内只在池中暂存最新候选；
 3. 新结果替换尚未到发送时刻的旧候选时，增加 `reflectance_rate_limited`，这属于设计内降采样，不是故障；
 4. 到达时间格边界时，只把当时最新候选送入可靠发送 FIFO；空时间格不补发，任务延迟后也不突发“补课”；
 5. 被选中的记录保留原始测量时间戳、计算序号和地面/天空帧关联。
 
-发送任务的优先次序是：新 GPS 批次、普通 ACK 超时重试、到期的恢复探针、最后是新反射率。GPS 批次优先是为了避免大反射率报文和旧重试淹没航迹。生产 10 秒驻留期限短于 30 秒恢复探针周期，因此正常生产条目会在进入探针阶段前过期；探针逻辑主要服务于禁用或放宽驻留期限的诊断配置。
+发送任务的优先次序是：新重大事件、新 GPS 批次、普通 ACK 超时重试、到期的恢复探针、最后是新反射率。事件优先保证采集启停和断链告警不会被光谱积压遮蔽，GPS 批次优先于反射率是为了避免大报文和旧重试淹没航迹。高频 CRC/超时/时钟丢失诊断只把首次和每第 100 次送入实时事件队列；计算拒绝本来就只在首次/每百次生成 JSONL 事件，这些已生成事件不再二次节流。实时策略不会删除或合并 `EVENTS.JSONL` 中已经接纳的记录。生产 10 秒驻留期限短于 30 秒恢复探针周期，因此正常生产条目会在进入探针阶段前过期；探针逻辑主要服务于禁用或放宽驻留期限的诊断配置。
+
+B 板在已建链状态下以任意 CRC 正确的 A→B 帧刷新链路时间；连续 3 秒没有有效帧时停止 `0x81` 心跳、记录并实时上报 `ab_link_lost`，然后只等待协议规定的 1 Hz 握手。下一次 ready 握手记录 `handshake` 和 `ab_link_restored`，A 板随后按 5.5 节用新的 SEQ 补发当前应有采集状态。这个 3 秒门限与 A 板对 B 心跳的超时一致，不能在未同步修改双方协议和模拟器时单边改变。
 
 #### 7.1.5 PSRAM 固定池和所有权
 
-组件启动时一次性在 8 MB PSRAM 中分配 512 个 `telemetry_entry_t`，运行中不为单条消息 `malloc/free`。联合体每项既能容纳最大 1024 采样点的反射率，也能容纳 10 条 GPS；最大成员仍是反射率，因此 DGB1 不显著扩大 PSRAM 池。FreeRTOS 队列中只传 4 字节指针，不按值复制记录。三个队列分别保存空闲项、GPS 批次 ready 指针和反射率 ready 指针。第一条 GPS 到来时就从池中保留一项并进入 `STAGED`，后续九条原位追加；封包后内容不可再修改。
+组件启动时一次性在 8 MB PSRAM 中分配 512 个 `telemetry_entry_t`，运行中不为单条消息 `malloc/free`。联合体每项既能容纳最大 1024 采样点的反射率、10 条 GPS，也能容纳 76 字节操作事件；最大成员仍是反射率，因此事件不会增大池项。FreeRTOS 队列中只传 4 字节指针，不按值复制记录。四个队列分别保存空闲项、事件 ready 指针、GPS 批次 ready 指针和反射率 ready 指针。第一条 GPS 到来时就从池中保留一项并进入 `STAGED`，后续九条原位追加；封包后内容不可再修改。
 
 条目生命周期的主要状态转换为：
 
@@ -386,11 +392,11 @@ DTU 上行 QoS 1 只证明 DTU 与 broker 之间的 MQTT 行为，ESP32 看不�
 | `gps_batches_submitted` / `gps_partial_batches` | 进入可靠 ready 路径的 DGB1 数 / 未满 10 条的批次数 | 否 |
 | `reflectance_submitted` | 成功进入可靠 ready 路径的反射率数 | 否 |
 | `reflectance_offered` | 计算模块提供的有效结果 | 否 |
-| `reflectance_rate_limited` | 在 250 ms 时间格内被更新候选替换 | 否，设计内降采样 |
-| `gps_sent` / `reflectance_sent` | 收到正 DTA1 后清除的 GPS 源记录数 / 反射率数 | 否 |
+| `reflectance_rate_limited` | 在 200 ms 时间格内被更新候选替换 | 否，设计内降采样 |
+| `gps_sent` / `reflectance_sent` / `events_sent` | 收到正 DTA1 后清除的 GPS 源记录数 / 反射率数 / 事件数 | 否 |
 | `gps_batches_sent` | 收到正 DTA1 后清除的完整 DGB1 数 | 否 |
 | `*_queue_overflows` | 池或 ready 路径无容量，新遥测副本被丢弃 | 是 |
-| `gps_expired` / `reflectance_expired` | 超过 10 秒驻留后丢弃的 GPS 源记录数 / 反射率数 | 是 |
+| `gps_expired` / `reflectance_expired` / `events_expired` | 超过 10 秒驻留后丢弃的 GPS 源记录数 / 反射率数 / 事件数 | 是 |
 | `gps_batches_expired` | 超过驻留期限的 DGB1 容器数 | 是 |
 | `messages_failed` | 正常重试耗尽或收到永久负 ACK 的逻辑消息 | 是 |
 | `messages_retried` / `acknowledgement_timeouts` | 传输和 ACK 延迟诊断 | 视结果判断 |
@@ -401,11 +407,11 @@ DTU 上行 QoS 1 只证明 DTU 与 broker 之间的 MQTT 行为，ESP32 看不�
 | `messages_abandoned_shutdown` | 断电预告时主动放弃的池项 | 设计内收尾 |
 | `gps_records_abandoned_shutdown` | 上述被放弃 DGB1 中包含的 GPS 源记录数 | 设计内收尾 |
 
-`gps_expired`、`reflectance_expired`、overflow、`messages_failed` 或基础设施故障都会使 A/B 心跳报告错误码 5，但不会关闭 recorder 或拒绝未来遥测提交。`MISSION.JSON.telemetry.delivery_degraded` 汇总可恢复的交付损失和 drain timeout；基础设施故障另由 `infrastructure_healthy=false` 以及 serialization/pool/UART 计数表示。最终摘要还保存池峰值、ACK RTT、分片/字节数、重试、下行字节、断电放弃数和 `max_residency_ms`，用于把“采集问题、SD 问题、DTU 问题、地面 ACK 问题”分开诊断。
+`gps_expired`、`reflectance_expired`、`events_expired`、overflow、`messages_failed` 或基础设施故障都会使 A/B 心跳报告错误码 5，但不会关闭 recorder 或拒绝未来遥测提交。`MISSION.JSON.telemetry.delivery_degraded` 汇总可恢复的交付损失和 drain timeout；基础设施故障另由 `infrastructure_healthy=false` 以及 serialization/pool/UART 计数表示。最终摘要还保存池峰值、ACK RTT、分片/字节数、重试、下行字节、事件计数、断电放弃数和 `max_residency_ms`，用于把“采集问题、SD 问题、DTU 问题、地面 ACK 问题”分开诊断。
 
 #### 7.1.9 断电优先级
 
-收到 A 板 `0x30` 断电预告时，`mission_control_power_off()` 立即调用 `telemetry_abort_mission()`：关闭接纳、丢弃尚未封包的部分 GPS 批次、置终态 abort latch、清空 GPS/反射率 ready queue，并要求 worker 放弃 staged、queued、in-flight、retry 和 exhausted 项。这里故意不为了“凑满十条”或发送 partial batch 等待；正在写 UART 的分片之间会检查 abort，已经交给 UART 硬件的字节可能继续移出，但不会延迟 SD 收尾。
+收到 A 板 `0x30` 断电预告时，`mission_control_power_off()` 立即调用 `telemetry_abort_mission()`：关闭接纳、丢弃尚未封包的部分 GPS 批次、置终态 abort latch、清空事件/GPS/反射率 ready queue，并要求 worker 放弃 staged、queued、in-flight、retry 和 exhausted 项。断电事件是 best-effort 实时通知，可能被同一次 abort 主动舍弃；地面不能依靠它判断可安全断电，A/B 心跳中的 `safe_power_off` 才是协议权威。这里故意不为了“凑满十条”或发送 partial batch 等待；正在写 UART 的分片之间会检查 abort，已经交给 UART 硬件的字节可能继续移出，但不会延迟 SD 收尾。
 
 这个 abort 在本次上电内不可恢复，符合“一次上电一个飞行目录，`0x30` 后等待物理切电”的生命周期。`telemetry.shutdown_aborted=true` 不是故障；它表示系统按设计牺牲尚未完成的云副本，给 SD writer barrier、flush、文件关闭、最终摘要和卸载让出确定的时间预算。
 
@@ -420,10 +426,10 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
   --host <broker-host> --mqtt-port 1883 --username <device-user> `
   --topic dji-h1/test/up --ack-topic dji-h1/test/down `
   --duration 720 --expect-qos 1 --ack-qos 0 `
-  --expect-gps-min 2900 --expect-reflectance-min 300
+  --expect-gps-min 2900 --expect-reflectance-min 300 --expect-events-min 8
 ```
 
-上面的 `300` 是允许低照度长曝光的功能回归门槛，不是 4 Hz 吞吐资格门槛。要重新资格 4 Hz，必须先从心跳/SD 计数确认 H1 源速率持续高于 4 Hz，把 `--expect-reflectance-min` 提高到 1200，并同时核对板端已选数等于地面完整数、零 expiry/overflow、池峰值有界和最终 `inflight=0`、`buffered=0`。
+上面的 `300` 是允许低照度长曝光的功能回归门槛，不是 5 Hz 吞吐资格门槛。要资格当前 5 Hz 候选，必须先从心跳/SD 计数确认 H1 源速率持续高于 5 Hz，把正常 324 秒有效采集的 `--expect-reflectance-min` 提高到约 1500，并同时核对板端已选数等于地面完整数、重大事件到达、零 expiry/overflow、池峰值有界和最终 `inflight=0`、`buffered=0`。
 
 10 分钟任务的典型顺序见 [emulator_test_sop.md](emulator_test_sop.md)：先跑 broker probe，再启动 720 秒 validator，最后启动 A 板 endurance 模拟器。validator 退出、`TELEMETRY INVALID`、未达到最低计数、仍有未完成重组或 B 板池持续增长，都应判为遥测资格测试失败。测试日志和任务报告必须使用新的前缀保存，不能只截取终端最后几行。
 
@@ -474,13 +480,13 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
 
 高照度长测的反射率 queue 平均约 171 ms、p95 约 248 ms、最大约 808 ms；反射率 DTA1 RTT 平均约 286 ms、p95 约 404 ms、最大约 779 ms。GPS DTA1 RTT 平均约 184 ms、p95 约 325 ms、最大约 650 ms。全程没有 telemetry warning/error、ACK timeout、重试、过期、overflow 或未完成地面重组。四段 recorder 都是 `dropped=0`、`rejected=0`、`write_errors=0`、`flush_errors=0`，证明 4 Hz 遥测没有反向干扰全速 SD 记录。
 
-这些结果取代了“2 Hz 是当前保守生产上限”的旧结论，但不抹去历史压力测试：2.5 Hz 反射率配合逐条 5 Hz GPS、QoS 1 DTA1 或 fire-and-forget 曾在 YY-M200 上出现明显拥塞和整条多分片消息丢失；原始比较见 [dtu_ack_qos_stress_2026-09-14.md](dtu_ack_qos_stress_2026-09-14.md)。当前可靠基线是 460800 baud、DGB1 10 条/2 秒、反射率 4 Hz、上行 QoS 1、DTA1 QoS 0 和 10 秒驻留。下一阶段仍须在真实 A 板和实际作业区域蜂窝网络中复测，不能把受控开发网络的全送达直接外推到所有覆盖、时延和丢包条件。
+这些结果取代了“2 Hz 是当前保守生产上限”的旧结论，但不抹去历史压力测试：2.5 Hz 反射率配合逐条 5 Hz GPS、QoS 1 DTA1 或 fire-and-forget 曾在 YY-M200 上出现明显拥塞和整条多分片消息丢失；原始比较见 [dtu_ack_qos_stress_2026-09-14.md](dtu_ack_qos_stress_2026-09-14.md)。已经验证的可靠基线是 460800 baud、DGB1 10 条/2 秒、反射率 4 Hz、上行 QoS 1、DTA1 QoS 0 和 10 秒驻留；当前代码把选择上限提高到 5 Hz 并加入重大事件优先通道，因此必须重新资格。下一阶段仍须在真实 A 板和实际作业区域蜂窝网络中复测，不能把受控开发网络的全送达直接外推到所有覆盖、时延和丢包条件。
 
 #### 7.1.12 代码地图和修改联动
 
 | 文件/目录 | 遥测职责 | 修改时必须联动检查 |
 |---|---|---|
-| `components/board_support/include/dji_h1_board.h` | UART、速率、ACK、池、驻留、GPS 批次和 4 Hz 生产常量 | DTU 持久配置、SOP、压力测试参数 |
+| `components/board_support/include/dji_h1_board.h` | UART、速率、ACK、池、驻留、GPS 批次和 5 Hz 候选常量 | DTU 持久配置、SOP、压力测试参数 |
 | `main/main.c` | 生成 `source_id`，显式选择 application-ACK 并启动组件 | 不得让诊断 delivery mode 成为生产默认 |
 | `components/telemetry/include/telemetry.h` | 对 recorder/mission control 的 API 和统计契约 | `MISSION.JSON` 字段、心跳降级条件、注释 |
 | `components/telemetry/telemetry.c` | 固定池、调度、UART owner、ACK、重试、过期和 abort | 所有权测试、栈/PSRAM、竞态、shutdown deadline |
@@ -500,7 +506,7 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
 
 #### 7.1.13 诊断固件隔离和待办
 
-`tests/dtu_telemetry_stress` 是独立 ESP-IDF project，会复用生产 serializer、DTF2、pool 和 UART owner，但不会被根目录生产 `CMakeLists.txt` 编进 `DJI_H1.bin`。`DTU_STRESS_FIRE_AND_FORGET`、无上限反射率输入和固定假数据只在该测试 project 的 `main` 中选择；生产 `main/main.c` 明确写死 `TELEMETRY_DELIVERY_APPLICATION_ACK`、250 ms sampler 和 10 秒驻留。刷写 stress image 会替换生产应用，测试后必须重新刷 `build-review`，并从启动横幅确认不是 `DTU_STRESS`。
+`tests/dtu_telemetry_stress` 是独立 ESP-IDF project，会复用生产 serializer、DTF2、pool 和 UART owner，但不会被根目录生产 `CMakeLists.txt` 编进 `DJI_H1.bin`。`DTU_STRESS_FIRE_AND_FORGET`、无上限反射率输入和固定假数据只在该测试 project 的 `main` 中选择；生产 `main/main.c` 明确写死 `TELEMETRY_DELIVERY_APPLICATION_ACK`、当前 200 ms sampler 和 10 秒驻留。刷写 stress image 会替换生产应用，测试后必须重新刷 `build-review`，并从启动横幅确认不是 `DTU_STRESS`。
 
 最近一次审查留下三项非阻塞待办，后续修改时应优先处理：
 
@@ -930,7 +936,7 @@ python -B tests/ab_board_emulator/run_hardware_flight.py `
 - 把设备移至高照度区域后，4 Hz 十分钟饱和资格任务在约 6.5–6.7 Hz 光谱源下完整接收全部 1277 条已选反射率和 2910 条 GPS；反射率 ACK p95 约 404 ms、最大约 779 ms，池峰值 7/512，零超时、重试、过期、溢出或未完成重组；
 - mission viewer 已由用户在真实任务目录上运行，百度卫星图、航迹和光谱联动达到预期。
 
-需要区分：本文基线的 460800 baud、DGB1 十条/2 秒、反射率 4 Hz、10 秒驻留组合已经通过高照度真实 DTU/EMQX 十分钟饱和资格测试，但仍应在真实 A 板和实际作业区域蜂窝网络中重新做长航次资格测试。当前结果证明该组合在本次受控网络条件下可以完整传送所有进入遥测发送路径的数据，同时保持采集和 SD 记录独立；它不是对所有公网覆盖、时延和丢包条件的无条件保证。反射率源记录中未被 4 Hz latest-value 策略选中的帧属于设计内降采样，不是遥测丢包，更不是 SD 数据丢失。
+需要区分：460800 baud、DGB1 十条/2 秒、反射率 4 Hz、10 秒驻留组合已经通过高照度真实 DTU/EMQX 十分钟饱和资格测试，但当前工作区已经改为 5 Hz 并增加实时重大事件，因此当前组合尚未资格。历史结果证明 4 Hz 组合在本次受控网络条件下可以完整传送所有进入遥测发送路径的数据，同时保持采集和 SD 记录独立；它不是对 5 Hz、新事件流、所有公网覆盖、时延和丢包条件的无条件保证。反射率源记录中未被 latest-value 策略选中的帧属于设计内降采样，不是遥测丢包，更不是 SD 数据丢失。
 
 ## 18. 已知限制和风险
 
@@ -945,7 +951,7 @@ python -B tests/ab_board_emulator/run_hardware_flight.py `
 - `F_0001..F_9999` 目录耗尽后没有自动处理策略；根目录索引可避免日常线性扫描，但不能扩展编号空间；
 - session 去重历史只存在 RAM 中，复位后丢失；
 - 当前稳定设备身份使用芯片出厂 eFuse MAC 生成遥测 `source_id`；独立的产品序列号、烧录工装、权限控制和追溯数据库尚未实现，不能把目录编号或 A 板序列号当作 B 板产品序列号；
-- A/B CRC 错误和字节间超时会写入 `EVENTS.JSONL`，但“成功记录了一次协议错误”本身目前不会直接把心跳置为错误码 5；若要求 A 板实时获知链路错误率，需要增加有界计数和明确的降级阈值。
+- A/B CRC 错误和字节间超时会写入 `EVENTS.JSONL`，并以首次/每百次的节流策略尝试实时上传，但“成功记录了一次协议错误”本身目前不会直接把心跳置为错误码 5；若要求 A 板实时获知链路错误率，需要增加有界计数和明确的降级阈值。
 
 ### 18.2 数据和算法
 
@@ -970,7 +976,7 @@ python -B tests/ab_board_emulator/run_hardware_flight.py `
 1. **首轮室外资格飞行**：在真实阳光和实际作业区域蜂窝网络下复现十分钟以上任务，核对光谱动态范围、SD 完整性、DGB1 序号、反射率送达率、池峰值和安全收尾；
 2. **真实 A 板联调**：逐项核对电平、握手版本、5 Hz 数据、动作重试、心跳、grace deadline 和断电；
 3. **光谱标定**：建立暗场、白板、两传感器响应和波长映射流程，明确“表观反射率”升级为科学产品的条件；
-4. **4G DTU/MQTT**：受控 DGB1 及 4 Hz 饱和真实 DTU 资格测试已经完成；下一步先把相同 validator 与计数口径用于室外/真实 A 板任务，再评估地面 cached-ACK 边界、池维护扫描、Air780/更大单包或选择性 ACK，最后补充 SD 回放、TLS、正式设备身份和常驻地面接收服务；
+4. **4G DTU/MQTT**：受控 DGB1 及 4 Hz 饱和真实 DTU 资格测试已经完成；下一步先对 5 Hz + 重大事件候选做 60 秒回归和高照度十分钟资格，再把相同 validator 与计数口径用于室外/真实 A 板任务，随后评估地面 cached-ACK 边界、池维护扫描、Air780/更大单包或选择性 ACK，最后补充 SD 回放、TLS、正式设备身份和常驻地面接收服务；
 5. **数据格式兼容策略**：保留 v01 解码器，新格式只能增加新版本，不能静默改变已有字段含义；
 6. **部署可靠性**：规划 OTA 双分区、回滚、固件签名、看门狗复位记录和掉电保护；
 7. **查看器完善**：备份摘要恢复、事件分类、重叠点选择、BD-09 转换和真实波长轴；
@@ -1015,7 +1021,7 @@ calculation ──> SD recorder queue ──> SD（权威本地副本）
 - [ ] 能解释 B 单调时间、A 时间、UTC 和同步 generation；
 - [ ] 能解释反射率公式、天空帧因果匹配和 500 ms 新鲜度限制；
 - [ ] 能解释 DHR1、DTF2、DTA1、MQTT QoS 与“已写 SD/已离开 UART/已被地面接纳”四种不同完成语义；
-- [ ] 能启动地面 validator，确认 `TELEMETRY READY` 后再起飞，并从计数器区分设计内 4 Hz 选择、池溢出、10 秒过期和基础设施故障；
+- [ ] 能启动地面 validator，确认 `TELEMETRY READY` 后再起飞，并从计数器区分设计内 5 Hz 选择、事件发送、池溢出、10 秒过期和基础设施故障；
 - [ ] 能区分已验证能力、工程假设和待标定能力；
 - [ ] 能运行全部主机测试、固件构建和至少一次硬件回归；
 - [ ] 能在改协议或数据格式时同步更新固件、模拟器、查看器和文档。
@@ -1035,7 +1041,7 @@ calculation ──> SD recorder queue ──> SD（权威本地副本）
 | 任务结束后文件时间错误 | UTC 是否 LOCKED、是否收到并完成 `0x30`、FAT/Windows 时区显示 |
 | MQTTX 有消息但 B 板仍重试 | MQTTX 不发 DTA1；检查 validator、down topic、DTA1 QoS、DTU 下行订阅和身份/CRC 是否匹配 |
 | 遥测池持续增长或频繁过期 | broker/蜂窝延迟、validator 是否 READY、DTU 460800/1024 字节/5 ms 配置、ACK topic、`*_expired` 和 RTT |
-| GPS 正常而反射率很少 | 多分片丢失、DTU 转发容量、4 Hz 选择计数、反射率是否实际产生；不要只看 MQTT publication 数 |
+| GPS 正常而反射率很少 | 多分片丢失、DTU 转发容量、5 Hz 选择计数、反射率是否实际产生；不要只看 MQTT publication 数 |
 | 百度地图轨迹整体偏移 | 尚未做 WGS84→BD-09 转换 |
 | 光谱点没有位置 | GPS 前后点不足、跨同步 generation、定位间隔过宽或时间无效 |
 

@@ -25,6 +25,8 @@ extern "C" {
     (DATA_RECORD_WIRE_HEADER_SIZE + 36U + (uint32_t)(sample_count) * 3U + 4U)
 #define GPS_RECORD_WIRE_SIZE \
     (DATA_RECORD_WIRE_HEADER_SIZE + 34U + 4U)
+#define OPERATION_EVENT_RECORD_WIRE_SIZE \
+    (DATA_RECORD_WIRE_HEADER_SIZE + 12U + 4U)
 
 typedef enum {
     DATA_RECORD_GPS = 1,
@@ -83,6 +85,28 @@ typedef struct {
     uint8_t reserved[3];
     drone_realtime_data_t data;
 } gps_record_t;
+
+typedef enum {
+    OPERATION_EVENT_SEVERITY_INFO = 0,
+    OPERATION_EVENT_SEVERITY_WARNING = 1,
+    OPERATION_EVENT_SEVERITY_ERROR = 2,
+    OPERATION_EVENT_SEVERITY_CRITICAL = 3,
+} operation_event_severity_t;
+
+/** Compact operation event used by live MQTT telemetry.
+ *
+ * EVENTS.JSONL remains the human-readable authoritative SD representation.
+ * This fixed-size DHR1 representation gives the ground receiver the same
+ * synchronized timestamp, session/segment identity, stable event code and
+ * arguments without parsing JSON on the embedded target. */
+typedef struct {
+    data_record_header_t header;
+    uint16_t event_code;
+    uint8_t severity;
+    uint8_t reserved;
+    uint32_t argument0;
+    int32_t argument1;
+} operation_event_record_t;
 
 enum {
     RAW_QUALITY_VALID = 1U << 0,

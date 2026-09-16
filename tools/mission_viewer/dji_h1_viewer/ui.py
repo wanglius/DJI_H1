@@ -37,6 +37,7 @@ from .credentials import CredentialError
 from .live import LiveReceiverConfig, LiveTelemetrySource
 from .presentation import (
     MeasurementPoint, MissionEventPoint, MissionMapModel, build_mission_map,
+    event_severity,
 )
 
 
@@ -426,7 +427,8 @@ class MissionMap(QWidget):
         for x, y, point in self._events:
             screen = self._to_screen(x, y)
             color = QColor("#d62828" if point.severity == "critical"
-                           else "#f08c00")
+                           else "#f08c00" if point.severity == "warning"
+                           else "#5b5bd6")
             size = 8.0 if point.event_index == self._selected_event else 6.0
             triangle = QPainterPath(QPointF(screen.x(), screen.y() - size))
             triangle.lineTo(screen.x() - size, screen.y() + size)
@@ -464,7 +466,8 @@ class MissionMap(QWidget):
         labels = ((QColor("#97a3ad"), "GPS fixes"),
                   (QColor("#168aad"), "Reflectance"),
                   (QColor("#d62828"), "Critical event"),
-                  (QColor("#f08c00"), "Warning"))
+                  (QColor("#f08c00"), "Warning"),
+                  (QColor("#5b5bd6"), "Lifecycle event"))
         x, y = 54.0, 18.0
         for color, label in labels:
             painter.setPen(QPen(background, 0.8))
@@ -723,7 +726,7 @@ class MissionViewer(QMainWindow):
         info_layout.addWidget(self.flight_info)
         layout.addWidget(info_group)
 
-        events_group = QGroupBox("Critical events")
+        events_group = QGroupBox("Mission events")
         events_layout = QVBoxLayout(events_group)
         self.events_list = QListWidget()
         self.events_list.setWordWrap(True)
@@ -731,7 +734,7 @@ class MissionViewer(QMainWindow):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.events_list.itemClicked.connect(self._event_item_clicked)
         events_layout.addWidget(self.events_list)
-        self.event_details = QLabel("No located abnormal events")
+        self.event_details = QLabel("No located mission events")
         self.event_details.setWordWrap(True)
         self.event_details.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -802,8 +805,7 @@ class MissionViewer(QMainWindow):
         self.path_text.setText(candidate.description)
         self.flight_info.setText("Connecting to live telemetry…")
         self.events_list.clear()
-        self.event_details.setText(
-            "Onboard event records are not part of the current MQTT payloads.")
+        self.event_details.setText("Waiting for onboard mission events")
         self.spectrum_info.setText("Waiting for a located reflectance record")
         self.spectrum_plot.clear("Waiting for live reflectance")
         self.disconnect_button.setEnabled(True)
@@ -988,8 +990,9 @@ class MissionViewer(QMainWindow):
             ("Valid map fixes", len(self.map_model.route)),
             ("Located measurements", len(self.map_model.measurements)),
             ("Unlocated measurements", self.map_model.unlocated_measurements),
-            ("Critical/warning events", len(self.map_model.events)),
-            ("Unlocated abnormal events", self.map_model.unlocated_events),
+            ("Mission events", len(mission.events)),
+            ("Located mission events", len(self.map_model.events)),
+            ("Unlocated mission events", self.map_model.unlocated_events),
             ("CRC verification", crc_text),
             ("Damaged data files", product_error_text),
         )
@@ -1011,6 +1014,7 @@ class MissionViewer(QMainWindow):
                 ("MQTT publications", live.get("mqtt_messages", 0)),
                 ("Transport fragments", live.get("fragments", 0)),
                 ("Complete messages", live.get("complete_messages", 0)),
+                ("Live event records", live.get("event_records", 0)),
                 ("DTA1 acknowledgements", live.get("acknowledgements", 0)),
                 ("DTA1 publish failures", live.get("ack_publish_failures", 0)),
                 ("Ingress queue",
@@ -1037,20 +1041,32 @@ class MissionViewer(QMainWindow):
 
     def _populate_events(self) -> None:
         self.events_list.clear()
-        for point in self.map_model.events:
-            label = ("CRITICAL" if point.severity == "critical" else "WARNING")
+        mission = self.service.mission
+        if mission is None:
+            self.event_details.setText("No mission events")
+            return
+        located = {point.event_index for point in self.map_model.events}
+        for index, event in enumerate(mission.events):
+            severity = event_severity(event)
+            if severity is None:
+                continue
+            label = severity.upper()
+            location = "" if index in located else " · location pending"
             item = QListWidgetItem(
-                f"{label} · {point.event_name.replace('_', ' ')}")
-            item.setData(Qt.ItemDataRole.UserRole, point.event_index)
-            item.setForeground(QColor("#d62828" if point.severity == "critical"
-                                      else "#c66a00"))
+                f"{label} · {str(event.get('event', 'unknown')).replace('_', ' ')}"
+                f"{location}")
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setForeground(QColor(
+                "#d62828" if severity == "critical"
+                else "#c66a00" if severity == "warning"
+                else "#5b5bd6"))
             self.events_list.addItem(item)
-        if not self.map_model.events:
-            self.event_details.setText("No located abnormal events")
+        if self.events_list.count() == 0:
+            self.event_details.setText("No mission events")
         elif self.map_model.unlocated_events:
             self.event_details.setText(
-                f"{self.map_model.unlocated_events} abnormal event(s) could not "
-                "be placed because the GPS track did not bracket their time.")
+                f"{self.map_model.unlocated_events} event(s) are shown now but "
+                "cannot yet be placed because GPS does not bracket their time.")
         else:
             self.event_details.setText(
                 "Select an event to center it on the route.")

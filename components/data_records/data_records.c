@@ -220,3 +220,33 @@ esp_err_t data_record_serialize_gps(const gps_record_t *record,
     return finish_record(bytes, cursor, output_capacity, GPS_RECORD_WIRE_SIZE,
                          output_length);
 }
+
+esp_err_t data_record_serialize_operation_event(
+    const operation_event_record_t *record, void *output,
+    size_t output_capacity, size_t *output_length)
+{
+    if (record == NULL || output == NULL || output_length == NULL ||
+        record->event_code == 0 ||
+        record->severity > OPERATION_EVENT_SEVERITY_CRITICAL ||
+        record->reserved != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!valid_header(&record->header, DATA_RECORD_OPERATION_LOG,
+                      OPERATION_EVENT_RECORD_WIRE_SIZE)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (output_capacity < OPERATION_EVENT_RECORD_WIRE_SIZE)
+        return ESP_ERR_INVALID_SIZE;
+
+    uint8_t *bytes = output;
+    uint8_t *cursor = bytes;
+    serialize_header(&cursor, &record->header,
+                     OPERATION_EVENT_RECORD_WIRE_SIZE);
+    put16(&cursor, record->event_code);
+    *cursor++ = record->severity;
+    *cursor++ = 0;
+    put32(&cursor, record->argument0);
+    put32(&cursor, (uint32_t)record->argument1);
+    return finish_record(bytes, cursor, output_capacity,
+                         OPERATION_EVENT_RECORD_WIRE_SIZE, output_length);
+}

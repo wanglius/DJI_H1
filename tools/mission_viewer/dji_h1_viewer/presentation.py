@@ -58,16 +58,19 @@ class MissionMapModel:
 _CRITICAL_NAMES = {
     "protocol_crc_error", "protocol_timeout", "storage_error",
     "write_error", "flush_error", "acquisition_error", "rx_overrun",
-    "drone_identity_mismatch",
+    "drone_identity_mismatch", "ab_link_lost",
 }
 _WARNING_NAMES = {
     "clock_observation_drop", "reflectance_rejected", "frame_drop",
 }
+_INFO_NAMES = {
+    "handshake", "segment_start", "segment_end", "capture_result",
+    "flight_closed", "ab_link_restored", "power_off_request",
+}
 
 
 def event_severity(event: dict[str, Any]) -> str | None:
-    """Classify map-worthy abnormal events without treating normal lifecycle
-    transitions as alarms.
+    """Classify map-worthy lifecycle and abnormal events.
 
     Explicit severity supplied by a future recorder takes priority. The v01
     stop reason is also decoded so low battery, manual abort, and drone-link
@@ -79,6 +82,8 @@ def event_severity(event: dict[str, Any]) -> str | None:
         return "critical"
     if explicit in ("warning", "warn"):
         return "warning"
+    if explicit in ("info", "information"):
+        return "info"
     name = str(event.get("event", "")).lower()
     if name in _CRITICAL_NAMES or any(
             token in name for token in ("failure", "failed", "corrupt",
@@ -88,7 +93,7 @@ def event_severity(event: dict[str, Any]) -> str | None:
         return "warning"
     if name == "capture_result":
         try:
-            return "critical" if int(event.get("argument1", 0)) != 0 else None
+            return "critical" if int(event.get("argument1", 0)) != 0 else "info"
         except (TypeError, ValueError):
             return "critical"
     if name == "stop_request":
@@ -100,6 +105,9 @@ def event_severity(event: dict[str, Any]) -> str | None:
             return "critical"
         if reason in (2, 4):  # return-home or automatic landing
             return "warning"
+        return "info"
+    if name in _INFO_NAMES:
+        return "info"
     return None
 
 

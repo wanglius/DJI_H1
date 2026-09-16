@@ -40,22 +40,12 @@ typedef enum {
     MSG_RAW, MSG_GPS, MSG_EVENT, MSG_CHECKPOINT, MSG_BARRIER, MSG_FINALIZE
 } message_type_t;
 typedef struct {
-    measurement_event_t code;
-    uint32_t sequence;
-    uint32_t session_id;
-    uint16_t segment_id;
-    uint16_t reserved;
-    uint32_t argument0;
-    int32_t argument1;
-    record_time_t timestamp;
-} operation_event_t;
-typedef struct {
     message_type_t type;
     bool allow_reflectance;
     union {
         raw_spectrum_record_t *raw;
         gps_record_t gps;
-        operation_event_t event;
+        operation_event_record_t event;
     } data;
 } message_t;
 
@@ -104,6 +94,10 @@ static uint8_t s_drone_serial[32];
 static bool s_have_drone_identity;
 static uint16_t s_a_firmware_version;
 static uint8_t s_drone_link;
+/* Noisy per-frame diagnostics stay complete in EVENTS.JSONL but only the first
+ * and each hundredth occurrence enter the priority telemetry queue. */
+static uint32_t s_live_event_occurrences[
+    MEASUREMENT_EVENT_AB_LINK_RESTORED + 1U];
 /* Sole writer-task workspaces live in BSS to keep its stack bounded. */
 static uint8_t s_serial_buffer[SERIAL_BUFFER_SIZE];
 static raw_spectrum_record_t s_sky_history[SKY_HISTORY_COUNT];
@@ -392,11 +386,49 @@ static const char *event_name(measurement_event_t event)
     case MEASUREMENT_EVENT_FLIGHT_CLOSED: return "flight_closed";
     case MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH:
         return "drone_identity_mismatch";
+    case MEASUREMENT_EVENT_AB_LINK_LOST: return "ab_link_lost";
+    case MEASUREMENT_EVENT_AB_LINK_RESTORED: return "ab_link_restored";
     default: return "unknown";
     }
 }
 
-static esp_err_t write_event(const operation_event_t *event)
+static uint8_t event_severity(measurement_event_t event, int32_t argument1)
+{
+    switch (event) {
+    case MEASUREMENT_EVENT_STOP_REQUEST:
+        if (argument1 == 3 || argument1 == 6 || argument1 == 7)
+            return OPERATION_EVENT_SEVERITY_CRITICAL;
+        if (argument1 == 2 || argument1 == 4 || argument1 == 8)
+            return OPERATION_EVENT_SEVERITY_WARNING;
+        return OPERATION_EVENT_SEVERITY_INFO;
+    case MEASUREMENT_EVENT_POWER_OFF_REQUEST:
+    case MEASUREMENT_EVENT_PROTOCOL_CRC_ERROR:
+    case MEASUREMENT_EVENT_PROTOCOL_TIMEOUT:
+    case MEASUREMENT_EVENT_CLOCK_OBSERVATION_DROP:
+    case MEASUREMENT_EVENT_REFLECTANCE_REJECTED:
+        return OPERATION_EVENT_SEVERITY_WARNING;
+    case MEASUREMENT_EVENT_CAPTURE_RESULT:
+        return argument1 == ESP_OK ? OPERATION_EVENT_SEVERITY_INFO
+                                   : OPERATION_EVENT_SEVERITY_ERROR;
+    case MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH:
+    case MEASUREMENT_EVENT_AB_LINK_LOST:
+        return OPERATION_EVENT_SEVERITY_CRITICAL;
+    default:
+        return OPERATION_EVENT_SEVERITY_INFO;
+    }
+}
+
+static const char *event_severity_name(uint8_t severity)
+{
+    switch (severity) {
+    case OPERATION_EVENT_SEVERITY_WARNING: return "warning";
+    case OPERATION_EVENT_SEVERITY_ERROR: return "error";
+    case OPERATION_EVENT_SEVERITY_CRITICAL: return "critical";
+    default: return "info";
+    }
+}
+
+static esp_err_t write_event(const operation_event_record_t *event)
 {
     const char *timezone_name = clock_sync_timezone_name();
     int timezone_offset = clock_sync_timezone_offset_minutes();
@@ -407,11 +439,15 @@ static esp_err_t write_event(const operation_event_t *event)
         ",\"utc_ms\":%" PRIu64 ",\"sync_state\":%u"
         ",\"time_valid_flags\":%u,\"argument0\":%" PRIu32
         ",\"argument1\":%" PRId32
+        ",\"severity\":\"%s\""
         ",\"timezone_name\":\"%s\",\"utc_offset_minutes\":%d}\n",
-        event->sequence, event_name(event->code), event->session_id,
-        event->segment_id, event->timestamp.b_monotonic_us,
-        event->timestamp.utc_ms, event->timestamp.sync_state,
-        event->timestamp.valid_flags, event->argument0, event->argument1,
+        event->header.record_sequence,
+        event_name((measurement_event_t)event->event_code),
+        event->header.session_id,
+        event->header.segment_id, event->header.timestamp.b_monotonic_us,
+        event->header.timestamp.utc_ms, event->header.timestamp.sync_state,
+        event->header.timestamp.valid_flags, event->argument0, event->argument1,
+        event_severity_name(event->severity),
         timezone_name, timezone_offset);
     if (length <= 0 || (size_t)length >= sizeof(s_serial_buffer))
         return ESP_ERR_INVALID_SIZE;
@@ -463,8 +499,10 @@ static esp_err_t write_mission_summary(const char *state)
     bool telemetry_delivery_degraded =
         telemetry.messages_failed != 0 ||
         telemetry.gps_queue_overflows != 0 ||
+        telemetry.event_queue_overflows != 0 ||
         telemetry.reflectance_queue_overflows != 0 ||
         telemetry.gps_expired != 0 ||
+        telemetry.events_expired != 0 ||
         telemetry.reflectance_expired != 0 ||
         telemetry.drain_timeouts != 0;
 
@@ -541,6 +579,11 @@ static esp_err_t write_mission_summary(const char *state)
         ", \"gps_batches_sent\": %" PRIu32
         ", \"gps_batches_expired\": %" PRIu32
         ", \"gps_records_abandoned_shutdown\": %" PRIu32
+        ", \"events_offered\": %" PRIu32
+        ", \"events_submitted\": %" PRIu32
+        ", \"events_sent\": %" PRIu32
+        ", \"event_queue_overflows\": %" PRIu32
+        ", \"events_expired\": %" PRIu32
         ", \"reflectance_offered\": %" PRIu32
         ", \"reflectance_submitted\": %" PRIu32
         ", \"reflectance_rate_limited\": %" PRIu32
@@ -603,6 +646,11 @@ static esp_err_t write_mission_summary(const char *state)
         telemetry.gps_expired, telemetry.gps_batches_sent,
         telemetry.gps_batches_expired,
         telemetry.gps_records_abandoned_shutdown,
+        telemetry.events_offered,
+        telemetry.events_submitted,
+        telemetry.events_sent,
+        telemetry.event_queue_overflows,
+        telemetry.events_expired,
         telemetry.reflectance_offered,
         telemetry.reflectance_submitted,
         telemetry.reflectance_rate_limited,
@@ -760,29 +808,58 @@ static esp_err_t flush_files(void)
     return result;
 }
 
-static operation_event_t make_event(measurement_event_t code,
-                                    uint32_t argument0,
-                                    int32_t argument1)
+static operation_event_record_t make_event(measurement_event_t code,
+                                           uint32_t argument0,
+                                           int32_t argument1)
 {
-    operation_event_t event = {
-        .code = code,
+    operation_event_record_t event = {
+        .event_code = code,
+        .severity = event_severity(code, argument1),
         .argument0 = argument0,
         .argument1 = argument1,
     };
+    uint32_t sequence;
+    uint32_t session_id;
+    uint16_t segment_id;
     taskENTER_CRITICAL(&s_lock);
-    event.sequence = ++s_event_sequence;
-    event.session_id = s_session;
-    event.segment_id = s_segment;
+    sequence = ++s_event_sequence;
+    session_id = s_session;
+    segment_id = s_segment;
     taskEXIT_CRITICAL(&s_lock);
-    (void)clock_sync_timestamp(esp_timer_get_time(), &event.timestamp);
+    record_time_t timestamp;
+    (void)clock_sync_timestamp(esp_timer_get_time(), &timestamp);
+    data_record_header_init(&event.header, DATA_RECORD_OPERATION_LOG,
+                            OPERATION_EVENT_RECORD_WIRE_SIZE, sequence,
+                            session_id, segment_id, &timestamp);
     return event;
+}
+
+static void submit_event_telemetry(const operation_event_record_t *event)
+{
+    measurement_event_t code = (measurement_event_t)event->event_code;
+    if (code == MEASUREMENT_EVENT_PROTOCOL_CRC_ERROR ||
+        code == MEASUREMENT_EVENT_PROTOCOL_TIMEOUT ||
+        code == MEASUREMENT_EVENT_CLOCK_OBSERVATION_DROP) {
+        uint32_t occurrence = __atomic_add_fetch(
+            &s_live_event_occurrences[code], 1U, __ATOMIC_RELAXED);
+        if (occurrence != 1U && occurrence % 100U != 0U) return;
+    }
+    /* Reflectance rejection events are already created only for the first and
+     * every hundredth rejected calculation; do not rate-limit them twice. */
+    esp_err_t result = telemetry_submit_event(event);
+    if (result != ESP_OK && result != ESP_ERR_NO_MEM &&
+        result != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Operation-event telemetry rejected: %s",
+                 esp_err_to_name(result));
+    }
 }
 
 static void write_internal_event(measurement_event_t code,
                                  uint32_t argument0,
                                  int32_t argument1)
 {
-    operation_event_t event = make_event(code, argument0, argument1);
+    operation_event_record_t event = make_event(code, argument0, argument1);
+    submit_event_telemetry(&event);
     note_aux_write(write_event(&event), false);
 }
 
@@ -1161,6 +1238,7 @@ static esp_err_t open_flight_files(void)
     s_segment = 0;
     s_raw_sequence = s_calculation_sequence = 0;
     s_gps_sequence = s_event_sequence = 0;
+    memset(s_live_event_occurrences, 0, sizeof(s_live_event_occurrences));
     memset(&s_totals, 0, sizeof(s_totals));
     s_flight_started = flight_started;
     s_flight_start_time_frozen =
@@ -1333,7 +1411,7 @@ esp_err_t measurement_recorder_log_event(measurement_event_t event,
                                          int32_t argument1)
 {
     if (event < MEASUREMENT_EVENT_HANDSHAKE ||
-        event > MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH)
+        event > MEASUREMENT_EVENT_AB_LINK_RESTORED)
         return ESP_ERR_INVALID_ARG;
     taskENTER_CRITICAL(&s_lock);
     bool available = s_task != NULL && s_have_flight && s_accept_aux &&
@@ -1343,6 +1421,7 @@ esp_err_t measurement_recorder_log_event(measurement_event_t event,
     if (!available) return ESP_ERR_INVALID_STATE;
     message_t message = {.type = MSG_EVENT};
     message.data.event = make_event(event, argument0, argument1);
+    submit_event_telemetry(&message.data.event);
     bool queued = xQueueSend(s_writer_queue, &message, 0) == pdTRUE;
     taskENTER_CRITICAL(&s_lock);
     s_aux_submitters--;

@@ -24,12 +24,18 @@ static const char *TAG = "AB_LINK";
 #define AB_LINK_TASK_STACK 4096
 #define AB_LINK_TASK_PRIORITY 8
 #define AB_B_FIRMWARE_VERSION 0x0001
+/* A sends realtime data at 5 Hz while linked. Three seconds without any valid
+ * A-to-B frame is treated as a broken control link, matching A's documented
+ * three-second B-heartbeat timeout before its 1 Hz re-handshake cycle. */
+#define AB_LINK_TIMEOUT_US 3000000LL
 
 typedef struct {
     bool linked;
     uint8_t tx_sequence;
     uint32_t realtime_count;
     int64_t next_heartbeat_us;
+    int64_t last_rx_us;
+    bool ever_linked;
 } ab_link_state_t;
 
 static ab_link_state_t s_state;
@@ -124,6 +130,7 @@ static void cache_and_send_ack(const ab_frame_t *request, uint8_t result)
 
 static void handle_frame(const ab_frame_t *frame)
 {
+    if (s_state.linked) s_state.last_rx_us = esp_timer_get_time();
     if (replay_duplicate_ack(frame)) return;
     switch (frame->command) {
     case AB_CMD_HANDSHAKE: {
@@ -159,13 +166,21 @@ static void handle_frame(const ab_frame_t *frame)
          * is still in progress. Once linked, a later readiness fault is
          * reported by heartbeat rather than silently destroying the session. */
         if (response.b_ready != 0) {
+            bool restored = s_state.ever_linked && !s_state.linked;
             if (!s_state.linked) {
                 s_state.linked = true;
                 s_state.next_heartbeat_us = esp_timer_get_time();
             }
+            s_state.last_rx_us = esp_timer_get_time();
+            s_state.ever_linked = true;
             measurement_recorder_note_handshake(request.drone_serial,
                                                 request.firmware_version,
                                                 request.drone_link);
+            if (restored) {
+                (void)measurement_recorder_log_event(
+                    MEASUREMENT_EVENT_AB_LINK_RESTORED,
+                    frame->sequence, request.drone_link);
+            }
         }
         ESP_LOGI(TAG,
                  "Handshake response: seq=%u ready=%u drone_link=%u "
@@ -316,6 +331,17 @@ static void ab_link_task(void *argument)
             }
         }
         now_us = esp_timer_get_time();
+        if (s_state.linked && s_state.last_rx_us > 0 &&
+            now_us - s_state.last_rx_us >= AB_LINK_TIMEOUT_US) {
+            uint32_t silent_ms = (uint32_t)(
+                (now_us - s_state.last_rx_us) / 1000LL);
+            s_state.linked = false;
+            (void)measurement_recorder_log_event(
+                MEASUREMENT_EVENT_AB_LINK_LOST, silent_ms, 0);
+            ESP_LOGW(TAG,
+                     "A-board link timed out after %lu ms; awaiting handshake",
+                     (unsigned long)silent_ms);
+        }
         if (s_state.linked && now_us >= s_state.next_heartbeat_us) {
             send_heartbeat();
             /* Skip missed deadlines instead of sending a catch-up burst.

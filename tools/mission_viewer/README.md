@@ -74,13 +74,19 @@ new route points normally land in groups about every two seconds. A spectrum
 remains unlocated until GPS fixes bracket its timestamp; live mode uses the
 same non-extrapolating interpolation as offline mode.
 
-This first live milestone is an in-memory operational display. The onboard SD
-files remain the authoritative mission record. MQTT currently carries GPS and
-reflectance but not `EVENTS.JSONL`, raw spectra, the complete heartbeat state,
-or `MISSION.JSON`; the live information panel states those limitations and
-shows receiver connection, assembly, duplicate, acknowledgement, expiry, QoS,
-and error counters. A durable ground journal and live event/status telemetry
-are follow-on work rather than implicit claims of this viewer.
+This live milestone is an in-memory operational display. The onboard SD files
+remain the authoritative mission record. MQTT carries GPS, reflectance, and
+compact major operation events. The viewer decodes, deduplicates, maps, and
+lists those events with their onboard timestamp and severity, including
+capture start/stop and A/B link loss/restoration. Events appear in the list
+immediately; an event received before a following GPS fix is marked
+`location pending` and is added to the map once interpolation becomes possible.
+It does not receive raw
+spectra, the complete `EVENTS.JSONL` diagnostic history, the complete heartbeat
+state, or `MISSION.JSON`. The live information panel states those limitations
+and shows receiver connection, assembly, record-type, duplicate,
+acknowledgement, expiry, QoS, and error counters. A durable ground journal is
+still follow-on work; closing the viewer discards its in-memory live history.
 
 The receiver is also a public Python API and does not require Qt:
 

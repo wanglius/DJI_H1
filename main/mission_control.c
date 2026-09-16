@@ -151,8 +151,10 @@ void mission_control_get_status(ab_status_report_t *out)
     if (!error && telemetry.initialized &&
         (!telemetry.healthy || telemetry.messages_failed ||
          telemetry.gps_queue_overflows ||
+         telemetry.event_queue_overflows ||
          telemetry.reflectance_queue_overflows ||
-         telemetry.gps_expired || telemetry.reflectance_expired))
+         telemetry.gps_expired || telemetry.events_expired ||
+         telemetry.reflectance_expired))
         error = 5;
     *out = (ab_status_report_t) {
         .b_state = error ? 2 : (s_initialized ? 1 : 0),

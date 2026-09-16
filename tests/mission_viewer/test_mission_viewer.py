@@ -300,11 +300,13 @@ class MissionViewerTests(unittest.TestCase):
         self.assertEqual(model.events[0].event_name, "protocol_timeout")
         self.assertEqual(model.events[0].severity, "critical")
         self.assertEqual(model.unlocated_measurements, 0)
-        self.assertEqual(model.unlocated_events, 0)
+        # The legacy handshake fixture intentionally has no timestamp, so the
+        # lifecycle event is retained but cannot be placed on the route.
+        self.assertEqual(model.unlocated_events, 1)
 
-    def test_marks_only_abnormal_stop_reasons_as_map_events(self) -> None:
-        self.assertIsNone(event_severity(
-            {"event": "stop_request", "argument1": 1}))
+    def test_classifies_lifecycle_and_abnormal_events(self) -> None:
+        self.assertEqual(event_severity(
+            {"event": "stop_request", "argument1": 1}), "info")
         self.assertEqual(event_severity(
             {"event": "stop_request", "argument1": 7}), "critical")
         self.assertEqual(event_severity(
@@ -313,8 +315,10 @@ class MissionViewerTests(unittest.TestCase):
             {"event": "stop_request", "argument1": 2}), "warning")
         self.assertEqual(event_severity(
             {"event": "capture_result", "argument1": -1}), "critical")
-        self.assertIsNone(event_severity(
-            {"event": "capture_result", "argument1": 0}))
+        self.assertEqual(event_severity(
+            {"event": "capture_result", "argument1": 0}), "info")
+        self.assertEqual(event_severity(
+            {"event": "segment_start", "severity": "info"}), "info")
         self.assertEqual(event_severity(
             {"event": "drone_identity_mismatch"}), "critical")
 

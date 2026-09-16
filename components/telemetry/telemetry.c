@@ -56,6 +56,7 @@ typedef enum {
 typedef union {
     gps_batch_t gps_batch;
     reflectance_record_t reflectance;
+    operation_event_record_t event;
 } telemetry_record_t;
 
 /** A slot owns one logical message from admission until a matching positive
@@ -97,6 +98,7 @@ typedef struct {
 static telemetry_config_t s_config;
 static telemetry_status_t s_status;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static QueueHandle_t s_event_queue;
 static QueueHandle_t s_gps_queue;
 static QueueHandle_t s_ready_queue;
 static QueueHandle_t s_free_queue;
@@ -161,6 +163,12 @@ static bool is_gps_entry(const telemetry_entry_t *entry)
 {
     return entry != NULL &&
            entry->message_type == TELEMETRY_MESSAGE_GPS_BATCH;
+}
+
+static bool is_event_entry(const telemetry_entry_t *entry)
+{
+    return entry != NULL &&
+           entry->message_type == TELEMETRY_MESSAGE_OPERATION_LOG;
 }
 
 static uint16_t entry_gps_record_count(const telemetry_entry_t *entry)
@@ -308,16 +316,20 @@ static void purge_all_entries(void)
 
 static uint32_t entry_sequence(const telemetry_entry_t *entry)
 {
-    return is_gps_entry(entry)
-        ? gps_batch_message_sequence(&entry->record.gps_batch)
-        : entry->record.reflectance.header.record_sequence;
+    if (is_gps_entry(entry))
+        return gps_batch_message_sequence(&entry->record.gps_batch);
+    if (is_event_entry(entry))
+        return entry->record.event.header.record_sequence;
+    return entry->record.reflectance.header.record_sequence;
 }
 
 static uint64_t entry_timestamp_us(const telemetry_entry_t *entry)
 {
-    return is_gps_entry(entry)
-        ? gps_batch_first_timestamp_us(&entry->record.gps_batch)
-        : entry->record.reflectance.header.timestamp.b_monotonic_us;
+    if (is_gps_entry(entry))
+        return gps_batch_first_timestamp_us(&entry->record.gps_batch);
+    if (is_event_entry(entry))
+        return entry->record.event.header.timestamp.b_monotonic_us;
+    return entry->record.reflectance.header.timestamp.b_monotonic_us;
 }
 
 static uint32_t recovery_probe_interval_ms(uint32_t pool_used,
@@ -571,6 +583,8 @@ static void process_ack(const telemetry_ack_t *ack)
         s_status.gps_batches_sent++;
     } else if (message_type == TELEMETRY_MESSAGE_REFLECTANCE) {
         s_status.reflectance_sent++;
+    } else if (message_type == TELEMETRY_MESSAGE_OPERATION_LOG) {
+        s_status.events_sent++;
     }
     uint32_t pool_used = s_status.pool_used;
     uint32_t in_flight = s_status.messages_in_flight;
@@ -661,14 +675,20 @@ static void expire_stale_entries(int64_t now_us)
                                  s_config.max_residency_ms)) {
             message_type = entry->message_type;
             if (message_type != TELEMETRY_MESSAGE_GPS_BATCH &&
-                message_type != TELEMETRY_MESSAGE_REFLECTANCE) {
+                message_type != TELEMETRY_MESSAGE_REFLECTANCE &&
+                message_type != TELEMETRY_MESSAGE_OPERATION_LOG) {
                 invalid = entry->state != ENTRY_FREE &&
                           entry->state != ENTRY_FILLING;
             } else if (entry->state == ENTRY_STAGED) {
-                telemetry_entry_t **pending =
-                    message_type == TELEMETRY_MESSAGE_GPS_BATCH
-                        ? &s_pending_gps_batch : &s_pending_reflectance;
-                if (*pending != entry) {
+                telemetry_entry_t **pending = NULL;
+                if (message_type == TELEMETRY_MESSAGE_GPS_BATCH)
+                    pending = &s_pending_gps_batch;
+                else if (message_type == TELEMETRY_MESSAGE_REFLECTANCE)
+                    pending = &s_pending_reflectance;
+                /* Events are enqueued immediately and can never be staged. */
+                if (pending == NULL) {
+                    invalid = true;
+                } else if (*pending != entry) {
                     invalid = true;
                 } else {
                     *pending = NULL;
@@ -694,6 +714,8 @@ static void expire_stale_entries(int64_t now_us)
                     uint16_t records = entry_gps_record_count(entry);
                     s_status.gps_expired += records;
                     expired_count = ++s_status.gps_batches_expired;
+                } else if (message_type == TELEMETRY_MESSAGE_OPERATION_LOG) {
+                    expired_count = ++s_status.events_expired;
                 } else {
                     expired_count = ++s_status.reflectance_expired;
                 }
@@ -809,6 +831,11 @@ static esp_err_t serialize_entry(telemetry_entry_t *entry, size_t *length)
             &entry->record.reflectance, s_record_buffer,
             sizeof(s_record_buffer), length);
     }
+    if (entry->message_type == TELEMETRY_MESSAGE_OPERATION_LOG) {
+        return data_record_serialize_operation_event(
+            &entry->record.event, s_record_buffer,
+            sizeof(s_record_buffer), length);
+    }
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -894,6 +921,8 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
                 s_status.gps_batches_sent++;
             } else if (entry->message_type == TELEMETRY_MESSAGE_REFLECTANCE) {
                 s_status.reflectance_sent++;
+            } else if (entry->message_type == TELEMETRY_MESSAGE_OPERATION_LOG) {
+                s_status.events_sent++;
             }
             taskEXIT_CRITICAL(&s_lock);
             release_entry(entry);
@@ -1043,6 +1072,7 @@ static void telemetry_task(void *unused)
 
     while (true) {
         if (abort_requested()) {
+            xQueueReset(s_event_queue);
             xQueueReset(s_gps_queue);
             xQueueReset(s_ready_queue);
             taskENTER_CRITICAL(&s_lock);
@@ -1071,11 +1101,13 @@ static void telemetry_task(void *unused)
             update_ack_deadlines(now_us);
         release_due_reflectance(now_us);
 
-        /* GPS and ordinary retries precede recovery probes. A due probe
-         * precedes new reflectance so continuous acquisition cannot starve old
-         * retained slots. Probe rate rises with pool pressure, but remains
-         * globally capped at ten messages per second. */
+        /* Rare operational events are sent first so start/stop/link alarms do
+         * not sit behind scientific traffic. GPS and ordinary retries follow;
+         * a due recovery probe still precedes new reflectance so continuous
+         * acquisition cannot starve old retained slots. */
         telemetry_entry_t *entry = take_queued(
+            s_event_queue, TELEMETRY_MESSAGE_OPERATION_LOG);
+        if (entry == NULL) entry = take_queued(
             s_gps_queue, TELEMETRY_MESSAGE_GPS_BATCH);
         if (entry == NULL &&
             s_config.delivery_mode == TELEMETRY_DELIVERY_APPLICATION_ACK)
@@ -1291,14 +1323,47 @@ static esp_err_t stage_reflectance(const reflectance_record_t *record)
     return ESP_OK;
 }
 
+static esp_err_t enqueue_event(const operation_event_record_t *record)
+{
+    telemetry_entry_t *entry = acquire_entry();
+    if (entry != NULL) {
+        entry->record.event = *record;
+        if (!try_mark_admitted(entry, TELEMETRY_MESSAGE_OPERATION_LOG,
+                               ENTRY_ENQUEUING)) {
+            release_entry(entry);
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (xQueueSend(s_event_queue, &entry, 0) == pdTRUE) {
+            taskENTER_CRITICAL(&s_lock);
+            if (entry->state == ENTRY_ENQUEUING)
+                entry->state = ENTRY_QUEUED;
+            s_status.events_submitted++;
+            taskEXIT_CRITICAL(&s_lock);
+            return ESP_OK;
+        }
+        note_pool_fault("event ready list overflow");
+        release_entry(entry);
+    }
+
+    taskENTER_CRITICAL(&s_lock);
+    uint32_t dropped = ++s_status.event_queue_overflows;
+    taskEXIT_CRITICAL(&s_lock);
+    if (dropped == 1 || dropped % 100U == 0) {
+        ESP_LOGW(TAG, "Telemetry pool full; event dropped=%lu",
+                 (unsigned long)dropped);
+    }
+    return ESP_ERR_NO_MEM;
+}
+
 static void delete_resources(bool driver_installed)
 {
     if (driver_installed) (void)uart_driver_delete(s_config.uart_port);
+    if (s_event_queue != NULL) vQueueDelete(s_event_queue);
     if (s_gps_queue != NULL) vQueueDelete(s_gps_queue);
     if (s_ready_queue != NULL) vQueueDelete(s_ready_queue);
     if (s_free_queue != NULL) vQueueDelete(s_free_queue);
     if (s_pool != NULL) heap_caps_free(s_pool);
-    s_gps_queue = s_ready_queue = s_free_queue = NULL;
+    s_event_queue = s_gps_queue = s_ready_queue = s_free_queue = NULL;
     s_pool = NULL;
 }
 
@@ -1340,14 +1405,16 @@ esp_err_t telemetry_start(const telemetry_config_t *config)
     s_config = *config;
     s_pool = heap_caps_calloc(config->pool_length, sizeof(*s_pool),
                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_event_queue = xQueueCreate(config->pool_length,
+                                 sizeof(telemetry_entry_t *));
     s_gps_queue = xQueueCreate(config->pool_length,
                                sizeof(telemetry_entry_t *));
     s_ready_queue = xQueueCreate(config->pool_length,
                                  sizeof(telemetry_entry_t *));
     s_free_queue = xQueueCreate(config->pool_length,
                                 sizeof(telemetry_entry_t *));
-    if (s_pool == NULL || s_gps_queue == NULL || s_ready_queue == NULL ||
-        s_free_queue == NULL) {
+    if (s_pool == NULL || s_event_queue == NULL || s_gps_queue == NULL ||
+        s_ready_queue == NULL || s_free_queue == NULL) {
         delete_resources(false);
         return ESP_ERR_NO_MEM;
     }
@@ -1448,12 +1515,14 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
                      s_status.pool_used == 0 &&
                      s_pending_gps_batch == NULL;
     taskEXIT_CRITICAL(&s_lock);
-    if (!available || uxQueueMessagesWaiting(s_gps_queue) != 0 ||
+    if (!available || uxQueueMessagesWaiting(s_event_queue) != 0 ||
+        uxQueueMessagesWaiting(s_gps_queue) != 0 ||
         uxQueueMessagesWaiting(s_ready_queue) != 0 ||
         uxQueueMessagesWaiting(s_free_queue) != s_config.pool_length) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    xQueueReset(s_event_queue);
     xQueueReset(s_gps_queue);
     int64_t first_reflectance_release_us = 0;
     if (s_config.reflectance_interval_ms != 0) {
@@ -1531,6 +1600,28 @@ esp_err_t telemetry_submit_reflectance(const reflectance_record_t *record)
     return result;
 }
 
+esp_err_t telemetry_submit_event(const operation_event_record_t *record)
+{
+    if (record == NULL || record->event_code == 0 ||
+        record->severity > OPERATION_EVENT_SEVERITY_CRITICAL ||
+        record->reserved != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    taskENTER_CRITICAL(&s_lock);
+    bool active = s_task != NULL && s_accepting && s_status.mission_id != 0;
+    if (active) {
+        s_submitters++;
+        s_status.events_offered++;
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    if (!active) return ESP_ERR_INVALID_STATE;
+    esp_err_t result = enqueue_event(record);
+    taskENTER_CRITICAL(&s_lock);
+    s_submitters--;
+    taskEXIT_CRITICAL(&s_lock);
+    return result;
+}
+
 static bool mission_delivery_drained(void)
 {
     taskENTER_CRITICAL(&s_lock);
@@ -1539,7 +1630,8 @@ static bool mission_delivery_drained(void)
                        s_pending_gps_batch == NULL;
     taskEXIT_CRITICAL(&s_lock);
     if (!idle_before) return false;
-    if (uxQueueMessagesWaiting(s_gps_queue) != 0 ||
+    if (uxQueueMessagesWaiting(s_event_queue) != 0 ||
+        uxQueueMessagesWaiting(s_gps_queue) != 0 ||
         uxQueueMessagesWaiting(s_ready_queue) != 0) {
         return false;
     }
@@ -1604,6 +1696,7 @@ esp_err_t telemetry_abort_mission(void)
     /* Remove every not-yet-dequeued pointer immediately. The worker owns pool
      * reclamation and observes s_abort_requested between fragments, so this
      * call never waits for UART, MQTT acknowledgements, or retry deadlines. */
+    xQueueReset(s_event_queue);
     xQueueReset(s_gps_queue);
     xQueueReset(s_ready_queue);
     ESP_LOGI(TAG,

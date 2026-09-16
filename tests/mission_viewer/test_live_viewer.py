@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT / "tools" / "mission_viewer"))
 
 from dji_h1_viewer import (  # noqa: E402
     LiveConfigError, LiveMissionStore, LiveReceiverConfig, LiveTelemetrySource,
-    MESSAGE_GPS, MESSAGE_GPS_BATCH, MESSAGE_REFLECTANCE, MissionService,
+    MESSAGE_GPS, MESSAGE_GPS_BATCH, MESSAGE_OPERATION_LOG,
+    MESSAGE_REFLECTANCE, MissionService,
     ReassembledTelemetry, decode_acknowledgement, decode_record,
     encode_gps_batch, fragment_message,
 )
@@ -28,6 +29,7 @@ from dji_h1_viewer import (  # noqa: E402
 _RECORD_HEADER = struct.Struct("<IHHIIIHHIQQQIHBB")
 _GPS_BODY = struct.Struct("<B3xiiiIIH8B")
 _REFLECTANCE_PREFIX = struct.Struct("<IIIQIHHHHHH")
+_OPERATION_EVENT_BODY = struct.Struct("<HBBIi")
 
 
 def _record(record_type: int, body: bytes, sequence: int,
@@ -57,6 +59,15 @@ def _reflectance(sequence: int, a_ms: int) -> bytes:
         + struct.pack("<4H", 100, 2500, 5000, 10000)
         + bytes((1, 1, 1, 1)))
     return _record(MESSAGE_REFLECTANCE, body, sequence,
+                   1_000_000 + a_ms * 1000, a_ms)
+
+
+def _event(sequence: int, a_ms: int, code: int = 13,
+           severity: int = 3, argument0: int = 3000,
+           argument1: int = 0) -> bytes:
+    body = _OPERATION_EVENT_BODY.pack(
+        code, severity, 0, argument0, argument1)
+    return _record(MESSAGE_OPERATION_LOG, body, sequence,
                    1_000_000 + a_ms * 1000, a_ms)
 
 
@@ -121,6 +132,24 @@ class LiveViewerTests(unittest.TestCase):
         mission = store.snapshot({"connected": True, "state": "subscribed"})
         self.assertEqual(len(mission.gps), 2)
 
+    def test_live_store_exposes_timestamped_operation_event(self) -> None:
+        store = LiveMissionStore(LiveReceiverConfig(host="localhost"))
+        self.assertEqual(store.accept(_message(
+            MESSAGE_OPERATION_LOG, 4, _event(4, 2050))), 1)
+        mission = store.snapshot({"connected": True, "state": "subscribed"})
+        self.assertIsNotNone(mission)
+        assert mission is not None
+        self.assertEqual(len(mission.events), 1)
+        self.assertEqual(mission.events[0]["event"], "ab_link_lost")
+        self.assertEqual(mission.events[0]["severity"], "critical")
+        self.assertEqual(mission.events[0]["argument0"], 3000)
+
+        # Application retries are ACKed elsewhere but never duplicate the
+        # event shown to the operator.
+        self.assertEqual(store.accept(_message(
+            MESSAGE_OPERATION_LOG, 4, _event(4, 2050))), 0)
+        self.assertEqual(len(store.snapshot({}).events), 1)
+
     def test_local_live_configuration_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "live_mqtt.local.json"
@@ -180,6 +209,41 @@ class LiveViewerTests(unittest.TestCase):
             self.assertEqual(source.status()["duplicate_fragments"], 1)
             self.assertEqual(len(transport.publications), 2)
             self.assertEqual(len(source.snapshot().reflectance), 1)
+        finally:
+            source._accepting = False
+            source._stop_workers()
+
+    def test_receiver_decodes_and_acknowledges_operation_event(self) -> None:
+        class FakeTransport:
+            def __init__(self):
+                self.publications = []
+
+            def publish(self, topic, payload, qos):
+                self.publications.append((topic, payload, qos))
+
+        source = LiveTelemetrySource(LiveReceiverConfig(host="localhost"))
+        transport = FakeTransport()
+        source._transport = transport
+        source._accepting = True
+        source._start_workers()
+        wire, = fragment_message(
+            MESSAGE_OPERATION_LOG, 42, 4, _event(4, 2050),
+            source_id=0x112233445566)
+        try:
+            source._enqueue_publication("dji-h1/test/up", wire, 1)
+            self._wait_for(
+                lambda: source.status()["acknowledgements"] == 1)
+            status = source.status()
+            self.assertEqual(status["complete_messages"], 1)
+            self.assertEqual(status["event_records"], 1)
+            acknowledgement = decode_acknowledgement(
+                transport.publications[0][1])
+            self.assertEqual(acknowledgement.message_sequence, 4)
+            self.assertEqual(acknowledgement.status, 0)
+            mission = source.snapshot()
+            self.assertEqual(len(mission.events), 1)
+            self.assertEqual(mission.events[0]["event"], "ab_link_lost")
+            self.assertEqual(mission.events[0]["severity"], "critical")
         finally:
             source._accepting = False
             source._stop_workers()
@@ -304,6 +368,10 @@ class LiveViewerTests(unittest.TestCase):
             MESSAGE_REFLECTANCE, 9, _reflectance(9, 2050)))
         source.store.accept(_message(
             MESSAGE_GPS, 2, _gps(2, 2100, 399_000_100)))
+        source.store.accept(_message(
+            MESSAGE_OPERATION_LOG, 4, _event(4, 2050)))
+        source.store.accept(_message(
+            MESSAGE_OPERATION_LOG, 5, _event(5, 5000)))
         source._status.update({"connected": True, "state": "subscribed"})
         app = QApplication.instance() or QApplication([])
         with patch("dji_h1_viewer.ui.MissionMapPanel", MapStub):
@@ -316,6 +384,9 @@ class LiveViewerTests(unittest.TestCase):
             self.assertEqual(viewer.service.mode, "live")
             self.assertEqual(len(viewer.map_model.route), 2)
             self.assertEqual(len(viewer.map_model.measurements), 1)
+            self.assertEqual(len(viewer.map_model.events), 1)
+            self.assertEqual(viewer.events_list.count(), 2)
+            self.assertIn("location pending", viewer.events_list.item(1).text())
             self.assertIn("Reflectance calculation 9",
                           viewer.spectrum_info.text())
             self.assertIn("Live link", viewer.flight_info.text())

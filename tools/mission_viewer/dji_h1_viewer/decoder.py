@@ -21,6 +21,7 @@ MAX_RECORD_SIZE = 4 * 1024 * 1024
 RECORD_GPS = 1
 RECORD_RAW_SPECTRUM = 2
 RECORD_REFLECTANCE = 3
+RECORD_OPERATION_LOG = 4
 
 ROLE_GROUND = 0
 ROLE_SKY = 1
@@ -30,6 +31,7 @@ _RECORD_HEADER = struct.Struct("<IHHIIIHHIQQQIHBB")
 _RAW_PREFIX = struct.Struct("<IIHhBBBB")
 _REFLECTANCE_PREFIX = struct.Struct("<IIIQIHHHHHH")
 _GPS_BODY = struct.Struct("<B3xiiiIIH8B")
+_OPERATION_EVENT_BODY = struct.Struct("<HBBIi")
 
 
 class RecordFormatError(ValueError):
@@ -113,6 +115,23 @@ class GpsRecord:
 
 
 @dataclass(frozen=True)
+class OperationEventInfo:
+    event_code: int
+    severity: int
+    reserved: int
+    argument0: int
+    argument1: int
+
+
+@dataclass(frozen=True)
+class OperationEvent:
+    """One validated compact operation event received over telemetry."""
+
+    header: RecordHeader
+    info: OperationEventInfo
+
+
+@dataclass(frozen=True)
 class RecordRef:
     """A lightweight record index entry; sample arrays remain on disk."""
 
@@ -120,7 +139,8 @@ class RecordRef:
     file_offset: int
     body_offset: int
     body_size: int
-    info: RawRecordInfo | ReflectanceRecordInfo | GpsSample | None
+    info: (RawRecordInfo | ReflectanceRecordInfo | GpsSample |
+           OperationEventInfo | None)
     expected_crc: int
 
 
@@ -149,7 +169,7 @@ class RecordScanIssue:
     discarded_tail_bytes: int
 
 
-DecodedRecord = GpsRecord | RawSpectrum | ReflectanceSpectrum
+DecodedRecord = GpsRecord | RawSpectrum | ReflectanceSpectrum | OperationEvent
 
 
 def decode_record(encoded: bytes, *, expected_type: int | None = None,
@@ -183,7 +203,11 @@ def decode_record(encoded: bytes, *, expected_type: int | None = None,
         return ReflectanceSpectrum(
             header, info, values,
             body[flags_offset:flags_offset + info.sample_count])
-    raise RecordFormatError(f"unsupported DHR1 record type {record_type}")
+    if isinstance(info, OperationEventInfo):
+        if info.event_code == 0 or info.severity > 3 or info.reserved != 0:
+            raise RecordFormatError("invalid operation-event body")
+        return OperationEvent(header, info)
+    raise RecordFormatError(f"unsupported DHR1 record type {header.record_type}")
 
 
 def _record_info(record_type: int, body: bytes, offset: int):
@@ -206,13 +230,21 @@ def _record_info(record_type: int, body: bytes, offset: int):
         if len(body) != _GPS_BODY.size:
             raise RecordFormatError(f"invalid GPS body size at {offset}")
         return GpsSample(*_GPS_BODY.unpack(body))
+    if record_type == RECORD_OPERATION_LOG:
+        if len(body) != _OPERATION_EVENT_BODY.size:
+            raise RecordFormatError(f"invalid operation-event body size at {offset}")
+        info = OperationEventInfo(*_OPERATION_EVENT_BODY.unpack(body))
+        if info.event_code == 0 or info.severity > 3 or info.reserved != 0:
+            raise RecordFormatError(f"invalid operation-event body at {offset}")
+        return info
     return None
 
 
 def _decode_record_metadata(
         wire: bytes, offset: int, *, verify_crc: bool = True
         ) -> tuple[RecordHeader, bytes,
-                   RawRecordInfo | ReflectanceRecordInfo | GpsSample | None,
+                   RawRecordInfo | ReflectanceRecordInfo | GpsSample |
+                   OperationEventInfo | None,
                    int]:
     """Validate shared DHR1 framing without eagerly decoding sample arrays."""
 

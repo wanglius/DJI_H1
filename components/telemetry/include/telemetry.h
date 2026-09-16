@@ -82,6 +82,12 @@ typedef struct {
     /** GPS source records contained in pool entries deliberately abandoned by
      * the terminal shutdown forecast. */
     uint32_t gps_records_abandoned_shutdown;
+    /** Operation events offered/admitted/delivered on the live channel. */
+    uint32_t events_offered;
+    uint32_t events_submitted;
+    uint32_t events_sent;
+    uint32_t event_queue_overflows;
+    uint32_t events_expired;
     /** Valid calculated records offered by the measurement pipeline. */
     uint32_t reflectance_offered;
     /** Records admitted by the configured latest-value sampler. */
@@ -149,22 +155,24 @@ esp_err_t telemetry_start(const telemetry_config_t *config);
  */
 esp_err_t telemetry_begin_mission(uint64_t mission_id);
 
-/** GPS and reflectance are nonblocking submissions backed by one retained
- * PSRAM pool. GPS records remain ordered but are losslessly sealed into DGB1
- * batches before entering their FIFO. Reflectance uses a configured
- * latest-value sampling period before entering the reliable FIFO; intentional
- * replacement is counted separately and is not an error. A full pool returns
- * ESP_ERR_NO_MEM and counts a dropped live telemetry record without stopping
- * later submissions or SD recording. Every admitted record also has a bounded
- * residency; expiration is counted as delivery degradation but never latches
- * the component unhealthy.
+/** GPS, reflectance, and operation events are nonblocking submissions backed
+ * by one retained PSRAM pool. GPS records remain ordered but are losslessly
+ * sealed into DGB1 batches before entering their FIFO. Reflectance uses a
+ * configured latest-value sampling period before entering the reliable FIFO;
+ * intentional replacement is counted separately and is not an error. Events
+ * have a dedicated priority FIFO so major state changes are not trapped behind
+ * the spectral backlog. A full pool returns ESP_ERR_NO_MEM and counts a dropped
+ * live telemetry record without stopping later submissions or SD recording.
+ * Every admitted record also has a bounded residency; expiration is counted as
+ * delivery degradation but never latches the component unhealthy.
  */
 esp_err_t telemetry_submit_gps(const gps_record_t *record);
 esp_err_t telemetry_submit_reflectance(
     const reflectance_record_t *record);
+esp_err_t telemetry_submit_event(const operation_event_record_t *record);
 
-/** Stop accepting records and wait until every retained GPS/reflectance record
- * has completed according to the configured delivery mode.
+/** Stop accepting records and wait until every retained GPS, reflectance, and
+ * operation-event record has completed according to the configured mode.
  */
 esp_err_t telemetry_finish_mission(uint32_t timeout_ms);
 

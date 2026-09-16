@@ -16,8 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "mission_viewer"))
 
 from dji_h1_viewer.telemetry import (  # noqa: E402
-    MESSAGE_GPS, MESSAGE_GPS_BATCH, MESSAGE_REFLECTANCE, FragmentError,
-    TelemetryFragmentStreamDecoder, TelemetryReassembler,
+    MESSAGE_GPS, MESSAGE_GPS_BATCH, MESSAGE_OPERATION_LOG,
+    MESSAGE_REFLECTANCE, FragmentError, TelemetryFragmentStreamDecoder,
+    TelemetryReassembler,
     decode_gps_batch, encode_acknowledgement,
 )
 from mqtt_broker_probe import (  # noqa: E402
@@ -31,6 +32,7 @@ RECORD_HEADER_SIZE = 60
 _RECORD_HEADER = struct.Struct("<IHHIIIHHIQQQIHBB")
 _GPS_BODY = struct.Struct("<B3xiiiIIH8B")
 _REFLECTANCE_PREFIX = struct.Struct("<IIIQIHHHHHH")
+_OPERATION_EVENT_BODY = struct.Struct("<HBBIi")
 MAX_ACK_CACHE = 4096
 PING_INTERVAL_SECONDS = 10.0
 DEFAULT_ACK_QOS = 0
@@ -108,9 +110,21 @@ def validate_record(payload: bytes, transport_type: int,
     return fields, payload[RECORD_HEADER_SIZE:-4]
 
 
+def decode_operation_event(body: bytes) -> tuple[int, int, int, int]:
+    """Validate the compact type-4 body and return its meaningful fields."""
+
+    if len(body) != _OPERATION_EVENT_BODY.size:
+        raise ValueError("invalid operation-event body size")
+    event_code, severity, reserved, argument0, argument1 = \
+        _OPERATION_EVENT_BODY.unpack(body)
+    if event_code == 0 or severity > 3 or reserved != 0:
+        raise ValueError("invalid operation-event body")
+    return event_code, severity, argument0, argument1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate live GPS and reflectance telemetry"
+        description="Validate live GPS, reflectance, and event telemetry"
     )
     parser.add_argument("--host", required=True)
     parser.add_argument("--mqtt-port", type=int, default=1883)
@@ -137,6 +151,7 @@ def main() -> int:
     )
     parser.add_argument("--expect-gps-min", type=int, default=0)
     parser.add_argument("--expect-reflectance-min", type=int, default=0)
+    parser.add_argument("--expect-events-min", type=int, default=0)
     parser.add_argument(
         "--quiet-records", action="store_true",
         help="suppress one-line output for each valid record; keep the summary",
@@ -171,7 +186,11 @@ def main() -> int:
     reassembler = TelemetryReassembler(
         timeout_seconds=30.0, max_inflight=args.max_inflight,
     )
-    counts = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}
+    counts = {
+        MESSAGE_GPS: 0,
+        MESSAGE_REFLECTANCE: 0,
+        MESSAGE_OPERATION_LOG: 0,
+    }
     gps_batches = 0
     gps_partial_batches = 0
     observed_sequences: dict[tuple[int, int, int], set[int]] = {}
@@ -246,7 +265,7 @@ def main() -> int:
                     continue
                 if message.message_type not in (
                         MESSAGE_GPS, MESSAGE_GPS_BATCH,
-                        MESSAGE_REFLECTANCE):
+                        MESSAGE_REFLECTANCE, MESSAGE_OPERATION_LOG):
                     raise ValueError(
                         f"unsupported telemetry type {message.message_type}"
                     )
@@ -355,6 +374,17 @@ def main() -> int:
                             f"samples={sample_count} valid={reflectance[6]} "
                             f"sky_age_us={reflectance[4]}"
                         )
+                elif message.message_type == MESSAGE_OPERATION_LOG:
+                    event_code, severity, argument0, argument1 = \
+                        decode_operation_event(body)
+                    if not args.quiet_records:
+                        print(
+                            f"EVENT source={message.source_id:012X} "
+                            f"mission={message.mission_id} "
+                            f"seq={message.message_sequence} utc_ms={utc_ms} "
+                            f"code={event_code} severity={severity} "
+                            f"argument0={argument0} argument1={argument1}"
+                        )
     except (FragmentError, ValueError, OSError, RuntimeError) as exc:
         print(f"TELEMETRY INVALID: {exc}", file=sys.stderr)
         return 2
@@ -364,11 +394,16 @@ def main() -> int:
 
     gps_count = counts[MESSAGE_GPS]
     reflectance_count = counts[MESSAGE_REFLECTANCE]
+    event_count = counts[MESSAGE_OPERATION_LOG]
     source_records_skipped = {MESSAGE_GPS: 0, MESSAGE_REFLECTANCE: 0}
     # Retries can complete old records out of order. Compute actual holes from
     # the final observed set instead of treating each forward arrival jump as
     # loss, which would substantially over-report gaps under normal recovery.
     for sequence_key, sequences in observed_sequences.items():
+        if sequence_key[2] not in source_records_skipped:
+            # Live diagnostic event rate limiting intentionally creates event
+            # sequence gaps; they are not SD event loss.
+            continue
         ordered = sorted(sequences)
         source_records_skipped[sequence_key[2]] += sum(
             current - previous - 1
@@ -380,6 +415,7 @@ def main() -> int:
         f"gps={gps_count} gps_batches={gps_batches} "
         f"gps_partial_batches={gps_partial_batches} "
         f"reflectance={reflectance_count} "
+        f"events={event_count} "
         f"other_mission_records={other_mission_records} "
         f"gps_source_records_skipped={source_records_skipped[MESSAGE_GPS]} "
         f"reflectance_source_records_skipped="
@@ -387,7 +423,8 @@ def main() -> int:
         f"inflight={reassembler.inflight_count} buffered={stream.buffered_bytes}"
     )
     if gps_count < args.expect_gps_min or \
-            reflectance_count < args.expect_reflectance_min:
+            reflectance_count < args.expect_reflectance_min or \
+            event_count < args.expect_events_min:
         return 3
     return 0
 

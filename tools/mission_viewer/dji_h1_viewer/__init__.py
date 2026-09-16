@@ -1,10 +1,12 @@
 """Public APIs for the DJI H1 mission decoder and desktop viewer."""
 
 from .decoder import (
-    FORMAT_VERSION, GpsRecord, GpsSample, RawRecordInfo, RawSpectrum, RecordFile,
+    FORMAT_VERSION, GpsRecord, GpsSample, OperationEvent,
+    OperationEventInfo, RawRecordInfo, RawSpectrum, RecordFile,
     RecordFormatError, RecordHeader, RecordScanIssue, ReflectanceRecordInfo,
-    ReflectanceSpectrum, RECORD_GPS, RECORD_RAW_SPECTRUM,
-    RECORD_REFLECTANCE, ROLE_GROUND, ROLE_SKY, decode_record,
+    ReflectanceSpectrum, RECORD_GPS, RECORD_OPERATION_LOG,
+    RECORD_RAW_SPECTRUM, RECORD_REFLECTANCE, ROLE_GROUND, ROLE_SKY,
+    decode_record,
 )
 from .api import MissionHttpServer, MissionService, start_http_api
 from .geolocation import (
@@ -40,7 +42,8 @@ __all__ = [
     "DRONE_VALID_ALTITUDE", "DRONE_VALID_POSITION", "FORMAT_VERSION",
     "FRAGMENT_PAYLOAD_MAX",
     "FRAGMENT_WIRE_MAX_SIZE", "FragmentError", "GPS_BATCH_MAX_RECORDS",
-    "GROUND", "SKY", "GpsRecord", "GpsSample",
+    "GROUND", "SKY", "GpsRecord", "GpsSample", "OperationEvent",
+    "OperationEventInfo",
     "InterpolatedPosition", "LocatedRawSpectrum", "LocatedReflectanceSpectrum",
     "MESSAGE_GPS", "MESSAGE_GPS_BATCH", "MESSAGE_OPERATION_LOG",
     "MESSAGE_RAW_SPECTRUM",
@@ -51,7 +54,7 @@ __all__ = [
     "ProductReadError", "RoutePoint",
     "RawRecordInfo", "RawSpectrum", "RecordFile", "RecordFormatError",
     "RecordScanIssue",
-    "RecordHeader", "RECORD_GPS", "RECORD_RAW_SPECTRUM",
+    "RecordHeader", "RECORD_GPS", "RECORD_OPERATION_LOG", "RECORD_RAW_SPECTRUM",
     "RECORD_REFLECTANCE", "ReflectanceRecordInfo", "ReflectanceSpectrum",
     "ROLE_GROUND", "ROLE_SKY", "ReassembledTelemetry",
     "TelemetryAcknowledgement", "TelemetryFragment",

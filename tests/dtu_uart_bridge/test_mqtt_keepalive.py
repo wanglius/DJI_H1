@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 import sys
 import unittest
 
@@ -11,7 +12,8 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
 from monitor_telemetry import (  # noqa: E402
-    DEFAULT_ACK_QOS, PING_INTERVAL_SECONDS, publish_ack, service_keepalives,
+    DEFAULT_ACK_QOS, PING_INTERVAL_SECONDS, decode_operation_event,
+    publish_ack, service_keepalives,
 )
 from mqtt_broker_probe import ping  # noqa: E402
 
@@ -99,6 +101,12 @@ class KeepaliveTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ConnectionError, "invalid MQTT PINGRESP"):
             ping(connection)
+
+    def test_operation_event_body_is_validated(self) -> None:
+        body = struct.pack("<HBBIi", 13, 3, 0, 3000, -1)
+        self.assertEqual(decode_operation_event(body), (13, 3, 3000, -1))
+        with self.assertRaisesRegex(ValueError, "operation-event body"):
+            decode_operation_event(struct.pack("<HBBIi", 13, 4, 0, 0, 0))
 
 
 if __name__ == "__main__":

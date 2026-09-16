@@ -46,6 +46,8 @@ typedef enum {
     MEASUREMENT_EVENT_CAPTURE_RESULT,
     MEASUREMENT_EVENT_FLIGHT_CLOSED,
     MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH,
+    MEASUREMENT_EVENT_AB_LINK_LOST,
+    MEASUREMENT_EVENT_AB_LINK_RESTORED,
 } measurement_event_t;
 
 /** Create the fixed pools, sole SD writer task, and a new mission directory.

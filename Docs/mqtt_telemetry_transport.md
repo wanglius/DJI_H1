@@ -1,10 +1,11 @@
 # MQTT telemetry transport format v02
 
-The B board publishes compact GPS batches and calculated reflectance records
-through one MQTT uplink topic. Reflectance retains its original DHR1 logical
-payload. GPS_TRACK.BIN likewise remains individual 98-byte DHR1 records, but the
-live path losslessly packs up to ten adjacent records into one DGB1 payload
-before DTF2 framing. No timestamp or navigation field is discarded.
+The B board publishes compact GPS batches, calculated reflectance records, and
+major operation events through one MQTT uplink topic. Reflectance and operation
+events retain their original DHR1 logical payload. GPS_TRACK.BIN likewise
+remains individual 98-byte DHR1 records, but the live path losslessly packs up
+to ten adjacent records into one DGB1 payload before DTF2 framing. No timestamp
+or navigation field is discarded.
 
 ## Design boundaries
 
@@ -14,7 +15,7 @@ before DTF2 framing. No timestamp or navigation field is discarded.
   each flight and recorded in `MISSION.JSON`; neither device clones nor a
   reformatted/replaced card can reuse the complete message identity.
 - The ESP32 implementation performs no per-message allocation. A configurable
-  shared GPS/reflectance pool (512 entries in the production board profile) is
+  shared GPS/reflectance/event pool (512 entries in the production board profile) is
   allocated once in PSRAM. Only pointers cross the FreeRTOS ready/free queues.
   A slot remains owned until a matching application disposition, the 10-second
   production residency deadline, a permanent local failure, or a shutdown
@@ -66,8 +67,31 @@ of 1024 samples is 3172 bytes and uses four fragments with wire sizes
 Message-type values 1 through 4 intentionally match the existing measurement
 record types: legacy individual GPS `1`, raw spectrum `2`, reflectance `3`, and
 operation log `4`. DGB1 GPS batch is the telemetry-only extension type `5`.
-Production publishes types 5 and 3. Receivers continue accepting type 1 so
+Production publishes types 5, 3, and 4. Receivers continue accepting type 1 so
 stale data from pre-batch firmware can drain during migration.
+
+## Operation-event payload format (DHR1 type 4)
+
+Major lifecycle and fault notifications use a compact 76-byte DHR1 record:
+the standard 60-byte DHR1 header, the 12-byte body below, and the standard
+four-byte record CRC. The event timestamp, mission, segment, and sequence live
+in the common header and therefore use the same synchronized time model as GPS
+and reflectance.
+
+| Body offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | Event code from `measurement_event_code_t` |
+| 2 | 1 | Severity: info `0`, warning `1`, error `2`, critical `3` |
+| 3 | 1 | Reserved, must be zero |
+| 4 | 4 | Unsigned event-specific argument 0 |
+| 8 | 4 | Signed event-specific argument 1 |
+
+The authoritative, complete event history remains `EVENTS.JSONL` on SD. The
+live channel carries major state changes such as handshake, capture start/stop,
+power-off forecast, A/B link loss/restoration, and rate-limited diagnostic
+events. High-frequency diagnostic classes send their first occurrence and
+then every hundredth occurrence live so a fault storm cannot starve lifecycle
+events; no SD events are omitted by this live rate limit.
 
 ## GPS batch payload format (DGB1 v01)
 
@@ -103,20 +127,22 @@ before the new record is admitted.
 
 The `telemetry` component owns UART1 on GPIO17/GPIO18 and is the only task that
 writes application data to the DTU. The measurement recorder gives it finalized
-v01 GPS and reflectance records without ever waiting for UART or cellular I/O.
+v01 GPS, reflectance, and operation-event records without ever waiting for UART
+or cellular I/O.
 Every received 5 Hz GPS record is appended to a telemetry-only batch while its
 individual DHR1 copy continues independently to GPS_TRACK.BIN. A batch seals at
 ten records, two seconds after its first record, or at a metadata/mission
 boundary. Calculated reflectance remains
 full-rate on SD, while telemetry keeps one latest-value candidate and admits at
-most one candidate every 250 ms (4 Hz) to its reliable FIFO. A newer candidate
+most one candidate every 200 ms (5 Hz) to its reliable FIFO. A newer candidate
 within the same interval intentionally supersedes the older one. This
 rate-limited count is diagnostic, not data-path degradation. The original
 ground timestamp and record sequence remain unchanged, so the receiver can
 identify exactly which calculated records were selected.
 
-GPS batches are served first so a reflectance/retry backlog cannot age the
-flight track. Every admitted batch/record is retained until a positive
+Operation events use a dedicated priority FIFO, followed by GPS batches, so a
+reflectance/retry backlog cannot hide a major state change or age the flight
+track. Every admitted batch/record is retained until a positive
 application ACK or the
 configured freshness deadline, whichever comes first. Production measures the
 deadline from local pool admission (not the record's synchronized timestamp)
@@ -150,11 +176,14 @@ Current production policy:
   batch. Production seals at 10 records or 2000 ms, whichever occurs first;
   partial batches also seal at session/segment changes and orderly mission
   finish. GPS batches remain ahead of reflectance/retry backlog;
-- new reflectance telemetry is selected on a 250 ms mission-monotonic cadence.
+- new reflectance telemetry is selected on a 200 ms mission-monotonic cadence
+  (candidate 5 Hz setting; it still requires the hardware qualification noted
+  below).
   Each tick admits only the newest unsent calculated record; empty ticks send
   nothing and missed ticks are not replayed as a burst. `MISSION.JSON` reports
   offered, admitted, intentionally rate-limited, and acknowledged counts;
-- GPS and reflectance share a 512-entry PSRAM retention pool (roughly 1.6 MiB);
+- GPS, reflectance, and operation events share a 512-entry PSRAM retention pool
+  (roughly 1.6 MiB). Operation events have a dedicated priority ready queue;
   queue exhaustion is a visible, heartbeat-degrading drop rather than a silent
   overwrite;
 - production pool residency is limited to 10 seconds. Staged, queued,
@@ -162,7 +191,7 @@ Current production policy:
   entries use a tombstone until their FreeRTOS queue pointer is consumed.
   `gps_expired` counts contained GPS source records while
   `gps_batches_expired` counts their DGB1 containers;
-  `reflectance_expired` exposes reflectance gaps. All appear in
+  `reflectance_expired` and `events_expired` expose live-data gaps. All appear in
   `MISSION.JSON`, and record-level loss still degrades the heartbeat. A late
   ACK for a released entry is harmlessly counted as mismatched;
 - the task transmits new messages continuously and does not wait for DTA1
@@ -273,9 +302,13 @@ and all 2910 GPS source records in 295 DGB1 batches. Reflectance ACK RTT was
 286 ms average, 404 ms p95, and 779 ms maximum; retained-pool occupancy peaked
 at 7 of 512. There were no telemetry timeouts, retries, expirations, overflows,
 or incomplete reassemblies, and the mission ended with `inflight=0` and
-`buffered=0`. The qualified production rate is therefore 4 Hz (one latest
-candidate every 250 ms). This remains subject to requalification with the real
-A board and the cellular conditions of the deployment area.
+`buffered=0`. The rate qualified by that run is therefore 4 Hz (one latest
+candidate every 250 ms). The current firmware candidate has since moved to
+5 Hz (one latest candidate every 200 ms); 5 Hz is **not yet qualified** by that
+historical result and needs a fresh 60-second regression followed by a
+high-illumination ten-minute mission. Both rates remain subject to
+requalification with the real A board and the cellular conditions of the
+deployment area.
 
 ## Receiver contract
 

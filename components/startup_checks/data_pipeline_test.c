@@ -151,6 +151,27 @@ esp_err_t data_pipeline_self_test(void)
                                   reflectance_wire_length - 4),
           "reflectance serialized size/CRC");
 
+    operation_event_record_t event = {
+        .event_code = 13,
+        .severity = OPERATION_EVENT_SEVERITY_CRITICAL,
+        .argument0 = 3000,
+        .argument1 = -1,
+    };
+    data_record_header_init(&event.header, DATA_RECORD_OPERATION_LOG,
+                            OPERATION_EVENT_RECORD_WIRE_SIZE, 5, 42, 3,
+                            &record.header.timestamp);
+    uint8_t event_wire[OPERATION_EVENT_RECORD_WIRE_SIZE];
+    size_t event_wire_length = 0;
+    CHECK(data_record_serialize_operation_event(
+              &event, event_wire, sizeof(event_wire), &event_wire_length) ==
+              ESP_OK,
+          "operation event serialization");
+    CHECK(event_wire_length == sizeof(event_wire) &&
+              read_le32(event_wire) == DATA_RECORD_MAGIC &&
+              read_le32(event_wire + event_wire_length - 4) ==
+                  telemetry_crc32(event_wire, event_wire_length - 4),
+          "operation event serialized size/magic/CRC");
+
     record_time_t raw_time = {
         .b_monotonic_us = 1000,
         .valid_flags = RECORD_TIME_VALID_B_MONOTONIC,
@@ -194,6 +215,6 @@ esp_err_t data_pipeline_self_test(void)
               reflectance_header.record_size == sizeof(reflectance_record_t),
           "reflectance header initialization");
 
-    ESP_LOGI(TAG, "DATA RECORD AND FAKE GPS SELF-TEST PASSED");
+    ESP_LOGI(TAG, "DATA RECORD, EVENT, AND FAKE GPS SELF-TEST PASSED");
     return ESP_OK;
 }

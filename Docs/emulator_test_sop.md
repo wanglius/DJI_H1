@@ -113,7 +113,7 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
   --username DJI_H1_001 `
   --topic dji-h1/test/up --ack-topic dji-h1/test/down `
   --duration 720 --expect-qos 1 --ack-qos 0 `
-  --expect-gps-min 2900 --expect-reflectance-min 300
+  --expect-gps-min 2900 --expect-reflectance-min 300 --expect-events-min 8
 ```
 
 For a normal 60-second regression mission, use a 120-second validator window
@@ -125,15 +125,16 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
   --username DJI_H1_001 `
   --topic dji-h1/test/up --ack-topic dji-h1/test/down `
   --duration 120 --expect-qos 1 --ack-qos 0 `
-  --expect-gps-min 200 --expect-reflectance-min 30
+  --expect-gps-min 200 --expect-reflectance-min 30 --expect-events-min 4
 ```
 
 The normal scenario contains only about 19 seconds of active acquisition split
 across two segments. The minimum of 30 is deliberately a presence/regression
-gate that also works when long exposure limits the H1 source below the 4 Hz
-telemetry cap. It does not qualify 4 Hz throughput. For rate qualification,
-confirm that the source remains above 4 Hz, raise the endurance validator's
-reflectance minimum from 300 to 1200, compare selected and received counts, and
+gate that also works when long exposure limits the H1 source below the current
+5 Hz telemetry cap. It does not qualify 5 Hz throughput. For rate
+qualification, confirm that the source remains above 5 Hz, raise the endurance
+validator's reflectance minimum from 300 to approximately 1500 for the normal
+324 seconds of active acquisition, compare selected and received counts, and
 require zero expiry/overflow/incomplete reassembly plus final `inflight=0` and
 `buffered=0` over the full endurance mission.
 
@@ -233,7 +234,7 @@ write/flush errors or production drops.
 The ground side passes only when:
 
 - it prints one `TELEMETRY SUMMARY`;
-- `gps` and `reflectance` meet the selected minimums;
+- `gps`, `reflectance`, and `events` meet the selected minimums;
 - it prints no `TELEMETRY INVALID`;
 - the process exits with code 0 (`$LASTEXITCODE -eq 0` in PowerShell).
 

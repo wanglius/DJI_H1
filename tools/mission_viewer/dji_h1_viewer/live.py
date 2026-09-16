@@ -18,15 +18,17 @@ import time
 from typing import Any
 
 from .decoder import (
-    FileHeader, GpsRecord, GpsSample, RawSpectrum, RecordFormatError, RecordRef,
-    ReflectanceSpectrum, RECORD_GPS, RECORD_RAW_SPECTRUM,
-    RECORD_REFLECTANCE, decode_record,
+    FileHeader, GpsRecord, GpsSample, OperationEvent, RawSpectrum,
+    RecordFormatError, RecordRef, ReflectanceSpectrum, RECORD_GPS,
+    RECORD_OPERATION_LOG, RECORD_RAW_SPECTRUM, RECORD_REFLECTANCE,
+    decode_record,
 )
 from .mission import Mission
 from .live_transport import LiveMqttTransport
 from .telemetry import (
     ACK_STATUS_PERMANENT_REJECTION, FragmentError, MESSAGE_GPS,
-    MESSAGE_GPS_BATCH, MESSAGE_REFLECTANCE, ReassembledTelemetry,
+    MESSAGE_GPS_BATCH, MESSAGE_OPERATION_LOG, MESSAGE_REFLECTANCE,
+    ReassembledTelemetry,
     TelemetryFragmentStreamDecoder, TelemetryReassembler, decode_gps_batch,
     encode_acknowledgement,
 )
@@ -34,6 +36,53 @@ from .telemetry import (
 
 class LiveConfigError(ValueError):
     """A local live-viewer configuration is missing or unsafe."""
+
+
+_EVENT_NAMES = {
+    1: "handshake",
+    2: "segment_start",
+    3: "stop_request",
+    4: "segment_end",
+    5: "power_off_request",
+    6: "protocol_crc_error",
+    7: "protocol_timeout",
+    8: "clock_observation_drop",
+    9: "reflectance_rejected",
+    10: "capture_result",
+    11: "flight_closed",
+    12: "drone_identity_mismatch",
+    13: "ab_link_lost",
+    14: "ab_link_restored",
+}
+_EVENT_SEVERITIES = {
+    0: "info",
+    1: "warning",
+    2: "error",
+    3: "critical",
+}
+
+
+def _event_dictionary(event: OperationEvent) -> dict[str, Any]:
+    """Project a validated compact event into the offline JSONL schema."""
+
+    header = event.header
+    info = event.info
+    return {
+        "schema_version": 1,
+        "sequence": header.sequence,
+        "event": _EVENT_NAMES.get(info.event_code,
+                                  f"event_{info.event_code}"),
+        "event_code": info.event_code,
+        "severity": _EVENT_SEVERITIES[info.severity],
+        "session_id": header.session_id,
+        "segment_id": header.segment_id,
+        "b_monotonic_us": header.b_monotonic_us,
+        "utc_ms": header.utc_ms,
+        "sync_state": header.sync_state,
+        "time_valid_flags": header.time_valid_flags,
+        "argument0": info.argument0,
+        "argument1": info.argument1,
+    }
 
 
 def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
@@ -194,6 +243,8 @@ class _MutableMission:
     gps: OrderedDict[int, GpsRecord] = field(default_factory=OrderedDict)
     reflectance: OrderedDict[int, ReflectanceSpectrum] = field(
         default_factory=OrderedDict)
+    events: OrderedDict[int, OperationEvent] = field(
+        default_factory=OrderedDict)
     latest_utc_ms: int = 0
     last_arrival: int = 0
 
@@ -234,6 +285,10 @@ class LiveMissionStore:
         elif message.message_type == MESSAGE_REFLECTANCE:
             entries = (decode_record(
                 message.payload, expected_type=RECORD_REFLECTANCE,
+                expected_sequence=message.message_sequence),)
+        elif message.message_type == MESSAGE_OPERATION_LOG:
+            entries = (decode_record(
+                message.payload, expected_type=RECORD_OPERATION_LOG,
                 expected_sequence=message.message_sequence),)
         else:
             raise RecordFormatError(
@@ -276,6 +331,10 @@ class LiveMissionStore:
                     if entry.header.sequence not in mission.reflectance:
                         mission.reflectance[entry.header.sequence] = entry
                         added += 1
+                elif isinstance(entry, OperationEvent):
+                    if entry.header.sequence not in mission.events:
+                        mission.events[entry.header.sequence] = entry
+                        added += 1
             self._select_active(key)
             if added:
                 self._revision += 1
@@ -302,8 +361,12 @@ class LiveMissionStore:
             mutable = self._missions[self._active_key]
             gps_entries = tuple(mutable.gps.values())
             reflectance_entries = tuple(mutable.reflectance.values())
+            event_entries = tuple(sorted(
+                mutable.events.values(),
+                key=lambda entry: (entry.header.b_monotonic_us,
+                                   entry.header.sequence)))
             timestamps = [entry.header.utc_ms for entry in
-                          (*gps_entries, *reflectance_entries)
+                          (*gps_entries, *reflectance_entries, *event_entries)
                           if entry.header.utc_ms > 0]
             summary = {
                 "schema_version": 1,
@@ -331,8 +394,9 @@ class LiveMissionStore:
                     "filtered_records": self.filtered_records,
                 },
             }
+        events = [_event_dictionary(entry) for entry in event_entries]
         return Mission(
-            Path(summary["directory"]), summary, "live MQTT", [], [], [], None,
+            Path(summary["directory"]), summary, "live MQTT", events, [], [], None,
             (_MemoryRecordFile(RECORD_REFLECTANCE, reflectance_entries)
              if reflectance_entries else None),
             (_MemoryRecordFile(RECORD_GPS, gps_entries)
@@ -377,7 +441,8 @@ class LiveTelemetrySource:
             "connected": False, "state": "stopped", "last_error": "",
             "mqtt_messages": 0, "mqtt_bytes": 0, "fragments": 0,
             "complete_messages": 0, "gps_records": 0,
-            "reflectance_records": 0, "duplicate_fragments": 0,
+            "reflectance_records": 0, "event_records": 0,
+            "duplicate_fragments": 0,
             "invalid_messages": 0, "expired_assemblies": 0,
             "acknowledgements": 0, "ack_publish_failures": 0,
             "qos_mismatches": 0, "ingress_dropped": 0,
@@ -587,6 +652,8 @@ class LiveTelemetrySource:
                             self._status["gps_records"] += added
                         elif completed.message_type == MESSAGE_REFLECTANCE:
                             self._status["reflectance_records"] += added
+                        elif completed.message_type == MESSAGE_OPERATION_LOG:
+                            self._status["event_records"] += added
                 self._ack_cache[key] = encoded_ack
                 self._ack_cache.move_to_end(key)
                 if len(self._ack_cache) > self._ACK_CACHE_MAX:
