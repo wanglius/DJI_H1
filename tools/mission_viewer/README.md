@@ -1,8 +1,11 @@
 # DJI H1 mission viewer
 
-A read-only Python decoder and PyQt6 desktop viewer for measurement record
-format v01. Long files are scanned and CRC-checked once, while spectrum arrays
-are read from disk only when requested.
+A two-mode Python decoder and PyQt6 desktop viewer for measurement record
+format v01. Offline mode opens completed SD mission folders; live mode receives
+the same canonical records through MQTT. Both modes share record decoding,
+timestamp interpretation, GPS interpolation, map/spectrum presentation, and
+the read-only localhost API. Long SD files are scanned and CRC-checked once,
+while spectrum arrays are read from disk only when requested.
 
 ## Run from this repository
 
@@ -21,6 +24,79 @@ python tools/mission_viewer/run_viewer.py D:\F_6658
 Omit the folder to select it in the app. The viewer supports both older
 folders containing only `RAW_SPECTRA.BIN` and `REFLECTANCE.BIN`, and complete
 folders with `MISSION.JSON`, `GPS_TRACK.BIN`, and `EVENTS.JSONL`.
+
+## Live MQTT mode
+
+Copy the safe template to an ignored local configuration and edit only the
+local copy:
+
+```powershell
+Copy-Item tools/mission_viewer/credentials/live_mqtt.example.json `
+  tools/mission_viewer/credentials/live_mqtt.local.json
+```
+
+Then either click **Connect live telemetry…** in the same viewer window or
+launch directly:
+
+```powershell
+python tools/mission_viewer/run_viewer.py `
+  --live-config tools/mission_viewer/credentials/live_mqtt.local.json
+```
+
+Every `*.local.json` file in this credential directory is ignored by Git. The
+tracked example contains no operational broker address, password, Baidu AK, or
+device identity. Optional `source_id` and `mission_id` filters accept decimal
+or `0x`-prefixed values; leave them `null` to follow the newest timestamped
+mission seen on the subscribed topic.
+
+Live reception is split into three isolated stages. Paho's network callback
+only copies each MQTT payload into a bounded ingress queue and returns, keeping
+QoS-1 PUBACK independent of decoding and rendering. A telemetry worker performs
+DTF2 reassembly, DGB1 expansion, DHR1/CRC validation, deduplication, and live
+store updates. A separate egress worker publishes DTA1 acknowledgements. The Qt
+thread reads revisioned immutable snapshots once per second and does no MQTT or
+record-processing work. A DTA1 is queued only after the complete logical
+message has been validated and accepted by the live store. Invalid complete
+messages receive a permanent-rejection DTA1; transient receiver failures
+withhold acknowledgement.
+
+`ingress_queue_size` and `ack_queue_size` default to 512. If either bounded
+queue fills, the receiver increments a visible counter and withholds DTA1 for
+that logical message, allowing the B-board's retry/lifetime policy to remain
+the end-to-end authority. Queue depth, high-water marks, drops, ACK overflows,
+and maximum processing time are displayed in the live information panel.
+
+The route and measurement overlays refresh once per second without resetting
+manual zoom or pan. **Follow latest** selects the newest spatially located
+reflectance record; clicking an older point disables following until the box
+is checked again. Because production bundles ten 5 Hz GPS records per DGB1,
+new route points normally land in groups about every two seconds. A spectrum
+remains unlocated until GPS fixes bracket its timestamp; live mode uses the
+same non-extrapolating interpolation as offline mode.
+
+This first live milestone is an in-memory operational display. The onboard SD
+files remain the authoritative mission record. MQTT currently carries GPS and
+reflectance but not `EVENTS.JSONL`, raw spectra, the complete heartbeat state,
+or `MISSION.JSON`; the live information panel states those limitations and
+shows receiver connection, assembly, duplicate, acknowledgement, expiry, QoS,
+and error counters. A durable ground journal and live event/status telemetry
+are follow-on work rather than implicit claims of this viewer.
+
+The receiver is also a public Python API and does not require Qt:
+
+```python
+from dji_h1_viewer import LiveReceiverConfig, LiveTelemetrySource
+
+config = LiveReceiverConfig.load(
+    "tools/mission_viewer/credentials/live_mqtt.local.json")
+source = LiveTelemetrySource(config)
+source.start()
+try:
+    mission_snapshot = source.snapshot()
+    receiver_counters = source.status()
+finally:
+    source.stop()
+```
 
 The main screen links three views:
 
@@ -144,6 +220,10 @@ Available `GET` routes:
 - `/map`
 - `/gps?offset=0&limit=500`
 - `/events?offset=0&limit=500`
+
+The same routes operate on the latest one-second live snapshot. `/health`
+reports `mode` as `empty`, `offline`, or `live`; `/mission` includes the live
+receiver counters under `summary.live_telemetry` when connected to MQTT.
 
 Index routes return compact metadata. Spectrum routes return the selected
 sample array plus its interpolated `position` (or `null` when it cannot be

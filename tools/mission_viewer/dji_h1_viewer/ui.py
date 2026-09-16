@@ -19,13 +19,13 @@ if _WEBRTC_POLICY not in _chromium_flags.split():
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
         f"{_chromium_flags} {_WEBRTC_POLICY}".strip())
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QBrush, QCloseEvent, QColor, QFont, QFontDatabase, QMouseEvent, QPainter,
     QPainterPath, QPen, QWheelEvent,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
     QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QToolTip,
     QVBoxLayout, QWidget,
@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 from .api import MissionHttpServer, MissionService, start_http_api
 from .baidu_map import BaiduMissionMap
 from .credentials import CredentialError
+from .live import LiveReceiverConfig, LiveTelemetrySource
 from .presentation import (
     MeasurementPoint, MissionEventPoint, MissionMapModel, build_mission_map,
 )
@@ -204,10 +205,16 @@ class MissionMap(QWidget):
         self._timezone_name = name
         self._timezone_offset_minutes = offset_minutes
 
-    def set_model(self, model: MissionMapModel) -> None:
+    def set_model(self, model: MissionMapModel, *, fit: bool = True,
+                  preserve_selection: bool = False) -> None:
+        previous_selection = (self._selected_measurement
+                              if preserve_selection else None)
         self._model = model
         source = list(model.route) or list(model.measurements)
-        if source:
+        # Keep the projection origin stable during live updates; otherwise a
+        # new mean coordinate would make a manually panned view jump once per
+        # second even though its scale/center values were preserved.
+        if source and (fit or (not self._route and not self._measurements)):
             self._reference_latitude = sum(
                 point.latitude_deg for point in source) / len(source)
             self._reference_longitude = sum(
@@ -222,9 +229,12 @@ class MissionMap(QWidget):
         self._events = [(*self._project(point.latitude_deg,
                                         point.longitude_deg), point)
                         for point in model.events]
-        self._selected_measurement = None
+        self._selected_measurement = previous_selection
         self._selected_event = None
-        self.fit_route()
+        if fit:
+            self.fit_route()
+        else:
+            self.update()
 
     def _project(self, latitude: float, longitude: float) -> tuple[float, float]:
         return ((longitude - self._reference_longitude) * self._longitude_scale,
@@ -500,6 +510,8 @@ class MissionMapPanel(QWidget):
         self._web_failed = False
         self._model: MissionMapModel | None = None
         self._external_data_enabled = False
+        self._selected_measurement: int | None = None
+        self._selected_event: int | None = None
         self.status_text = "Offline metric map"
         try:
             self._web = BaiduMissionMap()
@@ -537,19 +549,32 @@ class MissionMapPanel(QWidget):
     def baidu_available(self) -> bool:
         return self._web is not None and not self._web_failed
 
-    def set_model(self, model: MissionMapModel) -> None:
+    def set_model(self, model: MissionMapModel, *, fit: bool = True,
+                  reset_external_permission: bool = True) -> None:
         self._model = model
-        self._external_data_enabled = False
-        self._offline.set_model(model)
+        if reset_external_permission:
+            self._external_data_enabled = False
+            self._selected_measurement = None
+            self._selected_event = None
+        self._offline.set_model(
+            model, fit=fit,
+            preserve_selection=not reset_external_permission)
         if self._web is None or self._web_failed:
             self._stack.setCurrentWidget(self._offline)
         else:
             # Keep the base map visible, but do not place recorded mission
             # coordinates into a remotely scripted page until the user agrees.
             self._stack.setCurrentWidget(self._web)
-            self._web.clear_mission()
-            self.status_text = "Baidu Map · mission overlay awaiting permission"
-            self.status_changed.emit(self.status_text)
+            if self._external_data_enabled:
+                self._web.set_model(model, fit=fit)
+                if self._selected_measurement is not None:
+                    self._web.select_measurement(self._selected_measurement)
+                elif self._selected_event is not None:
+                    self._web.focus_event(self._selected_event)
+            else:
+                self._web.clear_mission()
+                self.status_text = "Baidu Map · mission overlay awaiting permission"
+                self.status_changed.emit(self.status_text)
 
     def set_timezone(self, name: str, offset_minutes: int) -> None:
         self._offline.set_timezone(name, offset_minutes)
@@ -559,6 +584,10 @@ class MissionMapPanel(QWidget):
         if self._external_data_enabled and self._web is not None:
             if self._model is not None:
                 self._web.set_model(self._model)
+                if self._selected_measurement is not None:
+                    self._web.select_measurement(self._selected_measurement)
+                elif self._selected_event is not None:
+                    self._web.focus_event(self._selected_event)
             self._stack.setCurrentWidget(self._web)
             self.status_text = (
                 "Baidu satellite · WGS84 pass-through (BD09 conversion disabled)")
@@ -576,11 +605,15 @@ class MissionMapPanel(QWidget):
 
     def select_measurement(self, reflectance_index: int,
                            *, center: bool = False) -> None:
+        self._selected_measurement = reflectance_index
+        self._selected_event = None
         self._offline.select_measurement(reflectance_index, center=center)
         if self._external_data_enabled and self._web is not None:
             self._web.select_measurement(reflectance_index, center=center)
 
     def focus_event(self, event_index: int) -> None:
+        self._selected_event = event_index
+        self._selected_measurement = None
         self._offline.focus_event(event_index)
         if self._external_data_enabled and self._web is not None:
             self._web.focus_event(event_index)
@@ -593,6 +626,12 @@ class MissionViewer(QMainWindow):
         self.service = service
         self.verify_crc = verify_crc
         self.api_server: MissionHttpServer | None = None
+        self.live_source: LiveTelemetrySource | None = None
+        self.live_timer = QTimer(self)
+        self.live_timer.setInterval(1000)
+        self.live_timer.timeout.connect(self._refresh_live)
+        self._live_has_model = False
+        self._live_revision = -1
         self.map_model = MissionMapModel((), (), (), 0, 0)
         self.setWindowTitle("DJI H1 Mission Viewer")
         self.resize(1280, 840)
@@ -609,9 +648,20 @@ class MissionViewer(QMainWindow):
         outer.setSpacing(8)
 
         toolbar = QHBoxLayout()
-        open_button = QPushButton("Open mission folder…")
-        open_button.clicked.connect(self.open_dialog)
-        toolbar.addWidget(open_button)
+        self.open_button = QPushButton("Open mission folder…")
+        self.open_button.clicked.connect(self.open_dialog)
+        toolbar.addWidget(self.open_button)
+        self.live_button = QPushButton("Connect live telemetry…")
+        self.live_button.clicked.connect(self.open_live_dialog)
+        toolbar.addWidget(self.live_button)
+        self.disconnect_button = QPushButton("Disconnect live")
+        self.disconnect_button.clicked.connect(self.disconnect_live)
+        self.disconnect_button.setEnabled(False)
+        toolbar.addWidget(self.disconnect_button)
+        self.follow_latest = QCheckBox("Follow latest")
+        self.follow_latest.setChecked(True)
+        self.follow_latest.setEnabled(False)
+        toolbar.addWidget(self.follow_latest)
         self.path_text = QLineEdit()
         self.path_text.setReadOnly(True)
         self.path_text.setPlaceholderText("No mission loaded")
@@ -623,7 +673,8 @@ class MissionViewer(QMainWindow):
         map_group = QGroupBox("Flight route")
         map_layout = QVBoxLayout(map_group)
         self.route_map = MissionMapPanel()
-        self.route_map.measurement_selected.connect(self.show_measurement)
+        self.route_map.measurement_selected.connect(
+            self._map_measurement_selected)
         self.route_map.event_selected.connect(self.show_event)
         map_layout.addWidget(self.route_map)
         map_controls = QHBoxLayout()
@@ -704,7 +755,8 @@ class MissionViewer(QMainWindow):
             self.statusBar().showMessage(f"API unavailable: {exc}")
 
     def open_dialog(self) -> None:
-        initial = (str(self.service.mission.path) if self.service.mission
+        initial = (str(self.service.mission.path)
+                   if self.service.mode == "offline" and self.service.mission
                    else str(Path.home()))
         selected = QFileDialog.getExistingDirectory(
             self, "Select DJI H1 mission folder", initial)
@@ -712,6 +764,7 @@ class MissionViewer(QMainWindow):
             self.load(selected)
 
     def load(self, path: str | Path) -> None:
+        self._stop_live(clear_service=False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self.service.load(path, verify_crc=self.verify_crc)
@@ -720,6 +773,129 @@ class MissionViewer(QMainWindow):
             QMessageBox.critical(self, "Cannot open mission", str(exc))
         finally:
             QApplication.restoreOverrideCursor()
+
+    def open_live_dialog(self) -> None:
+        credential_dir = (Path(__file__).resolve().parents[1] / "credentials")
+        selected, _filter = QFileDialog.getOpenFileName(
+            self, "Select local MQTT configuration", str(credential_dir),
+            "JSON configuration (*.json)")
+        if selected:
+            self.connect_live(selected)
+
+    def connect_live(self, config_path: str | Path) -> None:
+        """Enter live mode without coupling MQTT work to the Qt event loop."""
+
+        try:
+            config = LiveReceiverConfig.load(config_path)
+            candidate = LiveTelemetrySource(config)
+            candidate.start()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot start live telemetry", str(exc))
+            return
+        self._stop_live(clear_service=False)
+        self.live_source = candidate
+        self.service.set_mission(None, mode="live")
+        self._live_has_model = False
+        self._live_revision = -1
+        self.map_model = MissionMapModel((), (), (), 0, 0)
+        self.route_map.set_model(self.map_model, reset_external_permission=True)
+        self.path_text.setText(candidate.description)
+        self.flight_info.setText("Connecting to live telemetry…")
+        self.events_list.clear()
+        self.event_details.setText(
+            "Onboard event records are not part of the current MQTT payloads.")
+        self.spectrum_info.setText("Waiting for a located reflectance record")
+        self.spectrum_plot.clear("Waiting for live reflectance")
+        self.disconnect_button.setEnabled(True)
+        self.follow_latest.setEnabled(True)
+        self.follow_latest.setChecked(True)
+        self.live_timer.start()
+        self._refresh_live()
+
+    def disconnect_live(self) -> None:
+        self._stop_live(clear_service=False)
+        mission = self.service.mission
+        stopped_status = {"connected": False, "state": "stopped"}
+        if mission is not None:
+            mission.summary["state"] = "disconnected"
+            live = mission.summary.get("live_telemetry")
+            if isinstance(live, dict):
+                live["connected"] = False
+                live["state"] = "stopped"
+                stopped_status = live
+            self._show_flight_info()
+        self.service.set_live_status(stopped_status)
+        self.statusBar().showMessage("Live telemetry disconnected")
+
+    def _stop_live(self, *, clear_service: bool) -> None:
+        self.live_timer.stop()
+        source = self.live_source
+        self.live_source = None
+        if source is not None:
+            source.stop()
+        self.disconnect_button.setEnabled(False)
+        self.follow_latest.setEnabled(False)
+        self._live_has_model = False
+        self._live_revision = -1
+        if clear_service:
+            self.service.set_mission(None, mode="empty")
+
+    def _refresh_live(self) -> None:
+        source = self.live_source
+        if source is None:
+            return
+        status = source.status()
+        self.service.set_live_status(status)
+        age = status.get("last_message_age_seconds")
+        age_text = "no data yet" if age is None else f"last data {age:.1f} s ago"
+        self.statusBar().showMessage(
+            f"Live MQTT: {status.get('state', 'unknown')} · {age_text} · "
+            f"inflight {status.get('inflight', 0)} · "
+            f"queues {status.get('ingress_queue_depth', 0)}/"
+            f"{status.get('ack_queue_depth', 0)}")
+        revision = int(status.get("store_revision", source.revision))
+        if self._live_has_model and revision == self._live_revision:
+            self._show_flight_info()
+            return
+        mission = source.snapshot(status)
+        if mission is None:
+            self.flight_info.setText(
+                "<b>Live telemetry</b><br>"
+                f"State: {html.escape(str(status.get('state', 'unknown')))}<br>"
+                f"{html.escape(age_text)}")
+            return
+        self.service.set_mission(mission, mode="live")
+        self.path_text.setText(source.description)
+        self.map_model = build_mission_map(mission)
+        first_model = not self._live_has_model
+        self.route_map.set_timezone(mission.timezone_name,
+                                    mission.timezone_offset_minutes)
+        self.route_map.set_model(
+            self.map_model, fit=first_model,
+            reset_external_permission=first_model)
+        if first_model and self.route_map.baidu_available:
+            choice = QMessageBox.question(
+                self, "Display live mission on Baidu Map?",
+                "Baidu's remotely loaded JavaScript and map services will see "
+                "the live geographic area and continuously updated route and "
+                "measurement positions.\n\nUse Baidu Map for this live session?",
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            self.route_map.set_external_data_enabled(
+                choice == QMessageBox.StandardButton.Yes)
+        self._live_has_model = True
+        self._live_revision = revision
+        self._show_flight_info()
+        self._populate_events()
+        if self.follow_latest.isChecked() and self.map_model.measurements:
+            self.show_measurement(
+                self.map_model.measurements[-1].reflectance_index)
+
+    def _map_measurement_selected(self, reflectance_index: int) -> None:
+        if self.service.mode == "live":
+            self.follow_latest.setChecked(False)
+        self.show_measurement(reflectance_index)
 
     def _refresh(self) -> None:
         mission = self.service.mission
@@ -817,6 +993,43 @@ class MissionViewer(QMainWindow):
             ("CRC verification", crc_text),
             ("Damaged data files", product_error_text),
         )
+        live = summary.get("live_telemetry")
+        if self.service.mode == "live":
+            current = self.service.live_status
+            if isinstance(live, dict):
+                live = {**live, **current}
+            elif current:
+                live = current
+        if isinstance(live, dict):
+            age = live.get("last_message_age_seconds")
+            rows += (
+                ("Live link", live.get("state", "unknown")),
+                ("Source ID", summary.get("source_id_hex", "unknown")),
+                ("Mission ID", summary.get("mission_id_hex", "unknown")),
+                ("Last MQTT data",
+                 "not received" if age is None else f"{float(age):.1f} s ago"),
+                ("MQTT publications", live.get("mqtt_messages", 0)),
+                ("Transport fragments", live.get("fragments", 0)),
+                ("Complete messages", live.get("complete_messages", 0)),
+                ("DTA1 acknowledgements", live.get("acknowledgements", 0)),
+                ("DTA1 publish failures", live.get("ack_publish_failures", 0)),
+                ("Ingress queue",
+                 f"{live.get('ingress_queue_depth', 0)} current / "
+                 f"{live.get('ingress_high_water', 0)} peak"),
+                ("Ingress drops", live.get("ingress_dropped", 0)),
+                ("ACK queue",
+                 f"{live.get('ack_queue_depth', 0)} current / "
+                 f"{live.get('ack_queue_high_water', 0)} peak"),
+                ("ACK queue overflows", live.get("ack_queue_overflows", 0)),
+                ("Processor maximum",
+                 f"{float(live.get('processing_max_ms', 0.0)):.1f} ms"),
+                ("Incomplete assemblies", live.get("inflight", 0)),
+                ("Duplicate fragments", live.get("duplicate_fragments", 0)),
+                ("Invalid messages", live.get("invalid_messages", 0)),
+                ("Expired assemblies", live.get("expired_assemblies", 0)),
+                ("QoS mismatches", live.get("qos_mismatches", 0)),
+                ("Last receiver error", live.get("last_error") or "none"),
+            )
         self.flight_info.setText("<table>" + "".join(
             f"<tr><td><b>{html.escape(str(label))}</b></td>"
             f"<td>&nbsp;{html.escape(str(value))}</td></tr>"
@@ -904,6 +1117,7 @@ class MissionViewer(QMainWindow):
             f"{html.escape(position_text)}")
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._stop_live(clear_service=False)
         if self.api_server is not None:
             self.api_server.shutdown()
             self.api_server.server_close()
@@ -911,6 +1125,7 @@ class MissionViewer(QMainWindow):
 
 
 def run_desktop(*, initial_path: str | Path | None = None,
+                initial_live_config: str | Path | None = None,
                 api_port: int | None = 8765, verify_crc: bool = True) -> None:
     app = QApplication.instance()
     owns_application = app is None
@@ -925,5 +1140,7 @@ def run_desktop(*, initial_path: str | Path | None = None,
     window = MissionViewer(service, api_port=api_port,
                            verify_crc=verify_crc)
     window.show()
+    if initial_live_config is not None:
+        window.connect_live(initial_live_config)
     if owns_application:
         app.exec()

@@ -8,6 +8,8 @@ import argparse
 def main() -> None:
     parser = argparse.ArgumentParser(description="DJI H1 mission data viewer")
     parser.add_argument("mission", nargs="?", help="mission folder to open")
+    parser.add_argument("--live-config",
+                        help="ignored local JSON configuration for live MQTT mode")
     parser.add_argument("--api-port", type=int, default=8765,
                         help="localhost HTTP API port (default: 8765; 0 chooses a free port)")
     parser.add_argument("--no-api", action="store_true",
@@ -15,6 +17,8 @@ def main() -> None:
     parser.add_argument("--skip-crc", action="store_true",
                         help="skip the initial CRC scan (faster but unsafe)")
     args = parser.parse_args()
+    if args.mission and args.live_config:
+        parser.error("mission folder and --live-config are mutually exclusive")
     try:
         from .ui import run_desktop
     except ModuleNotFoundError as exc:
@@ -24,6 +28,7 @@ def main() -> None:
                 "'python -m pip install -e tools/mission_viewer'")
         raise
     run_desktop(initial_path=args.mission,
+                initial_live_config=args.live_config,
                 api_port=None if args.no_api else args.api_port,
                 verify_crc=not args.skip_crc)
 

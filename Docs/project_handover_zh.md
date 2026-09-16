@@ -56,6 +56,8 @@ A 板模拟器 ──UART0──> B 板状态机
 
 4G DTU/MQTT 实时上传链路已经接入：A 板 5 Hz GPS 在 SD 卡上仍逐条保存为 98 字节 DHR1，但遥测把最多 10 条相邻 GPS 无损压成一个 DGB1 消息（满 10 条或首条等待 2 秒即封包），从而把正常 GPS 消息和 DTA1 数量降到原来的约十分之一。反射率在 SD 卡保持全速记录，实时遥测每 250 ms 只选择最新一帧（上限 4 Hz）。两类消息共用 PSRAM 保留池，UART 连续发送，云端 DTA1 确认后才释放。测量上行保持 MQTT QoS 1；DTA1 下行使用 QoS 0，丢失的 ACK 由 B 板应用层重试和 10 秒最大驻留策略处理。网络拥塞不得阻塞采集或 SD 写入。2026-09-15 已在专用板、YY-M200 和真实 EMQX 链路上完成 DGB1 及 4 Hz 饱和长航次资格测试；最终高照度十分钟任务在地面完整恢复 2910 条 GPS 和全部 1277 条已选反射率，零 GPS 序号缺口、零未完成重组，并安全收尾。完整设计、线格式、计数器和实测数据见第 7.1 节。
 
+地面 live viewer 使用同一套 Python 解码器，但 MQTT 传输、DTF2/记录处理和 Qt 展示已经分成三个独立执行阶段。Paho 回调只复制 payload 到 512 项有界 ingress queue 后立即返回；decoder worker 完成重组、CRC、去重和 live store 更新；独立 ACK worker 发布 DTA1；Qt 每秒只读取带 revision 的不可变快照。队列满时会计数并故意不发 DTA1，由 B 板既有重试/驻留策略恢复，不能伪造接纳成功。2026-09-16 的 EMQX 四路 trace 曾捕获一次 2.635 s 地面 PUBACK 停顿：broker 在此期间持续接收和转发上行，证明旧版同步 Paho callback/地面链路是可隔离瓶颈；上述重构已通过 host 测试，但仍需下一次真实十分钟任务确认 callback、processor 和 ACK queue 峰值均保持有界。
+
 ## 2. 仓库和版本基线
 
 - GitHub：`https://github.com/wanglius/DJI_H1.git`
@@ -487,6 +489,10 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
 | `components/measurement_recorder/measurement_recorder.c` | GPS/反射率分叉、随机 mission ID、最终摘要 | SD 不能受遥测返回值阻塞；摘要字段需保持可解释 |
 | `main/mission_control.c` | error 5、`0x30` 时同步 abort | A/B 协议、心跳和安全断电回归 |
 | `tools/mission_viewer/dji_h1_viewer/telemetry.py` | Python 分片解码、重组和 ACK 编码 | 与 C 头字段、大小、CRC 和版本完全一致 |
+| `tools/mission_viewer/dji_h1_viewer/live_transport.py` | 极短 Paho callback、连接/订阅和线程安全 publish | 回调不得加入解码、文件、地图或阻塞等待 |
+| `tools/mission_viewer/dji_h1_viewer/live.py` | 有界 ingress/ACK queue、decoder worker、live store 和 revision snapshot | queue 满必须计数并停发 DTA1；不得伪造接纳 |
+| `tools/mission_viewer/dji_h1_viewer/ui.py` | 每秒消费不可变 live snapshot 并更新地图/光谱 | 不得直接接触 Paho、reassembler 或 ACK 路径 |
+| `tests/mission_viewer/test_live_viewer.py` | callback 非阻塞、queue 压力、ACK 和 GUI 冒烟回归 | 修改 live pipeline 后必须执行 |
 | `tests/dtu_uart_bridge/monitor_telemetry.py` | 当前地面参考接收器/ACK publisher | 去重、重 ACK、keepalive、broker QoS、长任务门禁 |
 | `tests/dtu_telemetry_stress/` | 不依赖 H1/SD/A 板的板级传输压力镜像 | 与生产构建隔离；每次测试使用唯一 mission ID |
 
@@ -864,7 +870,7 @@ python -B tests/run_host_tests.py
 python -m pip check
 ```
 
-统一入口会发现每个 `tests/*/test_*.py` 测试组，并在任一测试组发现数为 0 时失败。DGB1 基线共通过 81 个 Python 测试：mission viewer 18（含无 Chromium/不触网的离屏 GUI 冒烟测试）、A 板模拟器 29、记录格式 6、telemetry transport 18、DTU 工具 10。测试数量会随代码演进变化，应以统一入口输出为准。
+统一入口会发现每个 `tests/*/test_*.py` 测试组，并在任一测试组发现数为 0 时失败。2026-09-16 的 live pipeline 重构基线共通过 90 个 Python 测试：mission viewer 27（含 callback 非阻塞、queue 压力、慢 ACK publisher 隔离和无 Chromium/不触网的离屏 GUI 冒烟测试）、A 板模拟器 29、记录格式 6、telemetry transport 18、DTU 工具 10。测试数量会随代码演进变化，应以统一入口输出为准。
 
 ### 16.2 A 板模拟器硬件飞行
 

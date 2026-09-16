@@ -27,11 +27,40 @@ class MissionService:
     def __init__(self, mission: Mission | None = None):
         self._lock = RLock()
         self._mission = mission
+        self._mode = "offline" if mission is not None else "empty"
+        self._live_status: dict[str, Any] = {}
 
     @property
     def mission(self) -> Mission | None:
         with self._lock:
             return self._mission
+
+    @property
+    def mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    def set_mission(self, mission: Mission | None, *, mode: str) -> None:
+        """Atomically replace the snapshot exposed to the UI and HTTP API."""
+
+        if mode not in ("empty", "offline", "live"):
+            raise ValueError(f"unsupported viewer mode: {mode}")
+        with self._lock:
+            self._mission = mission
+            self._mode = mode
+            if mode != "live":
+                self._live_status = {}
+
+    def set_live_status(self, status: dict[str, Any]) -> None:
+        """Publish one receiver snapshot to UI-independent API consumers."""
+
+        with self._lock:
+            self._live_status = dict(status)
+
+    @property
+    def live_status(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._live_status)
 
     def load(self, path: str | Path, *, verify_crc: bool = True,
              strict_products: bool = False) -> dict[str, Any]:
@@ -40,6 +69,8 @@ class MissionService:
                                  strict_products=strict_products)
         with self._lock:
             self._mission = candidate
+            self._mode = "offline"
+            self._live_status = {}
             return candidate.overview()
 
     def _require_mission(self) -> Mission:
@@ -170,7 +201,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def _route(self, path: str, query: dict[str, list[str]]) -> dict[str, Any]:
         service = self.server.service
         if path == "/api/v1/health":
-            return {"ok": True, "mission_loaded": service.mission is not None}
+            return {"ok": True, "mission_loaded": service.mission is not None,
+                    "mode": service.mode, "live": service.live_status}
         if path == "/api/v1/mission":
             return service.overview()
         if path == "/api/v1/raw-index":

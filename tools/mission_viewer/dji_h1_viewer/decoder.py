@@ -105,6 +105,14 @@ class GpsSample:
 
 
 @dataclass(frozen=True)
+class GpsRecord:
+    """One fully validated GPS record received from a file or live link."""
+
+    header: RecordHeader
+    sample: GpsSample
+
+
+@dataclass(frozen=True)
 class RecordRef:
     """A lightweight record index entry; sample arrays remain on disk."""
 
@@ -141,6 +149,43 @@ class RecordScanIssue:
     discarded_tail_bytes: int
 
 
+DecodedRecord = GpsRecord | RawSpectrum | ReflectanceSpectrum
+
+
+def decode_record(encoded: bytes, *, expected_type: int | None = None,
+                  expected_sequence: int | None = None) -> DecodedRecord:
+    """Validate and decode one complete canonical DHR1 record.
+
+    SD files and MQTT telemetry carry the same record bytes. Keeping this
+    parser here gives offline and live modes one authoritative interpretation
+    of the record header, body sizes, sample arrays, and CRC.
+    """
+
+    try:
+        wire = memoryview(encoded).tobytes()
+    except (TypeError, ValueError) as exc:
+        raise RecordFormatError("record must be bytes-like") from exc
+    header, body, info, _expected_crc = _decode_record_metadata(wire, 0)
+    if expected_type is not None and header.record_type != expected_type:
+        raise RecordFormatError("DTF2/DHR1 record type mismatch")
+    if expected_sequence is not None and header.sequence != expected_sequence:
+        raise RecordFormatError("DTF2/DHR1 sequence mismatch")
+    if isinstance(info, GpsSample):
+        return GpsRecord(header, info)
+    if isinstance(info, RawRecordInfo):
+        samples = struct.unpack_from(f"<{info.sample_count}H", body,
+                                     _RAW_PREFIX.size)
+        return RawSpectrum(header, info, samples)
+    if isinstance(info, ReflectanceRecordInfo):
+        values = struct.unpack_from(f"<{info.sample_count}H", body,
+                                    _REFLECTANCE_PREFIX.size)
+        flags_offset = _REFLECTANCE_PREFIX.size + info.sample_count * 2
+        return ReflectanceSpectrum(
+            header, info, values,
+            body[flags_offset:flags_offset + info.sample_count])
+    raise RecordFormatError(f"unsupported DHR1 record type {record_type}")
+
+
 def _record_info(record_type: int, body: bytes, offset: int):
     if record_type == RECORD_RAW_SPECTRUM:
         if len(body) < _RAW_PREFIX.size:
@@ -162,6 +207,35 @@ def _record_info(record_type: int, body: bytes, offset: int):
             raise RecordFormatError(f"invalid GPS body size at {offset}")
         return GpsSample(*_GPS_BODY.unpack(body))
     return None
+
+
+def _decode_record_metadata(
+        wire: bytes, offset: int, *, verify_crc: bool = True
+        ) -> tuple[RecordHeader, bytes,
+                   RawRecordInfo | ReflectanceRecordInfo | GpsSample | None,
+                   int]:
+    """Validate shared DHR1 framing without eagerly decoding sample arrays."""
+
+    if len(wire) < RECORD_HEADER_SIZE + 4:
+        raise RecordFormatError(f"truncated DHR1 record at {offset}")
+    fields = _RECORD_HEADER.unpack_from(wire)
+    (magic, version, record_type, header_size, record_size, session_id,
+     segment_id, flags, sequence, b_us, a_ms, utc_ms, sync_age,
+     sync_generation, sync_state, valid_flags) = fields
+    if magic != RECORD_MAGIC or version != FORMAT_VERSION:
+        raise RecordFormatError(f"invalid record signature/version at {offset}")
+    if header_size != RECORD_HEADER_SIZE or record_size != len(wire):
+        raise RecordFormatError(f"invalid record header at {offset}")
+    if record_size > MAX_RECORD_SIZE:
+        raise RecordFormatError(f"record is unreasonably large at {offset}")
+    stored_crc, = struct.unpack_from("<I", wire, len(wire) - 4)
+    if verify_crc and zlib.crc32(wire[:-4]) & 0xFFFFFFFF != stored_crc:
+        raise RecordFormatError(f"CRC mismatch at {offset}")
+    header = RecordHeader(
+        record_type, record_size, session_id, segment_id, flags, sequence,
+        b_us, a_ms, utc_ms, sync_age, sync_generation, sync_state, valid_flags)
+    body = wire[RECORD_HEADER_SIZE:-4]
+    return header, body, _record_info(record_type, body, offset), stored_crc
 
 
 class RecordFile:
@@ -215,19 +289,7 @@ class RecordFile:
                     if len(encoded_header) != RECORD_HEADER_SIZE:
                         raise RecordFormatError(
                             f"truncated record header at {offset}")
-                    fields = _RECORD_HEADER.unpack(encoded_header)
-                    (record_magic, record_version, item_type, item_header_size,
-                     record_size, session_id, segment_id, flags, sequence,
-                     b_us, a_ms, utc_ms, sync_age, sync_generation, sync_state,
-                     valid_flags) = fields
-                    if (record_magic != RECORD_MAGIC or
-                            record_version != FORMAT_VERSION):
-                        raise RecordFormatError(
-                            f"invalid record signature/version at {offset}")
-                    if (item_header_size != RECORD_HEADER_SIZE or
-                            item_type != record_type):
-                        raise RecordFormatError(
-                            f"invalid record header at {offset}")
+                    record_size = _RECORD_HEADER.unpack(encoded_header)[4]
                     if record_size > MAX_RECORD_SIZE:
                         raise RecordFormatError(
                             f"record is unreasonably large at {offset}")
@@ -240,20 +302,16 @@ class RecordFile:
                     if len(body) != body_size or len(crc_bytes) != 4:
                         raise RecordFormatError(
                             f"truncated record at {offset}")
-                    expected_crc, = struct.unpack("<I", crc_bytes)
-                    if verify_crc:
-                        actual_crc = zlib.crc32(encoded_header)
-                        actual_crc = zlib.crc32(body, actual_crc) & 0xFFFFFFFF
-                        if actual_crc != expected_crc:
-                            raise RecordFormatError(
-                                f"CRC mismatch at {offset}")
-                    header = RecordHeader(
-                        item_type, record_size, session_id, segment_id, flags,
-                        sequence, b_us, a_ms, utc_ms, sync_age,
-                        sync_generation, sync_state, valid_flags)
+                    header, _decoded_body, info, expected_crc = \
+                        _decode_record_metadata(
+                            encoded_header + body + crc_bytes, offset,
+                            verify_crc=verify_crc)
+                    if header.record_type != record_type:
+                        raise RecordFormatError(
+                            f"invalid record header at {offset}")
                     records.append(RecordRef(
                         header, offset, offset + RECORD_HEADER_SIZE, body_size,
-                        _record_info(item_type, body, offset), expected_crc))
+                        info, expected_crc))
                     offset += record_size
                 except RecordFormatError as exc:
                     if strict:
@@ -267,6 +325,10 @@ class RecordFile:
 
     def __len__(self) -> int:
         return len(self.records)
+
+    @property
+    def byte_size(self) -> int:
+        return self.path.stat().st_size
 
     def read_body(self, index: int) -> bytes:
         ref = self.records[index]

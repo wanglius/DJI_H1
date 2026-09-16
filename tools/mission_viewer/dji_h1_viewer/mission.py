@@ -215,7 +215,7 @@ class Mission:
             files[key] = {
                 "present": record_file is not None,
                 "records": len(record_file) if record_file is not None else 0,
-                "bytes": (record_file.path.stat().st_size
+                "bytes": (record_file.byte_size
                           if record_file is not None else 0),
                 "duration_seconds": self._duration_seconds(record_file),
                 "crc_verified": bool(record_file is not None and

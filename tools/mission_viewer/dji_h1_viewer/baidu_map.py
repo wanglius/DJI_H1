@@ -50,7 +50,7 @@ class BaiduMissionMap(QWebEngineView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._ready = False
-        self._pending_payload: str | None = None
+        self._pending_payload: tuple[str, bool] | None = None
         self._bridge = _MapBridge(self)
         self._bridge.ready.connect(self._on_ready)
         self._bridge.error.connect(self.map_error.emit)
@@ -92,7 +92,7 @@ class BaiduMissionMap(QWebEngineView):
         self._ready = True
         self.map_ready.emit()
         if self._pending_payload is not None:
-            self._send_payload(self._pending_payload)
+            self._send_payload(*self._pending_payload)
 
     @staticmethod
     def _payload(model: MissionMapModel) -> str:
@@ -101,13 +101,15 @@ class BaiduMissionMap(QWebEngineView):
         return json.dumps(asdict(model), ensure_ascii=True,
                           separators=(",", ":"))
 
-    def set_model(self, model: MissionMapModel) -> None:
-        self._pending_payload = self._payload(model)
+    def set_model(self, model: MissionMapModel, *, fit: bool = True) -> None:
+        self._pending_payload = (self._payload(model), fit)
         if self._ready:
-            self._send_payload(self._pending_payload)
+            self._send_payload(*self._pending_payload)
 
-    def _send_payload(self, payload: str) -> None:
-        self.page().runJavaScript(f"window.setMissionData({payload});")
+    def _send_payload(self, payload: str, fit: bool) -> None:
+        fit_text = "true" if fit else "false"
+        self.page().runJavaScript(
+            f"window.setMissionData({payload}, {fit_text});")
 
     def clear_mission(self) -> None:
         self._pending_payload = None

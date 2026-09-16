@@ -336,7 +336,7 @@ class MissionViewerTests(unittest.TestCase):
             status_text = "Offline test map"
             baidu_available = False
 
-            def set_model(self, model) -> None:
+            def set_model(self, model, **_kwargs) -> None:
                 self.model = model
 
             def set_timezone(self, name: str, offset_minutes: int) -> None:

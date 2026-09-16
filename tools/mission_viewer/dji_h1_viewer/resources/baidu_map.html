@@ -60,7 +60,7 @@
       return layer;
     }
 
-    window.setMissionData = function(data) {
+    window.setMissionData = function(data, fitView) {
       mission = data;
       if (!map) return;
       map.clearOverlays();
@@ -92,7 +92,9 @@
         });
         map.addOverlay(marker);
       });
-      if (routePoints.length) map.setViewport(routePoints, {margins: [45, 45, 45, 45]});
+      if (fitView && routePoints.length) {
+        map.setViewport(routePoints, {margins: [45, 45, 45, 45]});
+      }
     };
 
     window.clearMissionData = function() {

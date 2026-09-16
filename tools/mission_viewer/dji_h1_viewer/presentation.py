@@ -121,6 +121,9 @@ def build_mission_map(mission: Mission) -> MissionMapModel:
                 (sample.altitude_relative_mm / 1000.0
                  if sample.valid_flags & DRONE_VALID_ALTITUDE else None),
                 ref.header.b_monotonic_us, index))
+        # Live retries may complete out of arrival order. Draw the route in
+        # measurement time while retaining collection indices for provenance.
+        route.sort(key=lambda point: point.b_monotonic_us)
 
     measurements: list[MeasurementPoint] = []
     unlocated_measurements = 0
