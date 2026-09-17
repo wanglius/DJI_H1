@@ -131,12 +131,14 @@ python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
 The normal scenario contains only about 19 seconds of active acquisition split
 across two segments. The minimum of 30 is deliberately a presence/regression
 gate that also works when long exposure limits the H1 source below the current
-5 Hz telemetry cap. It does not qualify 5 Hz throughput. For rate
-qualification, confirm that the source remains above 5 Hz, raise the endurance
-validator's reflectance minimum from 300 to approximately 1500 for the normal
+4 Hz telemetry cap. It does not qualify saturated 4 Hz throughput. For rate
+qualification, confirm that the source remains above 4 Hz, raise the endurance
+validator's reflectance minimum from 300 to approximately 1250 for the normal
 324 seconds of active acquisition, compare selected and received counts, and
-require zero expiry/overflow/incomplete reassembly plus final `inflight=0` and
-`buffered=0` over the full endurance mission.
+require zero retry/expiry/overflow/incomplete reassembly plus final `inflight=0`
+and `buffered=0` over the full endurance mission. The 2026-09-17 reference run
+delivered 1287/1287 selected reflectance records, 2910 GPS records, and 27
+events; the exact count may vary slightly with command timing.
 
 The validator connects two clients, waits for the uplink SUBACK, and pings both
 connections. Uplink measurement records remain QoS 1. DTA1 acknowledgements

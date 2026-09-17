@@ -44,10 +44,9 @@
  * DGB1 telemetry message. GPS_TRACK.BIN remains individual DHR1 records. */
 #define DJI_DTU_GPS_BATCH_MAX_RECORDS 10
 #define DJI_DTU_GPS_BATCH_MAX_DELAY_MS 2000
-/* Candidate 5 Hz latest-value telemetry cadence. The 200 ms selector changes
- * only MQTT admission; SD recording remains full-rate and independent. This
- * value must pass the same saturated ten-minute qualification used for 4 Hz. */
-#define DJI_DTU_REFLECTANCE_INTERVAL_MS 200
+/* Qualified 4 Hz latest-value telemetry cadence. The 250 ms selector changes
+ * only MQTT admission; SD recording remains full-rate and independent. */
+#define DJI_DTU_REFLECTANCE_INTERVAL_MS 250
 
 #ifdef CONFIG_DJI_H1_TELEMETRY_TIMING_DIAGNOSTICS
 #define DJI_DTU_TIMING_DIAGNOSTICS true
