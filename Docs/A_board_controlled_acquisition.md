@@ -1,6 +1,6 @@
 # A-board controlled acquisition milestone
 
-COM5 is the emulated A-board link for development tests; COM4 is the ESP32
+COM5 is the emulated A-board link for development tests; COM7 is the ESP32
 debug/flash port. ESP32 TX/RX remain configurable in the `board_support`
 component's `dji_h1_board.h` profile.
 

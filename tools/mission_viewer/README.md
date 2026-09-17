@@ -47,7 +47,10 @@ Every `*.local.json` file in this credential directory is ignored by Git. The
 tracked example contains no operational broker address, password, Baidu AK, or
 device identity. Optional `source_id` and `mission_id` filters accept decimal
 or `0x`-prefixed values; leave them `null` to follow the newest timestamped
-mission seen on the subscribed topic.
+mission seen on the subscribed topic. A message excluded by either identity
+filter is counted but deliberately receives no DTA1: this receiver did not
+accept it and must not clear the sender's retained entry. On a shared uplink
+topic, another receiver responsible for that identity must provide its DTA1.
 
 Live reception is split into three isolated stages. Paho's network callback
 only copies each MQTT payload into a bounded ingress queue and returns, keeping

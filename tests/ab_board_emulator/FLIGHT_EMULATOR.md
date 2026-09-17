@@ -6,7 +6,7 @@ runner; the original short `ab_board_emulator.py` remains available unchanged.
 ## Run on this workstation
 
 Connect USB-UART TX to ESP32 GPIO44, RX to GPIO43, and common ground (3.3 V TTL).
-COM5 is the USB-UART bridge; COM4 is the ESP32 flash/debug port. This program
+COM5 is the USB-UART bridge; COM7 is the ESP32 flash/debug port. This program
 opens **only COM5**, does not flash/reset B, and never physically switches power.
 
 ```powershell
@@ -126,7 +126,7 @@ SD free space is measured, and safe-power-off requires successful acquisition
 cleanup and SD unmount. There is no spectral recorder yet, so this is not proof
 of spectral data persistence. The current mode creates no SD files.
 
-To capture COM4 and compare the real counts while driving COM5:
+To capture COM7 and compare the real counts while driving COM5:
 
 ```powershell
 python -B tests/ab_board_emulator/run_hardware_flight.py --reset --report-prefix build-review/mission-normal
@@ -138,7 +138,7 @@ python -B tests/ab_board_emulator/run_hardware_flight.py --reset --endurance --r
 `--reset` restarts B explicitly, without flashing or power removal. Use a new
 report prefix each run. This runner needs pyserial and esptool for reset.
 Without `--reset`, start it before manually resetting B so all summaries are
-captured. COM4 is the debug port and COM5 the emulator port unless overridden.
+captured. COM7 is the debug port and COM5 the emulator port unless overridden.
 
 ## Tests and module boundaries
 

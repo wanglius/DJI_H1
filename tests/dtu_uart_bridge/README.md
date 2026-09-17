@@ -31,10 +31,10 @@ From the repository root, with the ESP-IDF environment loaded:
 ```powershell
 idf.py -C tests/dtu_uart_bridge -B build-dtu-bridge `
     -DIDF_TARGET=esp32s3 build
-idf.py -C tests/dtu_uart_bridge -B build-dtu-bridge -p COM6 flash
+idf.py -C tests/dtu_uart_bridge -B build-dtu-bridge -p COM7 flash
 ```
 
-Open COM6 at 115200 baud with a serial terminal. Commands typed on the PC are
+Open COM7 at 115200 baud with a serial terminal. Commands typed on the PC are
 sent unchanged to the DTU, and bytes returned by the DTU are shown unchanged.
 AT commands normally require CRLF line endings. The DTU boots in transparent
 mode; follow the manual's guarded entry sequence before sending configuration
@@ -43,7 +43,7 @@ AT commands.
 For a non-destructive status check, install `pyserial` and run:
 
 ```powershell
-python tests/dtu_uart_bridge/probe_dtu.py --port COM6
+python tests/dtu_uart_bridge/probe_dtu.py --port COM7
 ```
 
 The probe enters AT mode temporarily, reads cellular and MQTT settings, and
@@ -77,7 +77,7 @@ The host utility cannot change the running ESP32 bridge, so the bridge firmware
 must be built for the same target baud before communication resumes after the
 DTU reboot.
 
-Validate the file without opening COM6 or changing the DTU:
+Validate the file without opening COM7 or changing the DTU:
 
 ```powershell
 python tests/dtu_uart_bridge/configure_dtu_mqtt.py `
@@ -103,7 +103,7 @@ directions:
 
 ```powershell
 python tests/dtu_uart_bridge/verify_dtu_mqtt_path.py `
-    --serial-port COM6 --host mqtt.example.com --mqtt-port 1883 `
+    --serial-port COM7 --host mqtt.example.com --mqtt-port 1883 `
     --username device_test
 ```
 
@@ -123,7 +123,7 @@ through the hardware path, run:
 
 ```powershell
 python tests/dtu_uart_bridge/verify_fragmented_telemetry.py `
-    --serial-port COM6 --host mqtt.example.com --mqtt-port 1883 `
+    --serial-port COM7 --host mqtt.example.com --mqtt-port 1883 `
     --username device_test --message-bytes 2233
 ```
 
@@ -144,7 +144,7 @@ and run:
 
 ```powershell
 python tests/dtu_uart_bridge/measure_input_rate.py `
-    --serial-port COM6 --host mqtt.example.com --mqtt-port 1883 `
+    --serial-port COM7 --host mqtt.example.com --mqtt-port 1883 `
     --username device_test --expect-qos 1 `
     --report build-review/dtu-input-rate-qos1.json
 ```
@@ -169,12 +169,12 @@ Useful focused variants are:
 
 ```powershell
 # Longer 0/1/2/5 Hz reflectance comparison with 0.5 Hz GPS batches.
-python tests/dtu_uart_bridge/measure_input_rate.py --serial-port COM6 `
+python tests/dtu_uart_bridge/measure_input_rate.py --serial-port COM7 `
     --host mqtt.example.com --username device_test --expect-qos 1 `
     --stage-seconds 30 --drain-seconds 60
 
 # Compare one rate or a different MQTT publish QoS.
-python tests/dtu_uart_bridge/measure_input_rate.py --serial-port COM6 `
+python tests/dtu_uart_bridge/measure_input_rate.py --serial-port COM7 `
     --host mqtt.example.com --username device_test --expect-qos 0 `
     --reflectance-rates 2 --stage-seconds 60
 ```
@@ -194,7 +194,7 @@ python tests/dtu_uart_bridge/monitor_telemetry.py `
     --expect-gps-min 2900 --expect-reflectance-min 300
 ```
 
-It does not use COM6. It subscribes to the uplink topic, handles
+It does not use COM7. It subscribes to the uplink topic, handles
 arbitrary DTU chunk boundaries and duplicates, validates both DTF2 and
 DHR1 CRCs plus the telemetry-only DGB1 GPS batch, publishes one `DTA1`
 application acknowledgement per complete logical message on the downlink

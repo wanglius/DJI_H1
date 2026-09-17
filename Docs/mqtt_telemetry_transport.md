@@ -134,7 +134,7 @@ individual DHR1 copy continues independently to GPS_TRACK.BIN. A batch seals at
 ten records, two seconds after its first record, or at a metadata/mission
 boundary. Calculated reflectance remains
 full-rate on SD, while telemetry keeps one latest-value candidate and admits at
-most one candidate every 200 ms (5 Hz) to its reliable FIFO. A newer candidate
+most one candidate every 250 ms (4 Hz) to its reliable FIFO. A newer candidate
 within the same interval intentionally supersedes the older one. This
 rate-limited count is diagnostic, not data-path degradation. The original
 ground timestamp and record sequence remain unchanged, so the receiver can
@@ -176,9 +176,8 @@ Current production policy:
   batch. Production seals at 10 records or 2000 ms, whichever occurs first;
   partial batches also seal at session/segment changes and orderly mission
   finish. GPS batches remain ahead of reflectance/retry backlog;
-- new reflectance telemetry is selected on a 200 ms mission-monotonic cadence
-  (candidate 5 Hz setting; it still requires the hardware qualification noted
-  below).
+- new reflectance telemetry is selected on the qualified 250 ms
+  mission-monotonic cadence (maximum 4 Hz).
   Each tick admits only the newest unsent calculated record; empty ticks send
   nothing and missed ticks are not replayed as a burst. `MISSION.JSON` reports
   offered, admitted, intentionally rate-limited, and acknowledged counts;
@@ -239,8 +238,11 @@ B-board application retry covers an ACK lost on this QoS 0 leg. The
 acknowledgement is published on the configured downlink topic only after the
 complete DTF2 message and its inner DHR1 or DGB1 payload pass validation. For
 DGB1, all contained records must reconstruct and validate before the single
-batch ACK is emitted. It echoes the
-source ID, mission ID, type, sequence, and complete-message CRC. The ESP32
+batch ACK is emitted. A receiver configured with a `source_id` or `mission_id`
+filter must not acknowledge an excluded identity: filtering means that receiver
+did not accept responsibility for the record, even when its CRC is valid. A
+different receiver responsible for that identity must emit the DTA1. The ACK
+echoes the source ID, mission ID, type, sequence, and complete-message CRC. The ESP32
 matches each ACK against every retained in-flight slot. An ACK deadline schedules
 the whole logical message for retry without blocking transmission of unrelated
 messages. Identical retransmissions are safe because the receiver deduplicates
@@ -303,12 +305,15 @@ and all 2910 GPS source records in 295 DGB1 batches. Reflectance ACK RTT was
 at 7 of 512. There were no telemetry timeouts, retries, expirations, overflows,
 or incomplete reassemblies, and the mission ended with `inflight=0` and
 `buffered=0`. The rate qualified by that run is therefore 4 Hz (one latest
-candidate every 250 ms). The current firmware candidate has since moved to
-5 Hz (one latest candidate every 200 ms); 5 Hz is **not yet qualified** by that
-historical result and needs a fresh 60-second regression followed by a
-high-illumination ten-minute mission. Both rates remain subject to
-requalification with the real A board and the cellular conditions of the
-deployment area.
+candidate every 250 ms). A subsequent experimental firmware moved to 5 Hz
+(one latest candidate every 200 ms); a controlled ten-minute test
+showed that this saturated the present DTU path: only 628 of 1579 selected
+reflectance records were recovered and 951 exhausted their retries. Production
+was therefore restored to the qualified 4 Hz/250 ms setting. The subsequent
+ten-minute full-stack run recovered all 1287 selected reflectance records,
+2910 GPS records and 27 major events with no retry, expiry, overflow or
+unfinished reassembly. The 4 Hz baseline still requires requalification with
+the real A board and cellular conditions of the deployment area.
 
 ## Receiver contract
 

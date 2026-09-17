@@ -59,7 +59,7 @@ def format_response(data: bytes) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Query DTU network/MQTT state without changing settings")
-    parser.add_argument("--port", default="COM6")
+    parser.add_argument("--port", default="COM7")
     parser.add_argument("--baud", type=int, default=115200)
     args = parser.parse_args()
 

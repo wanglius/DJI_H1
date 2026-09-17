@@ -56,7 +56,7 @@ A 板模拟器 ──UART0──> B 板状态机
 
 4G DTU/MQTT 实时上传链路已经接入：A 板 5 Hz GPS 在 SD 卡上仍逐条保存为 98 字节 DHR1，但遥测把最多 10 条相邻 GPS 无损压成一个 DGB1 消息（满 10 条或首条等待 2 秒即封包），从而把正常 GPS 消息和 DTA1 数量降到原来的约十分之一。反射率在 SD 卡保持全速记录；生产固件每 250 ms 选择最新一帧（上限 4 Hz），并以 DHR1 类型 4 实时上传握手、采集启停、断链/恢复等重大事件。三类消息共用 PSRAM 保留池，事件使用独立高优先级队列，云端 DTA1 确认后才释放。测量上行保持 MQTT QoS 1；DTA1 下行使用 QoS 0，丢失的 ACK 由 B 板应用层重试和 10 秒最大驻留策略处理。网络拥塞不得阻塞采集或 SD 写入。2026-09-17 在专用板、YY-M200、真实 EMQX 和解耦 live viewer 上完成十分钟饱和长航次：地面完整恢复 2910 条 GPS、全部 1287 条已选反射率和 27 条重大事件，零重试、过期、溢出或未完成重组。完整设计、线格式、计数器和实测数据见第 7.1 节。
 
-地面 live viewer 使用同一套 Python 解码器，但 MQTT 传输、DTF2/记录处理和 Qt 展示已经分成三个独立执行阶段。Paho 回调只复制 payload 到 512 项有界 ingress queue 后立即返回；decoder worker 完成重组、CRC、去重和 live store 更新；独立 ACK worker 发布 DTA1；Qt 每秒只读取带 revision 的不可变快照。队列满时会计数并故意不发 DTA1，由 B 板既有重试/驻留策略恢复，不能伪造接纳成功。2026-09-17 十分钟 4 Hz 资格任务共处理 4183 个 MQTT publication、1609 个完整逻辑消息；ingress 和 ACK queue 峰值均为 1，零 queue drop、ACK overflow、处理失败、无效消息或过期重组，最大单次 decoder 处理时间约 43.9 ms，终态 `inflight=0`、`buffered=0`。这次板端与地面同时实测确认了该解耦结构。
+地面 live viewer 使用同一套 Python 解码器，但 MQTT 传输、DTF2/记录处理和 Qt 展示已经分成三个独立执行阶段。Paho 回调只复制 payload 到 512 项有界 ingress queue 后立即返回；decoder worker 完成重组、CRC、去重和 live store 更新；独立 ACK worker 发布 DTA1；Qt 每秒只读取带 revision 的不可变快照。队列满时会计数并故意不发 DTA1，由 B 板既有重试/驻留策略恢复，不能伪造接纳成功。配置了 `source_id`/`mission_id` 过滤器时，被排除的身份同样只计数而不发 DTA1；该接收器没有接纳记录，不能替其他设备清除保留池条目。2026-09-17 十分钟 4 Hz 资格任务共处理 4183 个 MQTT publication、1609 个完整逻辑消息；ingress 和 ACK queue 峰值均为 1，零 queue drop、ACK overflow、处理失败、无效消息或过期重组，最大单次 decoder 处理时间约 43.9 ms，终态 `inflight=0`、`buffered=0`。这次板端与地面同时实测确认了该解耦结构。
 
 ## 2. 仓库和版本基线
 
@@ -109,10 +109,10 @@ git log -5 --oneline
 
 开发机上最近使用的端口分配为：
 
-- `COM6`：ESP32-S3 原生 USB，用于下载固件和 USB Serial/JTAG 日志；
+- `COM7`：ESP32-S3 原生 USB，用于下载固件和 USB Serial/JTAG 日志；
 - `COM5`：USB 转 UART 桥，用于运行 A 板模拟器。
 
-Windows 的 COM 编号可能随 USB 接口和设备枚举变化，因此脚本参数必须按设备管理器中的实际端口修改，不能把 COM5/COM6 当作硬件常量。
+Windows 的 COM 编号可能随 USB 接口和设备枚举变化，因此脚本参数必须按设备管理器中的实际端口修改，不能把 COM5/COM7 当作硬件常量。
 
 ### 4.2 A/B 板 UART
 
@@ -418,6 +418,8 @@ DTU 上行 QoS 1 只证明 DTU 与 broker 之间的 MQTT 行为，ESP32 看不�
 #### 7.1.10 地面 validator 和起飞门禁
 
 当前参考接收器是 `tests/dtu_uart_bridge/monitor_telemetry.py`。它建立独立的 uplink subscriber 和 ACK publisher，完成 SUBACK 与双连接 PING 后才打印 `TELEMETRY READY`。它同时接受旧版类型 1 单条 GPS 和新版类型 5 DGB1；DGB1 全包通过后展开成普通 GPS，摘要中的 `gps` 仍按源记录计数，另报告 `gps_batches` 和 `gps_partial_batches`。模拟飞行必须在看到 READY 且进程仍运行后才能启动；MQTTX 只适合人工观察，不能替代 CRC 校验、重组、去重和 DTA1。
+
+live viewer 的可选身份过滤器属于接纳边界：与 `source_id` 或 `mission_id` 不匹配的完整消息会增加 `filtered_records`，但不得生成或缓存 DTA1。共享 uplink topic 时，只有负责该身份的接收器可以确认；若没有负责接收器，B 板按重试与 10 秒驻留策略显式退化，而不是被错误成功 ACK 后静默丢失。
 
 十分钟模拟任务的通用命令模板如下；broker 和用户名应从本地部署配置取得，不要把密码写进命令历史或本文档：
 
@@ -853,7 +855,7 @@ idf.py -B build-review build
 
 ```powershell
 . 'C:/Espressif/tools/Microsoft.v5.5.5.PowerShell_profile.ps1'
-idf.py -B build-review -p COM6 flash
+idf.py -B build-review -p COM7 flash
 ```
 
 若芯片进入不了下载，应检查 BOOT/EN、USB 数据线、电源、电平和串口占用。`invalid header: 0xffffffff` 通常说明目标闪存中没有有效应用、flash 连接/供电异常或启动模式错误，本身不是业务固件日志。
@@ -862,7 +864,7 @@ idf.py -B build-review -p COM6 flash
 
 ```powershell
 . 'C:/Espressif/tools/Microsoft.v5.5.5.PowerShell_profile.ps1'
-idf.py -B build-review -p COM6 monitor
+idf.py -B build-review -p COM7 monitor
 ```
 
 串口是独占资源。如果下载、monitor 或模拟器提示端口占用，应先关闭其他终端、串口助手、旧 Python 进程和 VS Code 监视任务。终止进程前要确认 PID/命令行，避免误杀无关程序。
@@ -876,7 +878,7 @@ python -B tests/run_host_tests.py
 python -m pip check
 ```
 
-统一入口会发现每个 `tests/*/test_*.py` 测试组，并在任一测试组发现数为 0 时失败。2026-09-16 的 live pipeline 重构基线共通过 90 个 Python 测试：mission viewer 27（含 callback 非阻塞、queue 压力、慢 ACK publisher 隔离和无 Chromium/不触网的离屏 GUI 冒烟测试）、A 板模拟器 29、记录格式 6、telemetry transport 18、DTU 工具 10。测试数量会随代码演进变化，应以统一入口输出为准。
+统一入口会发现每个 `tests/*/test_*.py` 测试组，并在任一测试组发现数为 0 时失败。2026-09-17 的当前基线共通过 94 个 Python 测试：mission viewer 30（含 callback 非阻塞、queue 压力、慢 ACK publisher 隔离、身份过滤不误发 DTA1，以及无 Chromium/不触网的离屏 GUI 冒烟测试）、A 板模拟器 29、记录格式 6、telemetry transport 18、DTU 工具 11。测试数量会随代码演进变化，应以统一入口输出为准。
 
 ### 16.2 A 板模拟器硬件飞行
 
@@ -885,7 +887,7 @@ python -m pip check
 ```powershell
 python -B tests/ab_board_emulator/run_hardware_flight.py `
   --port COM5 `
-  --debug-port COM6 `
+  --debug-port COM7 `
   --reset `
   --report-prefix build-review/mission-YYYYMMDD-normal
 ```
@@ -896,13 +898,13 @@ python -B tests/ab_board_emulator/run_hardware_flight.py `
 - `--probe`：控制/协议探针；
 - `--endurance`：约 10 分钟完整飞行。
 
-部分脚本中的默认 debug port 仍可能是旧硬件时期的 COM4，因此在当前专用板上应显式传 `--debug-port COM6`。每次使用新的 `--report-prefix`，脚本不会覆盖已有报告。
+硬件飞行脚本当前默认 debug port 为最近使用的 COM7；端口重新枚举后仍应显式传入实际 `--debug-port`。每次使用新的 `--report-prefix`，脚本不会覆盖已有报告。
 
 推荐完整回归顺序：
 
 1. 卡已插入且为 FAT32；
 2. 两台 H1 均已连接并供电；
-3. COM5 接 A 板模拟器，COM6 接 ESP32；
+3. COM5 接 A 板模拟器，COM7 接 ESP32；
 4. 构建并下载；
 5. 启动 30 s 正常任务，检查握手、GPS 5 Hz、START/STOP、心跳和安全断电；
 6. 启动 faults 任务，确认坏 CRC、截断帧、丢 ACK、通信中断不会重复执行动作；
@@ -1013,7 +1015,7 @@ calculation ──> SD recorder queue ──> SD（权威本地副本）
 - [ ] 能说明 H1-A/H1-B 分别代表地面和天空；
 - [ ] 能找到并修改 A/B UART 以及 SC16/SD 引脚；
 - [ ] 能构建并向专用板下载固件；
-- [ ] 能用 COM5 模拟 A 板并在 COM6 查看 B 板日志；
+- [ ] 能用 COM5 模拟 A 板并在 COM7 查看 B 板日志；
 - [ ] 能解释握手、实时数据、START、STOP、POWER-OFF、ACK 和心跳；
 - [ ] 能说明相同 CMD/SEQ 重试为何不能重复执行动作；
 - [ ] 能完成一次多 segment 模拟飞行并看到安全断电；
@@ -1050,7 +1052,7 @@ calculation ──> SD recorder queue ──> SD（权威本地副本）
 
 建议交接会议现场完成一次端到端演示：
 
-1. 展示专用板、两台 H1、SD 卡、COM5 模拟链路和 COM6 USB；
+1. 展示专用板、两台 H1、SD 卡、COM5 模拟链路和 COM7 USB；
 2. 从干净构建目录编译并下载；
 3. 先启动 MQTT broker probe 和地面 validator，确认 `TELEMETRY READY`；
 4. 启动带 GPS 的模拟飞行；

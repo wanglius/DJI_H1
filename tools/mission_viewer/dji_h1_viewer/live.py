@@ -252,6 +252,13 @@ class _MutableMission:
 class LiveMissionStore:
     """Thread-safe live records with an offline-compatible Mission snapshot."""
 
+    # ``accept`` historically returns a source-record count, where zero also
+    # means an idempotent duplicate.  Keep that public contract while using a
+    # distinct negative result for an identity filter: filtered traffic must
+    # never receive the positive DTA1 that deliberately clears a B-board pool
+    # entry.
+    FILTERED = -1
+
     def __init__(self, config: LiveReceiverConfig):
         self._config = config
         self._lock = RLock()
@@ -270,7 +277,7 @@ class LiveMissionStore:
             return self._revision
 
     def accept(self, message: ReassembledTelemetry) -> int:
-        """Decode one logical message atomically and return source record count."""
+        """Decode one message and return added count, or ``FILTERED``."""
 
         if message.message_type == MESSAGE_GPS_BATCH:
             wires = decode_gps_batch(message.payload)
@@ -298,12 +305,12 @@ class LiveMissionStore:
                 message.source_id != self._config.source_id:
             with self._lock:
                 self.filtered_records += len(entries)
-            return 0
+            return self.FILTERED
         if self._config.mission_id is not None and \
                 message.mission_id != self._config.mission_id:
             with self._lock:
                 self.filtered_records += len(entries)
-            return 0
+            return self.FILTERED
 
         key = (message.source_id, message.mission_id)
         with self._lock:
@@ -637,6 +644,11 @@ class LiveTelemetrySource:
                     continue
                 try:
                     added = self.store.accept(completed)
+                    if added == LiveMissionStore.FILTERED:
+                        # This receiver is not an acceptance authority for the
+                        # excluded identity.  Do not cache or publish DTA1: an
+                        # intended receiver on the topic must acknowledge it.
+                        continue
                     encoded_ack = encode_acknowledgement(completed)
                 except (FragmentError, RecordFormatError, ValueError) as exc:
                     with self._lock:

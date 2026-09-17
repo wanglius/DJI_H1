@@ -23,7 +23,7 @@ Current custom-board wiring:
 
 | Function | Connection |
 |---|---|
-| ESP32 flash and diagnostic log | COM6, native USB Serial/JTAG |
+| ESP32 flash and diagnostic log | COM7, native USB Serial/JTAG |
 | Emulated A-board UART | COM5 USB-UART bridge |
 | B-board UART0 TX/RX | GPIO43 / GPIO44 |
 | DTU UART TX/RX, MCU side | GPIO17 / GPIO18, 460800 baud |
@@ -39,7 +39,7 @@ Before applying power, confirm:
 - the SD card is inserted and has sufficient free space;
 - both spectrometers, the DTU, its antenna, and the SIM are connected;
 - the DTU and board have a stable power supply suitable for cellular bursts;
-- no serial terminal, IDF monitor, or stale Python process owns COM5 or COM6;
+- no serial terminal, IDF monitor, or stale Python process owns COM5 or COM7;
 - the test operator has selected a new, unique report prefix.
 
 ## 3. Terminal layout
@@ -48,7 +48,7 @@ Use three separate ESP-IDF/PowerShell terminals and keep all three visible:
 
 1. **Ground validator** — connects to EMQX, receives telemetry, and sends DTA1
    acknowledgements.
-2. **Flight runner** — drives COM5 and captures/validates the COM6 firmware log.
+2. **Flight runner** — drives COM5 and captures/validates the COM7 firmware log.
 3. **Utilities** — build, flash, broker probe, and post-test checks.
 
 MQTTX may remain open as an additional observer. Give every MQTT client a unique
@@ -68,11 +68,11 @@ git status --short
 ```
 
 Build and flash. Do not leave an IDF serial monitor attached afterward because
-the flight runner must open COM6 itself.
+the flight runner must open COM7 itself.
 
 ```powershell
 idf.py -B build-review build
-idf.py -B build-review -p COM6 flash
+idf.py -B build-review -p COM7 flash
 ```
 
 A successful flash is not permission to launch; complete the ground-system gate
@@ -170,7 +170,7 @@ Ten-minute, four-line survey with deterministic mid-air incidents:
 
 ```powershell
 python -u -B tests/ab_board_emulator/run_hardware_flight.py `
-  --port COM5 --debug-port COM6 --reset --endurance `
+  --port COM5 --debug-port COM7 --reset --endurance `
   --report-prefix build-review/mission-YYYYMMDD-endurance-01
 ```
 
@@ -178,7 +178,7 @@ Normal 60-second regression mission:
 
 ```powershell
 python -u -B tests/ab_board_emulator/run_hardware_flight.py `
-  --port COM5 --debug-port COM6 --reset `
+  --port COM5 --debug-port COM7 --reset `
   --report-prefix build-review/mission-YYYYMMDD-normal-01
 ```
 
@@ -268,7 +268,7 @@ than committing generated logs to the source repository.
 ## 10. Quick go/no-go checklist
 
 - [ ] Hardware, antenna, SIM, SD card, and both H1 units are connected.
-- [ ] COM5 and COM6 are correct and free.
+- [ ] COM5 and COM7 are correct and free.
 - [ ] Production firmware builds and flashes successfully.
 - [ ] Broker probe prints `MQTT PASS`.
 - [ ] Validator command matches production host, topics, and QoS.

@@ -1,4 +1,4 @@
-"""Run the A-board mission on COM5 and verify real H1 summaries on COM4.
+"""Run the A-board mission on COM5 and verify real H1 summaries on COM7.
 
 No flashing or physical power removal. --reset explicitly restarts B first.
 All output files are exclusively created; ports are released on every exit.
@@ -109,7 +109,7 @@ def verify_debug(log, report, require_clock=False, require_recording=False,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', default='COM5')
-    parser.add_argument('--debug-port', default='COM4')
+    parser.add_argument('--debug-port', default='COM7')
     parser.add_argument('--reset', action='store_true')
     parser.add_argument('--faults', action='store_true')
     parser.add_argument('--probe', action='store_true', help='command edge cases instead of flight')

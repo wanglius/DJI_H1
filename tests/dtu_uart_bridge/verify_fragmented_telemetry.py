@@ -38,7 +38,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Verify fragmented telemetry through the DTU MQTT uplink"
     )
-    parser.add_argument("--serial-port", default="COM6")
+    parser.add_argument("--serial-port", default="COM7")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--host", required=True)
     parser.add_argument("--mqtt-port", type=int, default=1883)

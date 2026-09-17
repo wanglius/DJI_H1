@@ -213,6 +213,37 @@ class LiveViewerTests(unittest.TestCase):
             source._accepting = False
             source._stop_workers()
 
+    def test_receiver_does_not_ack_filtered_identity(self) -> None:
+        class FakeTransport:
+            def __init__(self):
+                self.publications = []
+
+            def publish(self, topic, payload, qos):
+                self.publications.append((topic, payload, qos))
+
+        source = LiveTelemetrySource(LiveReceiverConfig(
+            host="localhost", source_id=0x111111111111))
+        transport = FakeTransport()
+        source._transport = transport
+        source._accepting = True
+        source._start_workers()
+        wire, = fragment_message(
+            MESSAGE_REFLECTANCE, 42, 9, _reflectance(9, 2050),
+            source_id=0x222222222222)
+        try:
+            source._enqueue_publication("dji-h1/test/up", wire, 1)
+            self._wait_for(
+                lambda: source.status()["processed_publications"] == 1)
+            status = source.status()
+            self.assertEqual(status["acknowledgements"], 0)
+            self.assertEqual(status["complete_messages"], 0)
+            self.assertEqual(source.store.filtered_records, 1)
+            self.assertIsNone(source.snapshot())
+            self.assertEqual(transport.publications, [])
+        finally:
+            source._accepting = False
+            source._stop_workers()
+
     def test_receiver_decodes_and_acknowledges_operation_event(self) -> None:
         class FakeTransport:
             def __init__(self):
