@@ -19,7 +19,7 @@ git remote -v
 1. 安装并激活 ESP-IDF v5.5.5；桌面工具需要 Python 3.10 或更新版本；
 2. 运行 `python -B tests/run_host_tests.py`，确认纯主机协议、记录格式、模拟器、遥测和查看器测试通过；
 3. 从仓库根目录运行 `idf.py -B build-review build`，确认构建的是生产 project `DJI_H1`，而不是 `tests/` 下会覆盖生产固件的独立诊断 project；
-4. 依次阅读第 3 节列出的 A/B 协议、记录格式、时间戳、遥测格式和模拟飞行 SOP；
+4. 依次阅读第 3 节列出的 A/B 协议、记录格式、时间戳、遥测格式和模拟飞行 SOP，并按第 16.3 节从零复现一次模拟飞行；
 5. 只有在确认专用 N16R8 板、FAT32 SD 卡、两台 H1、实际 COM 端口和地面 validator 都就绪后，才进行刷写和硬件飞行。
 
 对自动化 agent 的工作边界也应明确：先检查 Git 状态并保留用户改动；不得把 `sdkconfig` 当作受版本控制的配置源；本地 AK/MQTT/SIM 凭据只在用户明确要求相应联调时按需读取，绝不打印或提交；不得把诊断固件的参数写回生产默认值；没有用户明确授权时不要刷写硬件、删除任务数据、提交、推送或访问已取出的 SD 卡盘符。
@@ -906,7 +906,7 @@ python -B tests/ab_board_emulator/run_hardware_flight.py `
 2. 两台 H1 均已连接并供电；
 3. COM5 接 A 板模拟器，COM7 接 ESP32；
 4. 构建并下载；
-5. 启动 30 s 正常任务，检查握手、GPS 5 Hz、START/STOP、心跳和安全断电；
+5. 启动 60 s 正常任务，检查握手、GPS 5 Hz、START/STOP、心跳和安全断电；
 6. 启动 faults 任务，确认坏 CRC、截断帧、丢 ACK、通信中断不会重复执行动作；
 7. 启动 endurance 任务，检查多航线、多次采集、4.5 s 链路黑障、RTK 降级和恢复；
 8. 安全断电标志出现后复位，开始下一任务；
@@ -914,7 +914,225 @@ python -B tests/ab_board_emulator/run_hardware_flight.py `
 10. 核对 `FLIGHT.IDX` 指向下一编号，再复位一次确认不会从 `F_0001` 线性扫描；
 11. 核对任务摘要计数、航迹、事件、光谱选择、CRC 和文件修改时间。
 
-### 16.3 SD 卡故障注入
+### 16.3 从零复现一次完整模拟飞行
+
+本节是交给新开发者的独立操作步骤，目标是在不了解历史调试过程的情况下，复现已经成功的“真实 B 板 + 两台 H1 + SD 卡 + 4G DTU + EMQX + PC 模拟 A 板”闭环。更细的异常处理规则见 [emulator_test_sop.md](emulator_test_sop.md)；两份文档冲突时，应先停止测试并修正文档，不能凭经验任选一份执行。
+
+#### 16.3.1 选择测试等级
+
+建议严格按以下顺序推进，不要第一次上手就直接进行十分钟资格飞行：
+
+1. **60 秒功能回归**：验证接线、握手、5 Hz 假 GPS、两段采集、SD 记录、遥测和安全断电；
+2. **10 分钟完整航线**：四条航线、多次启停、丢 ACK、坏 CRC、截断帧、4.5 秒断链/重连和 RTK 降级；
+3. **4 Hz 饱和资格**：流程与十分钟航线相同，但必须提供足够照度，使地面 H1 源速率持续高于 4 Hz，并使用更高的地面接收数量门槛。
+
+60 秒和普通十分钟任务证明功能完整；只有第三种测试才能证明当前 4 Hz 遥测容量。
+
+#### 16.3.2 准备仓库和软件环境
+
+在仓库根目录打开 ESP-IDF PowerShell，确认当前分支、提交和工作区。正式测试应使用已知提交；若工作区非空，必须在测试记录中说明每项修改：
+
+```powershell
+git switch main
+git pull --ff-only origin main
+git rev-parse --short HEAD
+git status --short
+. 'C:/Espressif/tools/Microsoft.v5.5.5.PowerShell_profile.ps1'
+python -B tests/run_host_tests.py
+python -m pip check
+```
+
+当前基线应发现并通过 94 个主机测试。测试数量以后可能增加，因此“全部通过且没有测试组为零”比固定数字更重要。若主机测试或依赖检查失败，不要下载固件或起飞。
+
+首次使用桌面查看器的电脑还需安装其本地包：
+
+```powershell
+python -m pip install -e tools/mission_viewer
+```
+
+#### 16.3.3 断电状态下检查硬件
+
+1. 在 B 板卡槽插入状态良好的 FAT32 SD 卡，并确认剩余空间充足；固件不会自动格式化卡；
+2. H1-A 接 SC16 通道 A，作为地面光谱仪；H1-B 接通道 B，作为天空参考光谱仪；
+3. 连接 DTU、天线和已开通数据业务的 SIM，确认 DTU 已持久配置为 460800 baud、1024 字节/5 ms UART 打包、正确 broker/topic 和 MQTT QoS；
+4. COM5 连接 GPIO43/44 的 A 板模拟 UART，COM7 连接 ESP32-S3 原生 USB；两条链路必须共地；
+5. 使用能够承受蜂窝发射电流脉冲的稳定电源；
+6. 在设备管理器再次确认端口号。COM 编号变化时，后续所有命令必须一起修改；
+7. 关闭 VS Code monitor、串口助手、旧模拟器和占用 COM5/COM7 的 Python/IDF 进程。
+
+SD 卡、任一 H1、DTU、天线或 SIM 缺失时都不能把结果判定为完整系统通过。
+
+#### 16.3.4 构建并下载生产固件
+
+```powershell
+idf.py -B build-review build
+idf.py -B build-review -p COM7 flash
+```
+
+必须从启动横幅确认运行的是 `DJI_H1 - A-BOARD CONTROLLED DUAL ACQUISITION`，而不是 `DTU_STRESS`、UART bridge 或其他临时测试镜像。下载完成后不要启动 `idf.py monitor`，因为硬件飞行 runner 需要独占 COM7 并自行保存完整日志。
+
+#### 16.3.5 在起飞前验证 broker
+
+另开“地面 validator”PowerShell。broker probe 会发送一条一次性非 DTF2 测试消息，所以必须在启动正式 validator **之前**运行：
+
+```powershell
+python -B tests/dtu_uart_bridge/mqtt_broker_probe.py `
+  --host mqtt-mgnt.torchbearer.tech --port 1883 `
+  --username DJI_H1_001 --topic dji-h1/test/up --qos 1
+```
+
+只有看到以下结果才能继续：
+
+```text
+MQTT PASS host=mqtt-mgnt.torchbearer.tech:1883 topic=dji-h1/test/up qos=1
+```
+
+DNS、网络、鉴权、topic 权限或 broker 任一检查失败均为 **NO-GO**。
+
+#### 16.3.6 先启动地面 validator
+
+60 秒功能回归使用：
+
+```powershell
+python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
+  --host mqtt-mgnt.torchbearer.tech --mqtt-port 1883 `
+  --username DJI_H1_001 `
+  --topic dji-h1/test/up --ack-topic dji-h1/test/down `
+  --duration 120 --expect-qos 1 --ack-qos 0 `
+  --expect-gps-min 200 --expect-reflectance-min 30 --expect-events-min 4
+```
+
+十分钟完整航线使用：
+
+```powershell
+python -u -B tests/dtu_uart_bridge/monitor_telemetry.py `
+  --host mqtt-mgnt.torchbearer.tech --mqtt-port 1883 `
+  --username DJI_H1_001 `
+  --topic dji-h1/test/up --ack-topic dji-h1/test/down `
+  --duration 720 --expect-qos 1 --ack-qos 0 `
+  --expect-gps-min 2900 --expect-reflectance-min 300 --expect-events-min 8
+```
+
+如果要重复高照度 4 Hz 饱和资格，把十分钟命令中的 `--expect-reflectance-min` 提高到约 `1250`，并在结果中确认板端 selected 数等于地面完整接收数。普通 `300` 门槛允许低照度长曝光，只是功能门槛。
+
+validator 必须完成 uplink SUBACK、双连接 PING，并打印：
+
+```text
+TELEMETRY READY host=mqtt-mgnt.torchbearer.tech:1883 topic=dji-h1/test/up ack_topic=dji-h1/test/down uplink_qos=1 ack=qos0
+```
+
+只有看到该行且进程仍在运行才允许启动模拟飞行。空白终端、已经返回命令提示符、`TELEMETRY INVALID` 或 traceback 都不算 READY。严格资格测试中只保留一个 DTA1 权威接收器；不要同时让 validator 和 live GUI 对同一任务发送 ACK，以免重复 ACK 干扰诊断计数。
+
+#### 16.3.7 启动模拟飞行
+
+另开“飞行 runner”PowerShell。每次都要使用全新的 `--report-prefix`，已有 `.json` 或 `.log` 时脚本会拒绝覆盖。
+
+60 秒功能回归：
+
+```powershell
+python -u -B tests/ab_board_emulator/run_hardware_flight.py `
+  --port COM5 --debug-port COM7 --reset `
+  --report-prefix build-review/mission-YYYYMMDD-normal-01
+```
+
+十分钟完整航线或 4 Hz 资格飞行：
+
+```powershell
+python -u -B tests/ab_board_emulator/run_hardware_flight.py `
+  --port COM5 --debug-port COM7 --reset --endurance `
+  --report-prefix build-review/mission-YYYYMMDD-endurance-01
+```
+
+runner 会复位 B 板、握手、持续发送 5 Hz 假定位、控制多段采集、注入既定事件并最终发送 `0x30`。运行期间不要下载、复位、拔卡或用其他程序打开 COM5/COM7。
+
+#### 16.3.8 飞行中观察项目
+
+同时观察两个终端：
+
+- runner 持续收到 1 Hz 心跳，`session_id`、采集状态和地面帧计数按阶段变化；
+- validator 持续恢复 GPS/DGB1，采集段内出现 REFLECTANCE，并收到主要 operation events；
+- clock sync 从 ACQUIRING 进入 LOCKED；断链事件中允许 HOLDOVER/INVALID，恢复后应重新 LOCKED；
+- 预设丢 ACK、坏 CRC、截断帧、断链和 RTK 降级不会造成重复动作、解析永久失步或 MCU 重启；
+- 不出现 Guru Meditation、watchdog、意外 `ESP-ROM` 重启、SD write/flush error 或无限增长的 telemetry backlog。
+
+MQTTX 只能作为旁观者。看到 MQTTX 消息不等于消息已经完成 DTF2/DGB1/DHR1 校验，也不等于 B 板收到 DTA1。
+
+如果 validator 中途退出，本次资格测试立即记为失败。可以重启接收器帮助设备完成可控收尾，但不能把恢复后的任务重新解释为无故障通过。如果 runner 被中断，应保持供电，优先等待或重新发送断电请求，直到固件明确报告安全断电；仅关闭终端不能证明 SD 已卸载。
+
+#### 16.3.9 判定飞行和遥测是否通过
+
+runner 必须以以下内容结束：
+
+```text
+HARDWARE MISSION: PASSED
+Hardware checks: []
+```
+
+其 `.log` 还必须包含 `Shutdown complete: safe=1 result=ESP_OK`、每个 segment 的 H1-A/H1-B 摘要，以及 recorder 的零意外 drop/reject/write/flush error。
+
+飞行结束后不要立刻关闭 validator；等待迟到分片和 ACK 排空，直到打印 `TELEMETRY SUMMARY` 并自行退出。随后检查：
+
+```powershell
+$LASTEXITCODE
+```
+
+必须为 `0`，且 GPS、reflectance、events 达到所选门槛，没有 `TELEMETRY INVALID`。4 Hz 饱和资格还要求：
+
+- 光谱源速率持续高于 4 Hz；
+- 板端 selected reflectance 等于地面完整 reflectance；
+- retry、expiry、overflow、queue drop 和 incomplete reassembly 均为零；
+- 结束时 `inflight=0`、`buffered=0`，B 板遥测池已排空。
+
+只有 runner 和 validator **同时通过**，才能称为完整系统通过。SD 成功不能抵消地面遥测失败；地面收全也不能抵消 SD 未关闭或 `safe_power_off=0`。
+
+#### 16.3.10 检查 SD 任务目录和桌面查看器
+
+只有看到 `safe_power_off=1` 后才能切断电源或拔卡。把 SD 卡接到 PC，找到本次新增的最高编号 `F_xxxx` 目录，确认至少包含：
+
+```text
+MISSION.JSON
+RAW_SPECTRA.BIN
+REFLECTANCE.BIN
+GPS_TRACK.BIN
+EVENTS.JSONL
+```
+
+用桌面查看器打开该目录，例如：
+
+```powershell
+python tools/mission_viewer/run_viewer.py D:\F_0123
+```
+
+逐项检查 `MISSION.JSON.state` 为 `closed`、记录/丢弃/错误计数合理、航迹连续、模拟事件出现在正确时间和位置、测量点可以点击并显示反射率光谱、文件修改时间符合配置时区。百度卫星图仍存在未实施 WGS84→BD-09 转换造成的已知偏移，不能把该偏移误判为 GPS 数据损坏。
+
+#### 16.3.11 单独复现 live GUI（非资格测试）
+
+完成上述 validator 基线后，可以用一个新的飞行任务单独验证实时 GUI。先复制并填写被 Git 忽略的本地配置：
+
+```powershell
+Copy-Item tools/mission_viewer/credentials/live_mqtt.example.json `
+  tools/mission_viewer/credentials/live_mqtt.local.json
+python tools/mission_viewer/run_viewer.py `
+  --live-config tools/mission_viewer/credentials/live_mqtt.local.json
+```
+
+配置中的 host、username、password、uplink/downlink topic 和可选设备过滤器必须与 DTU 部署一致。确认 GUI 显示 MQTT 已连接并订阅后，再用第 16.3.7 节的 runner 命令启动一个新任务。正常现象是航迹约每两秒成批更新、反射率点在采集段持续出现、重大事件进入事件列表，并且地图和信息面板每秒刷新但不重置人工缩放。
+
+该演示中 live GUI 自己会验证数据并发布 DTA1，因此不要同时运行另一个会 ACK 同一任务的 validator。GUI 没有命令行数量门槛和最终资格判决，所以它只能证明实时展示链路可用，不能替代第 16.3.6～16.3.9 节的正式 validator 测试。真实 broker 凭据和百度 AK 只能保存在 `*.local.json`，不得加入 Git。
+
+#### 16.3.12 保存证据并准备下一次测试
+
+至少保存以下信息：
+
+- Git commit、`git status --short`、测试类型、日期、操作者和硬件版本；
+- runner 生成的 `build-review/mission-*.json` 与 `.log`；
+- validator 完整命令、READY 行、最终 summary 和退出码；
+- broker/topic/用户名、板卡编号、SD 卡、SIM、照度和环境说明；
+- SD 任务目录编号以及任何偏离标准步骤的操作。
+
+下一次任务必须使用新的 report prefix。设备经历 `0x30` 后，本次上电生命周期已经终止；保持安全断电状态，重新上电/复位后再进行下一次飞行。生成的日志和真实飞行数据默认不提交 Git，应保存到团队规定的测试证据位置。
+
+### 16.4 SD 卡故障注入
 
 `tests/sdkconfig.stalled_sd` 可启用一次性 flush stall，用于模拟 SD 长延迟。预期行为：采集不中断、内存池耗尽后发生有计数的记录丢弃、心跳显示错误 5、SD 恢复后 writer 继续工作并最终安全收尾。
 
