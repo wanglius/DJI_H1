@@ -1,0 +1,1050 @@
+"""PyQt6 desktop viewer linking a flight map to reflectance records."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import html
+import math
+import os
+from pathlib import Path
+import sys
+from typing import Sequence
+
+# The map does not use WebRTC. Prevent Chromium from probing public STUN
+# servers or exposing a direct UDP interface; preserve any caller-supplied
+# Chromium flags while adding this narrowly scoped network policy.
+_WEBRTC_POLICY = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+_chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+if _WEBRTC_POLICY not in _chromium_flags.split():
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+        f"{_chromium_flags} {_WEBRTC_POLICY}".strip())
+
+from PyQt6.QtCore import (
+    QLibraryInfo, QLocale, QPointF, QRectF, QTimer, Qt, QTranslator, pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QBrush, QCloseEvent, QColor, QFont, QFontDatabase, QMouseEvent, QPainter,
+    QPainterPath, QPen, QWheelEvent,
+)
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QToolTip,
+    QVBoxLayout, QWidget,
+)
+
+from .api import MissionHttpServer, MissionService, start_http_api
+from .config import GroundConfig, MapConfig
+from .receiver import GroundReceiver
+from .spectral_axis import spectrum_wavelengths_nm
+from .ui_zh import display_value, event_name, event_field
+from .live import LiveReceiverConfig, LiveTelemetrySource
+from .presentation import (
+    MeasurementPoint, MissionEventPoint, MissionMapModel, build_mission_map,
+    event_severity,
+)
+
+
+def _nice_distance(value: float) -> float:
+    """Round a positive distance to a legible 1/2/5 × 10^n value."""
+
+    if not math.isfinite(value) or value <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(value))
+    fraction = value / (10 ** exponent)
+    factor = (1 if fraction < 1.5 else 2 if fraction < 3.5
+              else 5 if fraction < 7.5 else 10)
+    return factor * (10 ** exponent)
+
+
+def _time_text(utc_ms: int, offset_minutes: int = 0,
+               timezone_name: str = "UTC") -> str:
+    if utc_ms <= 0:
+        return "不可用"
+    local_zone = timezone(timedelta(minutes=offset_minutes))
+    local = datetime.fromtimestamp(utc_ms / 1000, local_zone).strftime(
+        "%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return (f"{local} {timezone_name} "
+            f"({_offset_text(offset_minutes)})")
+
+
+def _offset_text(offset_minutes: int) -> str:
+    sign = "+" if offset_minutes >= 0 else "-"
+    magnitude = abs(offset_minutes)
+    return f"UTC{sign}{magnitude // 60:02d}:{magnitude % 60:02d}"
+
+
+def _time_domain_text(domain: str, generation: int | None) -> str:
+    if domain == "a_monotonic_ms":
+        suffix = (f"，同步代次 {generation}"
+                  if generation is not None else "")
+        return f"A 板单调时钟{suffix}"
+    if domain == "b_monotonic_us":
+        return "B 板单调时钟（回退）"
+    return domain
+
+
+def _configure_application_font(app: QApplication) -> None:
+    """Prefer CJK fonts, including Qt's headless Windows backend."""
+
+    families = QFontDatabase.families()
+    if "Microsoft YaHei" not in families:
+        windows_font = Path(r"C:\Windows\Fonts\msyh.ttc")
+        if windows_font.is_file():
+            font_id = QFontDatabase.addApplicationFont(str(windows_font))
+            if font_id >= 0:
+                families += QFontDatabase.applicationFontFamilies(font_id)
+    preferred = ("Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC",
+                 "PingFang SC", "SimHei")
+    family = next((name for name in preferred if name in families), "Sans Serif")
+    app.setFont(QFont(family, 9))
+
+
+def _configure_chinese_ui(app: QApplication) -> None:
+    """Translate Qt-owned controls too; keep translator alive with the app."""
+    QLocale.setDefault(QLocale("zh_CN"))
+    if not hasattr(app, "_ground_zh_translator"):
+        translator = QTranslator(app)
+        translations = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+        if translator.load("qtbase_zh_CN", translations):
+            app.installTranslator(translator)
+        app._ground_zh_translator = translator
+    _configure_application_font(app)
+
+
+class SpectrumPlot(QWidget):
+    """Dependency-free Qt line plot for a selected reflectance spectrum."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._values: tuple[float, ...] = ()
+        self._message = "请在航迹上选择测量点"
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Expanding)
+
+    def set_values(self, values: Sequence[float]) -> None:
+        self._values = tuple(float(value) for value in values)
+        self._message = ""
+        self.update()
+
+    def clear(self, message: str) -> None:
+        self._values = ()
+        self._message = message
+        self.update()
+
+    def axis_label(self) -> str:
+        if spectrum_wavelengths_nm(len(self._values)) is not None:
+            return "波长（nm）：340–1050，间隔 1 nm"
+        return f"样本序号（0–{len(self._values) - 1}；波长未知）"
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = self.palette()
+        painter.fillRect(self.rect(), palette.color(palette.ColorRole.Base))
+        foreground = palette.color(palette.ColorRole.Text)
+        muted = palette.color(palette.ColorRole.Mid)
+        grid = palette.color(palette.ColorRole.Midlight)
+        accent = QColor("#168aad")
+
+        if not self._values:
+            painter.setPen(muted)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             self._message or "暂无光谱数据")
+            return
+
+        left, right, top, bottom = 70.0, 20.0, 18.0, 48.0
+        plot = QRectF(left, top, max(1.0, self.width() - left - right),
+                      max(1.0, self.height() - top - bottom))
+        painter.setPen(QPen(grid, 1))
+        for tick in range(5):
+            fraction = tick / 4
+            y = plot.bottom() - fraction * plot.height()
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+            painter.setPen(muted)
+            painter.drawText(QRectF(4, y - 9, left - 12, 18),
+                             Qt.AlignmentFlag.AlignRight |
+                             Qt.AlignmentFlag.AlignVCenter,
+                             f"{fraction * 100:.0f}")
+            painter.setPen(QPen(grid, 1))
+
+        painter.setPen(QPen(muted, 1))
+        painter.drawRect(plot)
+        count = len(self._values)
+        denominator = max(1, count - 1)
+        path = QPainterPath()
+        for index, value in enumerate(self._values):
+            x = plot.left() + index / denominator * plot.width()
+            y = (plot.bottom() - min(100.0, max(0.0, value)) /
+                 100.0 * plot.height())
+            if index == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        painter.setPen(QPen(accent, 1.6))
+        painter.drawPath(path)
+
+        painter.setPen(foreground)
+        painter.drawText(QRectF(plot.left(), plot.bottom() + 8,
+                                plot.width(), 24),
+                         Qt.AlignmentFlag.AlignCenter,
+                         self.axis_label())
+        painter.save()
+        painter.translate(18, plot.center().y())
+        painter.rotate(-90)
+        painter.drawText(QRectF(-plot.height() / 2, -12,
+                                plot.height(), 24),
+                         Qt.AlignmentFlag.AlignCenter, "反射率（%）")
+        painter.restore()
+
+
+class MissionMap(QWidget):
+    """Offline local projection with wheel zoom and linked point selection."""
+
+    measurement_selected = pyqtSignal(int)
+    event_selected = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._model = MissionMapModel((), (), (), 0, 0)
+        self._reference_latitude = 0.0
+        self._reference_longitude = 0.0
+        self._longitude_scale = 111_320.0
+        self._route: list[tuple[float, float]] = []
+        self._measurements: list[tuple[float, float, MeasurementPoint]] = []
+        self._events: list[tuple[float, float, MissionEventPoint]] = []
+        self._center_x = 0.0
+        self._center_y = 0.0
+        self._scale = 1.0
+        self._selected_measurement: int | None = None
+        self._selected_event: int | None = None
+        self._pan_anchor: QPointF | None = None
+        self._timezone_name = "UTC"
+        self._timezone_offset_minutes = 0
+        self.setMinimumSize(520, 360)
+        self.setMouseTracking(True)
+
+    def set_timezone(self, name: str, offset_minutes: int) -> None:
+        self._timezone_name = name
+        self._timezone_offset_minutes = offset_minutes
+
+    def set_model(self, model: MissionMapModel, *, fit: bool = True,
+                  preserve_selection: bool = False) -> None:
+        previous_selection = (self._selected_measurement
+                              if preserve_selection else None)
+        self._model = model
+        source = list(model.route) or list(model.measurements)
+        # Keep the projection origin stable during live updates; otherwise a
+        # new mean coordinate would make a manually panned view jump once per
+        # second even though its scale/center values were preserved.
+        if source and (fit or (not self._route and not self._measurements)):
+            self._reference_latitude = sum(
+                point.latitude_deg for point in source) / len(source)
+            self._reference_longitude = sum(
+                point.longitude_deg for point in source) / len(source)
+            self._longitude_scale = 111_320.0 * math.cos(
+                math.radians(self._reference_latitude))
+        self._route = [self._project(point.latitude_deg, point.longitude_deg)
+                       for point in model.route]
+        self._measurements = [(*self._project(point.latitude_deg,
+                                               point.longitude_deg), point)
+                              for point in model.measurements]
+        self._events = [(*self._project(point.latitude_deg,
+                                        point.longitude_deg), point)
+                        for point in model.events]
+        self._selected_measurement = previous_selection
+        self._selected_event = None
+        if fit:
+            self.fit_route()
+        else:
+            self.update()
+
+    def _project(self, latitude: float, longitude: float) -> tuple[float, float]:
+        return ((longitude - self._reference_longitude) * self._longitude_scale,
+                (latitude - self._reference_latitude) * 111_320.0)
+
+    def _to_screen(self, x: float, y: float) -> QPointF:
+        return QPointF((x - self._center_x) * self._scale + self.width() / 2,
+                       self.height() / 2 - (y - self._center_y) * self._scale)
+
+    def _to_world(self, point: QPointF) -> tuple[float, float]:
+        return ((point.x() - self.width() / 2) / self._scale + self._center_x,
+                -(point.y() - self.height() / 2) / self._scale + self._center_y)
+
+    def fit_route(self) -> None:
+        points = self._route or [(x, y) for x, y, _ in self._measurements]
+        if not points:
+            self._center_x = self._center_y = 0.0
+            self._scale = 1.0
+            self.update()
+            return
+        xs, ys = zip(*points)
+        xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+        span_x = max(20.0, xmax - xmin)
+        span_y = max(20.0, ymax - ymin)
+        self._center_x = (xmin + xmax) / 2
+        self._center_y = (ymin + ymax) / 2
+        self._scale = max(
+            0.01, min((max(100, self.width()) - 90) / span_x,
+                      (max(100, self.height()) - 90) / span_y))
+        self.update()
+
+    def select_measurement(self, reflectance_index: int,
+                           *, center: bool = False) -> None:
+        self._selected_measurement = reflectance_index
+        self._selected_event = None
+        if center:
+            for x, y, point in self._measurements:
+                if point.reflectance_index == reflectance_index:
+                    self._center_x, self._center_y = x, y
+                    break
+        self.update()
+
+    def focus_event(self, event_index: int) -> None:
+        self._selected_event = event_index
+        for x, y, point in self._events:
+            if point.event_index == event_index:
+                self._center_x, self._center_y = x, y
+                break
+        self.update()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
+        if not self._route and not self._measurements:
+            return
+        anchor = event.position()
+        before_x, before_y = self._to_world(anchor)
+        factor = 1.25 ** (event.angleDelta().y() / 120.0)
+        self._scale = min(5000.0, max(0.005, self._scale * factor))
+        after_x, after_y = self._to_world(anchor)
+        self._center_x += before_x - after_x
+        self._center_y += before_y - after_y
+        self.update()
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.RightButton:
+            self._pan_anchor = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        measurement = self._nearest_measurement(event.position(), 12.0)
+        if measurement is not None:
+            self.select_measurement(measurement.reflectance_index)
+            self.measurement_selected.emit(measurement.reflectance_index)
+            return
+        map_event = self._nearest_event(event.position(), 12.0)
+        if map_event is not None:
+            self.focus_event(map_event.event_index)
+            self.event_selected.emit(map_event.event_index)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._pan_anchor is not None:
+            delta = event.position() - self._pan_anchor
+            self._center_x -= delta.x() / self._scale
+            self._center_y += delta.y() / self._scale
+            self._pan_anchor = event.position()
+            self.update()
+            return
+        measurement = self._nearest_measurement(event.position(), 9.0)
+        map_event = self._nearest_event(event.position(), 9.0)
+        if measurement is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            QToolTip.showText(
+                event.globalPosition().toPoint(),
+                f"反射率计算 #{measurement.calculation_count}\n"
+                f"{measurement.latitude_deg:.7f}, "
+                f"{measurement.longitude_deg:.7f}\n"
+                f"{_time_text(measurement.utc_ms, self._timezone_offset_minutes, self._timezone_name)}\n"
+                f"{_time_domain_text(measurement.time_domain, measurement.sync_generation)}",
+                self)
+        elif map_event is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            QToolTip.showText(event.globalPosition().toPoint(),
+                              event_name(map_event.event_name), self)
+        else:
+            self.unsetCursor()
+            QToolTip.hideText()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.RightButton:
+            self._pan_anchor = None
+            self.unsetCursor()
+            event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.fit_route()
+
+    def leaveEvent(self, _event) -> None:  # noqa: N802
+        if self._pan_anchor is None:
+            self.unsetCursor()
+        QToolTip.hideText()
+
+    def _nearest_measurement(self, cursor: QPointF,
+                             radius: float) -> MeasurementPoint | None:
+        nearest: MeasurementPoint | None = None
+        best = radius * radius
+        for x, y, point in self._measurements:
+            screen = self._to_screen(x, y)
+            distance = ((screen.x() - cursor.x()) ** 2 +
+                        (screen.y() - cursor.y()) ** 2)
+            if distance <= best:
+                best, nearest = distance, point
+        return nearest
+
+    def _nearest_event(self, cursor: QPointF,
+                       radius: float) -> MissionEventPoint | None:
+        nearest: MissionEventPoint | None = None
+        best = radius * radius
+        for x, y, point in self._events:
+            screen = self._to_screen(x, y)
+            distance = ((screen.x() - cursor.x()) ** 2 +
+                        (screen.y() - cursor.y()) ** 2)
+            if distance <= best:
+                best, nearest = distance, point
+        return nearest
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = self.palette()
+        background = palette.color(palette.ColorRole.Base)
+        foreground = palette.color(palette.ColorRole.Text)
+        muted = palette.color(palette.ColorRole.Mid)
+        grid = palette.color(palette.ColorRole.Midlight)
+        painter.fillRect(self.rect(), background)
+
+        if not self._route and not self._measurements:
+            painter.setPen(muted)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "请打开任务文件夹或连接实时遥测以查看航迹")
+            return
+
+        self._draw_grid(painter, grid, muted)
+        if len(self._route) > 1:
+            path = QPainterPath(self._to_screen(*self._route[0]))
+            for point in self._route[1:]:
+                path.lineTo(self._to_screen(*point))
+            painter.setPen(QPen(QColor("#6c7a89"), 1.4))
+            painter.drawPath(path)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#97a3ad")))
+        for x, y in self._route:
+            painter.drawEllipse(self._to_screen(x, y), 1.5, 1.5)
+
+        for x, y, point in self._measurements:
+            screen = self._to_screen(x, y)
+            selected = point.reflectance_index == self._selected_measurement
+            if selected:
+                painter.setPen(QPen(QColor("#ffca3a"), 2.5))
+                painter.setBrush(QBrush(QColor("#168aad")))
+                painter.drawEllipse(screen, 7.5, 7.5)
+            else:
+                painter.setPen(QPen(background, 0.8))
+                painter.setBrush(QBrush(QColor("#168aad")))
+                painter.drawEllipse(screen, 4.0, 4.0)
+
+        for x, y, point in self._events:
+            screen = self._to_screen(x, y)
+            color = QColor("#d62828" if point.severity == "critical"
+                           else "#f08c00" if point.severity == "warning"
+                           else "#5b5bd6")
+            size = 8.0 if point.event_index == self._selected_event else 6.0
+            triangle = QPainterPath(QPointF(screen.x(), screen.y() - size))
+            triangle.lineTo(screen.x() - size, screen.y() + size)
+            triangle.lineTo(screen.x() + size, screen.y() + size)
+            triangle.closeSubpath()
+            painter.setPen(QPen(background, 1))
+            painter.setBrush(QBrush(color))
+            painter.drawPath(triangle)
+
+        self._draw_legend(painter, foreground, background)
+        self._draw_scale_bar(painter, foreground)
+
+    def _draw_grid(self, painter: QPainter, grid: QColor, muted: QColor) -> None:
+        step = _nice_distance(90.0 / self._scale)
+        left, top = self._to_world(QPointF(0, 0))
+        right, bottom = self._to_world(QPointF(self.width(), self.height()))
+        x = math.floor(left / step) * step
+        painter.setPen(QPen(grid, 1))
+        while x <= right:
+            screen_x = self._to_screen(x, 0).x()
+            painter.drawLine(QPointF(screen_x, 0),
+                             QPointF(screen_x, self.height()))
+            x += step
+        y = math.floor(bottom / step) * step
+        while y <= top:
+            screen_y = self._to_screen(0, y).y()
+            painter.drawLine(QPointF(0, screen_y),
+                             QPointF(self.width(), screen_y))
+            y += step
+        painter.setPen(muted)
+        painter.drawText(12, 22, "北 ↑")
+
+    def _draw_legend(self, painter: QPainter, foreground: QColor,
+                     background: QColor) -> None:
+        labels = ((QColor("#97a3ad"), "GPS 定位点"),
+                  (QColor("#168aad"), "反射率"),
+                  (QColor("#d62828"), "严重事件"),
+                  (QColor("#f08c00"), "警告"),
+                  (QColor("#5b5bd6"), "任务事件"))
+        x, y = 54.0, 18.0
+        for color, label in labels:
+            painter.setPen(QPen(background, 0.8))
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(x, y), 4, 4)
+            painter.setPen(foreground)
+            painter.drawText(QPointF(x + 9, y + 4), label)
+            x += painter.fontMetrics().horizontalAdvance(label) + 35
+
+    def _draw_scale_bar(self, painter: QPainter, foreground: QColor) -> None:
+        distance = _nice_distance(120.0 / self._scale)
+        pixels = distance * self._scale
+        x, y = 18.0, self.height() - 24.0
+        painter.setPen(QPen(foreground, 2))
+        painter.drawLine(QPointF(x, y), QPointF(x + pixels, y))
+        painter.drawLine(QPointF(x, y - 4), QPointF(x, y + 4))
+        painter.drawLine(QPointF(x + pixels, y - 4),
+                         QPointF(x + pixels, y + 4))
+        label = (f"{distance / 1000:g} km" if distance >= 1000
+                 else f"{distance:g} m")
+        painter.drawText(QPointF(x, y - 7), label)
+
+
+from .map_panel import MissionMapPanel
+
+
+class MissionViewer(QMainWindow):
+    def __init__(self, service: MissionService, *, api_port: int | None = 8765,
+                 verify_crc: bool = True, ground_config: GroundConfig | None = None):
+        super().__init__()
+        self.ground_config = ground_config
+        self.service = service
+        self.verify_crc = verify_crc
+        self.api_server: MissionHttpServer | None = None
+        self.live_source: LiveTelemetrySource | None = None
+        self.live_timer = QTimer(self)
+        self.live_timer.setInterval(ground_config.refresh_ms if ground_config else 1000)
+        self.live_timer.timeout.connect(self._refresh_live)
+        self._live_has_model = False
+        self._live_revision = -1
+        self.map_model = MissionMapModel((), (), (), 0, 0)
+        self.setWindowTitle("DJI H1 地面站")
+        self.resize(1280, 840)
+        self.setMinimumSize(900, 620)
+        self._build()
+        self._start_api(api_port)
+        if self.service.mission is not None:
+            self._refresh()
+
+    def _build(self) -> None:
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        self.open_button = QPushButton("打开任务文件夹…")
+        self.open_button.clicked.connect(self.open_dialog)
+        toolbar.addWidget(self.open_button)
+        self.live_button = QPushButton("连接实时遥测…")
+        self.live_button.clicked.connect(self.open_live_dialog)
+        toolbar.addWidget(self.live_button)
+        self.disconnect_button = QPushButton("断开实时连接")
+        self.disconnect_button.clicked.connect(self.disconnect_live)
+        self.disconnect_button.setEnabled(False)
+        toolbar.addWidget(self.disconnect_button)
+        self.follow_latest = QCheckBox("跟随最新光谱")
+        self.follow_latest.setChecked(True)
+        self.follow_latest.setEnabled(False)
+        toolbar.addWidget(self.follow_latest)
+        self.path_text = QLineEdit()
+        self.path_text.setReadOnly(True)
+        self.path_text.setPlaceholderText("尚未加载任务")
+        toolbar.addWidget(self.path_text, 1)
+        outer.addLayout(toolbar)
+
+        vertical = QSplitter(Qt.Orientation.Vertical)
+        upper = QSplitter(Qt.Orientation.Horizontal)
+        map_group = QGroupBox("飞行航迹")
+        map_layout = QVBoxLayout(map_group)
+        self.route_map = MissionMapPanel(config=(
+            self.ground_config.map if self.ground_config else MapConfig()))
+        self.route_map.measurement_selected.connect(
+            self._map_measurement_selected)
+        self.route_map.event_selected.connect(self.show_event)
+        map_layout.addWidget(self.route_map)
+        map_controls = QHBoxLayout()
+        self.map_status = QLabel(self.route_map.status_text)
+        self.map_status.setWordWrap(True)
+        self.map_status.setStyleSheet("color: palette(mid);")
+        self.route_map.status_changed.connect(self.map_status.setText)
+        map_controls.addWidget(self.map_status, 1)
+        fit_button = QPushButton("显示全部航迹")
+        fit_button.clicked.connect(self.route_map.fit_route)
+        map_controls.addWidget(fit_button)
+        map_layout.addLayout(map_controls)
+        upper.addWidget(map_group)
+        upper.addWidget(self._build_information_panel())
+        upper.setStretchFactor(0, 3)
+        upper.setStretchFactor(1, 1)
+
+        spectrum_group = QGroupBox("测量结果")
+        spectrum_layout = QVBoxLayout(spectrum_group)
+        self.spectrum_info = QLabel(
+            "请在航迹上选择蓝色测量点")
+        self.spectrum_info.setWordWrap(True)
+        self.spectrum_info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        spectrum_layout.addWidget(self.spectrum_info)
+        self.spectrum_plot = SpectrumPlot()
+        spectrum_layout.addWidget(self.spectrum_plot, 1)
+        vertical.addWidget(upper)
+        vertical.addWidget(spectrum_group)
+        vertical.setStretchFactor(0, 3)
+        vertical.setStretchFactor(1, 2)
+        outer.addWidget(vertical, 1)
+        self.setCentralWidget(central)
+        self.setStatusBar(QStatusBar())
+
+    def _build_information_panel(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        info_group = QGroupBox("飞行信息")
+        info_layout = QVBoxLayout(info_group)
+        self.flight_info = QLabel("尚未加载任务")
+        self.flight_info.setWordWrap(True)
+        self.flight_info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        info_layout.addWidget(self.flight_info)
+        layout.addWidget(info_group)
+
+        events_group = QGroupBox("任务事件")
+        events_layout = QVBoxLayout(events_group)
+        self.events_list = QListWidget()
+        self.events_list.setWordWrap(True)
+        self.events_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.events_list.itemClicked.connect(self._event_item_clicked)
+        events_layout.addWidget(self.events_list)
+        self.event_details = QLabel("暂无已定位的任务事件")
+        self.event_details.setWordWrap(True)
+        self.event_details.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        events_layout.addWidget(self.event_details)
+        layout.addWidget(events_group, 1)
+        scroll.setWidget(container)
+        scroll.setMinimumWidth(300)
+        return scroll
+
+    def _start_api(self, api_port: int | None) -> None:
+        if api_port is None:
+            self.statusBar().showMessage("只读 API 已禁用")
+            return
+        try:
+            self.api_server, _thread = start_http_api(self.service,
+                                                      port=api_port)
+            actual_port = self.api_server.server_address[1]
+            self.statusBar().showMessage(
+                f"只读 API：http://127.0.0.1:{actual_port}/api/v1")
+        except OSError as exc:
+            self.statusBar().showMessage(f"API 不可用，技术详情：{exc}")
+
+    def open_dialog(self) -> None:
+        initial = (str(self.service.mission.path)
+                   if self.service.mode == "offline" and self.service.mission
+                   else str(Path.home()))
+        selected = QFileDialog.getExistingDirectory(
+            self, "选择 DJI H1 任务文件夹", initial,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog)
+        if selected:
+            self.load(selected)
+
+    def load(self, path: str | Path) -> None:
+        self._stop_live(clear_service=False)
+        self.service = MissionService()
+        if self.api_server is not None:
+            self.api_server.service = self.service
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.service.load(path, verify_crc=self.verify_crc)
+            self._refresh()
+        except Exception as exc:
+            QMessageBox.critical(self, "无法打开任务", f"任务加载失败。技术详情：\n{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def open_live_dialog(self) -> None:
+        credential_dir = Path.cwd() / "config"
+        selected, _filter = QFileDialog.getOpenFileName(
+            self, "选择本地 MQTT 配置文件", str(credential_dir),
+            "JSON 配置文件 (*.json)", options=QFileDialog.Option.DontUseNativeDialog)
+        if selected:
+            self.connect_live(selected)
+
+    def connect_live(self, config_path: str | Path) -> None:
+        """Enter live mode without coupling MQTT work to the Qt event loop."""
+
+        try:
+            config = GroundConfig.load(config_path)
+            candidate = GroundReceiver(config, output_enabled=False)
+            self._stop_live(clear_service=False)
+            candidate.start()
+        except Exception as exc:
+            QMessageBox.critical(self, "无法启动实时遥测", f"请检查配置与依赖。技术详情：\n{exc}")
+            return
+        self.live_source = candidate
+        self.ground_config = config
+        self.route_map.configure(config.map)
+        self.service = candidate.service
+        if self.api_server is not None:
+            self.api_server.service = self.service
+        self.live_timer.setInterval(config.refresh_ms)
+        self.service.set_mission(None, mode="live")
+        self._live_has_model = False
+        self._live_revision = -1
+        self.map_model = MissionMapModel((), (), (), 0, 0)
+        self.route_map.set_model(self.map_model, reset_external_permission=True)
+        self.path_text.setText(candidate.description)
+        self.flight_info.setText("正在连接实时遥测…")
+        self.events_list.clear()
+        self.event_details.setText("等待机载任务事件")
+        self.spectrum_info.setText("等待反射率记录（位置可随后补齐）")
+        self.spectrum_plot.clear("等待实时反射率数据")
+        self.disconnect_button.setEnabled(True)
+        self.follow_latest.setEnabled(True)
+        self.follow_latest.setChecked(True)
+        self.live_timer.start()
+        self._refresh_live()
+
+    def disconnect_live(self) -> None:
+        self._stop_live(clear_service=False)
+        mission = self.service.mission
+        stopped_status = {"connected": False, "state": "stopped"}
+        if mission is not None:
+            mission.summary["state"] = "disconnected"
+            live = mission.summary.get("live_telemetry")
+            if isinstance(live, dict):
+                live["connected"] = False
+                live["state"] = "stopped"
+                stopped_status = live
+            self._show_flight_info()
+        self.service.set_live_status(stopped_status)
+        self.statusBar().showMessage("实时遥测已断开")
+
+    def _stop_live(self, *, clear_service: bool) -> None:
+        self.live_timer.stop()
+        source = self.live_source
+        self.live_source = None
+        if source is not None:
+            source.stop()
+        self.disconnect_button.setEnabled(False)
+        self.follow_latest.setEnabled(False)
+        self._live_has_model = False
+        self._live_revision = -1
+        if clear_service:
+            self.service.set_mission(None, mode="empty")
+
+    def _refresh_live(self) -> None:
+        source = self.live_source
+        if source is None:
+            return
+        status = source.status()
+        self.service.set_live_status(status)
+        age = status.get("last_message_age_seconds")
+        age_text = "尚未收到数据" if age is None else f"最近数据：{age:.1f} 秒前"
+        self.statusBar().showMessage(
+            f"实时 MQTT：{display_value(status.get('state', 'unknown'))} · {age_text} · "
+            f"待重组 {status.get('inflight', 0)} · "
+            f"接收/确认队列 {status.get('ingress_queue_depth', 0)}/"
+            f"{status.get('ack_queue_depth', 0)}")
+        revision = int(status.get("store_revision", source.revision))
+        if self._live_has_model and revision == self._live_revision:
+            self._show_flight_info()
+            return
+        mission = source.snapshot(status)
+        if mission is None:
+            self.flight_info.setText(
+                "<b>实时遥测</b><br>"
+                f"状态：{html.escape(display_value(status.get('state', 'unknown')))}<br>"
+                f"{html.escape(age_text)}")
+            return
+        self.service.set_mission(mission, mode="live")
+        self.path_text.setText(source.description)
+        self.map_model = build_mission_map(mission)
+        first_model = not self._live_has_model
+        self.route_map.set_timezone(mission.timezone_name,
+                                    mission.timezone_offset_minutes)
+        self.route_map.set_model(
+            self.map_model, fit=first_model,
+            reset_external_permission=first_model)
+        self._live_has_model = True
+        self._live_revision = revision
+        self._show_flight_info()
+        self._populate_events()
+        if self.follow_latest.isChecked() and mission.reflectance:
+            self.show_measurement(len(mission.reflectance.records) - 1)
+
+    def _map_measurement_selected(self, reflectance_index: int) -> None:
+        if self.service.mode == "live":
+            self.follow_latest.setChecked(False)
+        self.show_measurement(reflectance_index)
+
+    def _refresh(self) -> None:
+        mission = self.service.mission
+        if mission is None:
+            return
+        self.path_text.setText(str(mission.path))
+        self.map_model = build_mission_map(mission)
+        self.route_map.set_timezone(mission.timezone_name,
+                                    mission.timezone_offset_minutes)
+        self.route_map.set_model(self.map_model)
+        self._show_flight_info()
+        self._populate_events()
+        if self.map_model.measurements:
+            self.show_measurement(
+                self.map_model.measurements[0].reflectance_index)
+        else:
+            self.spectrum_info.setText("暂无已定位的反射率测量点")
+            self.spectrum_plot.clear("暂无反射率记录")
+
+    def _show_flight_info(self) -> None:
+        mission = self.service.mission
+        if mission is None:
+            return
+        summary = mission.summary
+        overview = mission.overview()
+        files = overview["files"]
+        start = int(summary.get("started_utc_ms", 0) or 0)
+        end = int(summary.get("updated_utc_ms", 0) or 0)
+        timezone_name = mission.timezone_name
+        timezone_offset = mission.timezone_offset_minutes
+        duration = (max(0.0, (end - start) / 1000.0)
+                    if start and end else max(
+                        item["duration_seconds"] for item in files.values()))
+        product_errors = overview["product_errors"]
+        binary_errors = [item for item in product_errors
+                         if item["filename"].upper().endswith(".BIN")]
+        fatal_binary_errors = [item for item in binary_errors
+                               if item.get("fatal", True)]
+        recovered_binary = any(item["recovered_prefix"]
+                               for item in files.values())
+        all_present_crc_checked = all(
+            not item["present"] or item["crc_verified"]
+            for item in files.values())
+        crc_text = ("失败" if fatal_binary_errors else
+                    ("已恢复通过校验的记录前缀" if all_present_crc_checked
+                     else "已恢复记录前缀（跳过 CRC）")
+                    if recovered_binary else
+                    "通过" if all(not item["present"] or
+                                    item["crc_verified"]
+                                    for item in files.values()) else
+                    "未校验")
+        def format_product_error(item: dict) -> str:
+            text = f"{item['filename']}: {item['message']}"
+            if item.get("file_offset") is not None and not item.get(
+                    "fatal", True):
+                text += (f"；已恢复 {item['recovered_records']} 条记录，"
+                         f"已舍弃尾部 {item['discarded_tail_bytes']} 字节")
+            return text
+
+        product_error_text = ("none" if not product_errors else "; ".join(
+            format_product_error(item) for item in product_errors))
+        rows = (
+            ("任务", summary.get("directory", mission.path.name)),
+            ("摘要来源", overview.get("summary_source") or "none"),
+            ("状态", summary.get("state", "unknown")),
+            ("飞行器", summary.get("drone_serial", "unknown")),
+            ("飞行器规范标识",
+             summary.get("drone_serial_hex", "unknown")),
+            ("固件版本", summary.get("firmware_version", "unknown")),
+            ("时区", f"{timezone_name} ({_offset_text(timezone_offset)})"),
+            ("开始时间", _time_text(start, timezone_offset, timezone_name)),
+            ("持续时间", f"{duration:.1f} 秒"),
+            ("测量段数", summary.get("segments_completed",
+                                     len(overview["sessions"]))),
+            ("原始光谱", files["raw"]["records"]),
+            ("反射率", files["reflectance"]["records"]),
+            ("GPS 记录数", files["gps"]["records"]),
+            ("有效航迹点", len(self.map_model.route)),
+            ("已定位测量点", len(self.map_model.measurements)),
+            ("未定位测量点", self.map_model.unlocated_measurements),
+            ("任务事件", len(mission.events)),
+            ("已定位任务事件", len(self.map_model.events)),
+            ("未定位任务事件", self.map_model.unlocated_events),
+            ("CRC 校验", crc_text),
+            ("文件异常详情", product_error_text),
+        )
+        live = summary.get("live_telemetry")
+        if self.service.mode == "live":
+            current = self.service.live_status
+            if isinstance(live, dict):
+                live = {**live, **current}
+            elif current:
+                live = current
+        if isinstance(live, dict):
+            age = live.get("last_message_age_seconds")
+            rows += (
+                ("实时链路", live.get("state", "unknown")),
+                ("设备 ID", summary.get("source_id_hex", "unknown")),
+                ("任务 ID", summary.get("mission_id_hex", "unknown")),
+                ("最近 MQTT 数据",
+                 "尚未收到" if age is None else f"{float(age):.1f} 秒前"),
+                ("MQTT 消息数", live.get("mqtt_messages", 0)),
+                ("传输分片数", live.get("fragments", 0)),
+                ("完整消息数", live.get("complete_messages", 0)),
+                ("实时事件记录", live.get("event_records", 0)),
+                ("DTA1 确认数", live.get("acknowledgements", 0)),
+                ("DTA1 发布失败数", live.get("ack_publish_failures", 0)),
+                ("接收队列",
+                 f"当前 {live.get('ingress_queue_depth', 0)} / "
+                 f"峰值 {live.get('ingress_high_water', 0)}"),
+                ("接收丢弃数", live.get("ingress_dropped", 0)),
+                ("确认队列",
+                 f"当前 {live.get('ack_queue_depth', 0)} / "
+                 f"峰值 {live.get('ack_queue_high_water', 0)}"),
+                ("确认队列溢出数", live.get("ack_queue_overflows", 0)),
+                ("最大处理耗时",
+                 f"{float(live.get('processing_max_ms', 0.0)):.1f} ms"),
+                ("未完成重组数", live.get("inflight", 0)),
+                ("重复分片数", live.get("duplicate_fragments", 0)),
+                ("无效消息数", live.get("invalid_messages", 0)),
+                ("过期重组数", live.get("expired_assemblies", 0)),
+                ("QoS 不匹配数", live.get("qos_mismatches", 0)),
+                ("最近接收错误（技术详情）", live.get("last_error") or "none"),
+                ("地面日志", live.get("journal_path") or "disabled"),
+                ("日志失败数", live.get("journal_failures", 0)),
+                ("API 输出队列丢弃数", live.get("output_dropped", 0)),
+            )
+        self.flight_info.setText("<table>" + "".join(
+            f"<tr><td><b>{html.escape(str(label))}</b></td>"
+            f"<td>&nbsp;{html.escape(display_value(value))}</td></tr>"
+            for label, value in rows) + "</table>")
+
+    def _populate_events(self) -> None:
+        self.events_list.clear()
+        mission = self.service.mission
+        if mission is None:
+            self.event_details.setText("暂无任务事件")
+            return
+        located = {point.event_index for point in self.map_model.events}
+        for index, event in enumerate(mission.events):
+            severity = event_severity(event)
+            if severity is None:
+                continue
+            label = display_value(severity)
+            location = "" if index in located else " · 待定位"
+            item = QListWidgetItem(
+                f"{label} · {event_name(event.get('event', 'unknown'))}"
+                f"{location}")
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setForeground(QColor(
+                "#d62828" if severity == "critical"
+                else "#c66a00" if severity == "warning"
+                else "#5b5bd6"))
+            self.events_list.addItem(item)
+        if self.events_list.count() == 0:
+            self.event_details.setText("暂无任务事件")
+        elif self.map_model.unlocated_events:
+            self.event_details.setText(
+                f"已显示 {self.map_model.unlocated_events} 个未定位事件，"
+                "其发生时刻尚缺少前后有效 GPS 点，暂不能标在地图上。")
+        else:
+            self.event_details.setText(
+                "选择事件可在航迹上定位。")
+
+    def _event_item_clicked(self, item: QListWidgetItem) -> None:
+        value = item.data(Qt.ItemDataRole.UserRole)
+        if value is not None:
+            self.show_event(int(value))
+
+    def show_event(self, event_index: int) -> None:
+        mission = self.service.mission
+        if mission is None or not (0 <= event_index < len(mission.events)):
+            return
+        self.route_map.focus_event(event_index)
+        event = mission.events[event_index]
+        details = " · ".join(
+            f"{event_field(key)}={display_value(value)}" for key, value in event.items()
+            if key not in ("schema_version", "event"))
+        name = event_name(event.get("event", "unknown"))
+        self.event_details.setText(
+            f"<b>{html.escape(name)}</b><br>{html.escape(details)}")
+        for row in range(self.events_list.count()):
+            item = self.events_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == event_index:
+                self.events_list.setCurrentItem(item)
+                break
+
+    def show_measurement(self, reflectance_index: int) -> None:
+        mission = self.service.mission
+        if mission is None:
+            return
+        try:
+            located = mission.located_reflectance_spectrum(reflectance_index)
+        except (IndexError, FileNotFoundError, ValueError) as exc:
+            self.spectrum_plot.clear("无法解码反射率光谱")
+            self.spectrum_info.setText(f"解码失败，技术详情：{exc}")
+            return
+        self.route_map.select_measurement(reflectance_index)
+        record = located.spectrum
+        values = [value / 100.0
+                  for value in record.reflectance_0p01_percent]
+        self.spectrum_plot.set_values(values)
+        info = record.info
+        if located.position is None:
+            position_text = "位置不可用"
+        else:
+            point = located.position
+            altitude_text = (f"相对高度 {point.altitude_relative_m:.2f} 米"
+                             if point.altitude_relative_m is not None else
+                             "相对高度不可用")
+            position_text = (
+                f"{point.latitude_deg:.7f}, {point.longitude_deg:.7f} · "
+                f"{altitude_text} · "
+                f"{display_value(point.quality)}，GPS 间隔 {point.gap_ms:.1f} 毫秒 · "
+                f"{_time_domain_text(point.time_domain, point.sync_generation)}")
+        self.spectrum_info.setText(
+            f"<b>反射率计算 {info.calculation_count}</b> · "
+            f"会话 {record.header.session_id}，"
+            f"测量段 {record.header.segment_id} · "
+            f"地面帧 {info.ground_frame_count}，"
+            f"天空帧 {info.sky_frame_count} · "
+            f"有效样本 {info.valid_sample_count}/{info.sample_count} · "
+            f"{html.escape(_time_text(record.header.utc_ms, mission.timezone_offset_minutes, mission.timezone_name))}<br>"
+            f"{html.escape(position_text)}")
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._stop_live(clear_service=False)
+        if self.api_server is not None:
+            self.api_server.shutdown()
+            self.api_server.server_close()
+        event.accept()
+
+
+def run_desktop(*, initial_path: str | Path | None = None,
+                initial_live_config: str | Path | None = None,
+                api_port: int | None = 8765, verify_crc: bool = True,
+                ground_config: GroundConfig | None = None) -> None:
+    app = QApplication.instance()
+    owns_application = app is None
+    if app is None:
+        app = QApplication(sys.argv[:1])
+        app.setApplicationName("DJI H1 地面站")
+        app.setStyle("Fusion")
+    _configure_chinese_ui(app)
+    service = MissionService()
+    if initial_path is not None:
+        service.load(initial_path, verify_crc=verify_crc)
+    window = MissionViewer(service, api_port=api_port,
+                           verify_crc=verify_crc, ground_config=ground_config)
+    window.show()
+    if initial_live_config is not None:
+        window.connect_live(initial_live_config)
+    if owns_application:
+        app.exec()

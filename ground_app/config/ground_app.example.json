@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "mqtt": {
+    "host": "mqtt.example.com",
+    "port": 1883,
+    "username": "",
+    "password": "",
+    "client_id": "",
+    "uplink_topic": "dji-h1/test/up",
+    "ack_topic": "dji-h1/test/down",
+    "subscribe_qos": 1,
+    "expected_uplink_qos": 1,
+    "ack_qos": 0,
+    "ack_enabled": true,
+    "keepalive_seconds": 30,
+    "tls": false,
+    "tls_ca_file": null,
+    "source_id": null,
+    "mission_id": null,
+    "max_inflight": 512,
+    "ingress_queue_size": 512,
+    "ack_queue_size": 512,
+    "reassembly_timeout_seconds": 30
+  },
+  "viewer": {
+    "refresh_ms": 1000,
+    "timezone_name": "Asia/Shanghai",
+    "timezone_offset_minutes": 480
+  },
+  "map": {
+    "enabled": false,
+    "ak": "",
+    "allow_mission_coordinates": false,
+    "load_timeout_ms": 15000
+  },
+  "api": { "enabled": true, "port": 8765 },
+  "storage": { "enabled": true, "directory": "../data", "output_queue_size": 512 }
+}

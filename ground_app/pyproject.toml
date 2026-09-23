@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dji-h1-ground"
+version = "0.1.0"
+description = "Standalone DJI H1 MQTT receiver, decoder, journal and mission GUI"
+readme = "README_zh.md"
+requires-python = ">=3.10"
+dependencies = ["paho-mqtt>=2.1,<3"]
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.7,<7"]
+map = ["PyQt6-WebEngine>=6.7,<7"]
+
+[project.scripts]
+dji-h1-ground = "dji_h1_ground.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dji_h1_ground = ["resources/*.html"]

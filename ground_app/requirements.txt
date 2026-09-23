@@ -1,0 +1,2 @@
+# Full desktop installation. Core-only: python -m pip install -e .
+-e .[gui,map]

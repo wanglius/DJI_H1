@@ -1,0 +1,13 @@
+config/*.json
+!config/*.example.json
+data/
+logs/
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.local.json
+*.sqlite3*
+*.log

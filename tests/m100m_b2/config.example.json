@@ -1,0 +1,15 @@
+{
+  "serial_port": "COM8",
+  "initial_baud": 115200,
+  "baud": 460800,
+  "host": "mqtt.example.com",
+  "port": 1883,
+  "username": "",
+  "password": "",
+  "topic_prefix": "dji-h1/scratch/m100m",
+  "hz": 5,
+  "duration_seconds": 60,
+  "ack_timeout_seconds": 3,
+  "lifespan_seconds": 10,
+  "pool_capacity": 512
+}
