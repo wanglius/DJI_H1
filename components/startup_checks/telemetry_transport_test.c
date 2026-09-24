@@ -219,6 +219,20 @@ esp_err_t telemetry_transport_self_test(void)
                   TELEMETRY_ACK_STATUS_PERMANENT_REJECTION,
           "permanent-rejection acknowledgement round trip");
 
-    ESP_LOGI(TAG, "TELEMETRY FRAGMENTATION SELF-TEST PASSED");
+    /* Cross-language DTM1 vector: same exact bytes in ground_app unit test. */
+    static const uint8_t expected_message[] = {
+        0x44,0x54,0x4d,0x31,0x01,0x03,0x00,0x00,0xbc,0x9a,0x78,0x56,
+        0x34,0x12,0x00,0x00,0x2a,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x07,0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x26,0x39,0xf4,0xcb,
+        0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x98,0xf4,0x72,0xbc};
+    size_t message_length = 0;
+    CHECK(telemetry_message_encode(3, UINT64_C(0x123456789ABC), 42, 7,
+        (const uint8_t *)"123456789", 9, fragment, sizeof(fragment),
+        &message_length) == ESP_OK && message_length == sizeof(expected_message) &&
+        !memcmp(fragment, expected_message, sizeof(expected_message)), "DTM1 golden vector");
+    CHECK(telemetry_message_encode(3, 1, 1, 0, payload, 4061,
+        fragment, sizeof(fragment), &message_length) == ESP_ERR_INVALID_SIZE,
+        "DTM1 oversized payload rejected before read");
+    ESP_LOGI(TAG, "TELEMETRY TRANSPORT SELF-TEST PASSED (DTM1 + legacy DTF2)");
     return ESP_OK;
 }

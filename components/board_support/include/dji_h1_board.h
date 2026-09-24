@@ -24,7 +24,8 @@
 #endif
 #define DJI_AB_UART_BAUD_RATE 115200
 
-/* YY-M200 4G DTU link. The module must be persistently provisioned to match. */
+/* M100M-B2 native AT link. No hardware RST is connected on this PCB.
+ * Production provisions MQTT at boot from the ignored deployment JSON. */
 #define DJI_DTU_UART_PORT UART_NUM_1
 #ifndef DJI_DTU_UART_TX_GPIO
 #define DJI_DTU_UART_TX_GPIO 17

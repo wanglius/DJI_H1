@@ -196,6 +196,46 @@ class ReassembledTelemetry:
     payload: bytes
 
 
+_MESSAGE_HEADER = struct.Struct("<IBBHQQIII")
+MESSAGE_MAGIC_BYTES = b"DTM1"
+MESSAGE_WIRE_MAX = 4100
+
+
+def encode_message(message: ReassembledTelemetry) -> bytes:
+    """DTM1: one complete MQTT publication; no fragment metadata."""
+    payload = _copy_bytes(message.payload, "payload")
+    if not payload or len(payload) + 40 > MESSAGE_WIRE_MAX:
+        raise FragmentError("invalid DTM1 payload length")
+    if (message.source_id == 0 or message.mission_id == 0 or
+            not 1 <= message.message_type <= 5 or message.flags != 0):
+        raise FragmentError("invalid DTM1 identity/type/flags")
+    try:
+        wire = _MESSAGE_HEADER.pack(0x314D5444, 1, message.message_type, 0,
+            message.source_id, message.mission_id, message.message_sequence,
+            len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
+    except struct.error as exc:
+        raise FragmentError("invalid DTM1 integer field") from exc
+    return wire + _CRC.pack(zlib.crc32(wire) & 0xFFFFFFFF)
+
+
+def decode_message_envelope(wire: bytes) -> ReassembledTelemetry:
+    """Validate exact MQTT boundary, identity and both CRCs before acceptance."""
+    wire = _copy_bytes(wire, "DTM1 publication")
+    if not 41 <= len(wire) <= MESSAGE_WIRE_MAX:
+        raise FragmentError("invalid DTM1 wire length")
+    magic, version, kind, flags, source, mission, seq, length, crc = \
+        _MESSAGE_HEADER.unpack_from(wire)
+    if (magic != 0x314D5444 or version != 1 or flags != 0 or
+            not 1 <= kind <= 5 or not source or not mission or
+            length != len(wire) - 40):
+        raise FragmentError("invalid DTM1 header")
+    payload = wire[36:-4]
+    if (zlib.crc32(wire[:-4]) & 0xFFFFFFFF != _CRC.unpack_from(wire, len(wire)-4)[0]
+            or zlib.crc32(payload) & 0xFFFFFFFF != crc):
+        raise FragmentError("DTM1 CRC mismatch")
+    return ReassembledTelemetry(kind, source, mission, seq, flags, 1, payload)
+
+
 def _uint(name: str, value: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise FragmentError(f"{name} must be an integer")

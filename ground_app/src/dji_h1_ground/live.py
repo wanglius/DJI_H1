@@ -29,7 +29,7 @@ from .telemetry import (
     MESSAGE_GPS_BATCH, MESSAGE_OPERATION_LOG, MESSAGE_REFLECTANCE,
     ReassembledTelemetry,
     TelemetryFragmentStreamDecoder, TelemetryReassembler, decode_gps_batch,
-    encode_acknowledgement,
+    encode_acknowledgement, decode_message_envelope, MESSAGE_MAGIC_BYTES,
 )
 
 
@@ -657,6 +657,10 @@ class LiveTelemetrySource:
 
     def _process_publication(self, publication: _InboundPublication) -> None:
         try:
+            if publication.payload.startswith(MESSAGE_MAGIC_BYTES):
+                self._process_complete_message(
+                    decode_message_envelope(publication.payload), publication)
+                return
             fragments = self._stream.feed(publication.payload)
             for fragment in fragments:
                 with self._lock:
@@ -712,6 +716,44 @@ class LiveTelemetrySource:
             with self._lock:
                 self._status["invalid_messages"] += 1
                 self._status["last_error"] = str(exc)
+
+    def _process_complete_message(self, completed, publication):
+        # DTM1 preserves MQTT boundaries. No stream buffer or reassembly state.
+        # Validate the entire publication even for a cached duplicate.
+        import zlib
+        key = (completed.source_id, completed.mission_id, completed.message_type,
+               completed.message_sequence, len(completed.payload),
+               zlib.crc32(completed.payload) & 0xFFFFFFFF, 1, completed.flags)
+        cached = self._ack_cache.get(key)
+        if cached is not None:
+            with self._lock:
+                self._status["duplicate_fragments"] += 1
+            self._ack_cache.move_to_end(key)
+            self._queue_ack(cached)
+            return
+        try:
+            added = self._accept_message(completed, publication)
+            if added == LiveMissionStore.FILTERED:
+                return
+            encoded = encode_acknowledgement(completed)
+        except (FragmentError, RecordFormatError, ValueError) as exc:
+            with self._lock:
+                self._status["invalid_messages"] += 1
+                self._status["last_error"] = str(exc)
+            encoded = encode_acknowledgement(completed, status=ACK_STATUS_PERMANENT_REJECTION)
+        else:
+            with self._lock:
+                self._status["complete_messages"] += 1
+                counter = {MESSAGE_GPS: "gps_records", MESSAGE_GPS_BATCH: "gps_records",
+                           MESSAGE_REFLECTANCE: "reflectance_records",
+                           MESSAGE_OPERATION_LOG: "event_records",
+                           RECORD_RAW_SPECTRUM: "raw_records"}[completed.message_type]
+                self._status[counter] += added
+        # Transient storage errors escape: no cache entry, no success ACK.
+        self._ack_cache[key] = encoded
+        if len(self._ack_cache) > self._ACK_CACHE_MAX:
+            self._ack_cache.popitem(last=False)
+        self._queue_ack(encoded)
 
     def _queue_ack(self, encoded: bytes) -> None:
         if not self.config.ack_enabled:

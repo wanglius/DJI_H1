@@ -13,6 +13,7 @@
 #include "telemetry.h"
 #include "telemetry_transport.h"
 #include "startup_checks.h"
+#include "m100m_config.h"
 
 static const char *TAG = "DJI_H1";
 
@@ -84,6 +85,7 @@ void app_main(void)
         source_id = (source_id << 8) | factory_mac[i];
     }
     const telemetry_config_t telemetry = {
+        .m100m = &s_m100m_config,
         .uart_port = DJI_DTU_UART_PORT,
         .tx_gpio = DJI_DTU_UART_TX_GPIO,
         .rx_gpio = DJI_DTU_UART_RX_GPIO,

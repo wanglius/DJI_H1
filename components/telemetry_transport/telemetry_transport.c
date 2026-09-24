@@ -72,6 +72,25 @@ static uint16_t fragment_count_for(uint32_t message_length)
                       TELEMETRY_FRAGMENT_PAYLOAD_MAX);
 }
 
+esp_err_t telemetry_message_encode(uint8_t type, uint64_t source,
+    uint64_t mission, uint32_t sequence, const uint8_t *payload, size_t length,
+    uint8_t *output, size_t capacity, size_t *written)
+{
+    if (!payload || !output || !written || !source || !mission ||
+        type < 1 || type > 5 || !length) return ESP_ERR_INVALID_ARG;
+    if (length > TELEMETRY_MESSAGE_WIRE_MAX_SIZE - TELEMETRY_MESSAGE_OVERHEAD ||
+        capacity < length + TELEMETRY_MESSAGE_OVERHEAD) return ESP_ERR_INVALID_SIZE;
+    uint8_t *p = output;
+    put32(&p, UINT32_C(0x314D5444)); /* DTM1 */
+    *p++ = 1; *p++ = type; put16(&p, 0);
+    put64(&p, source); put64(&p, mission); put32(&p, sequence);
+    put32(&p, (uint32_t)length); put32(&p, telemetry_crc32(payload, length));
+    memcpy(p, payload, length); p += length;
+    put32(&p, telemetry_crc32(output, (size_t)(p - output)));
+    *written = (size_t)(p - output);
+    return ESP_OK;
+}
+
 static uint16_t payload_length_for(uint32_t message_length,
                                    uint16_t fragment_index)
 {

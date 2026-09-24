@@ -93,6 +93,14 @@ esp_err_t telemetry_fragment_decode(
 /** IEEE CRC-32 used by fragment and complete-message integrity checks. */
 uint32_t telemetry_crc32(const void *data, size_t length);
 
+/* DTM1: complete MQTT message, no fragment index/count or reassembly.
+ * 36-byte identity/length/CRC header + canonical payload + 4-byte wire CRC. */
+#define TELEMETRY_MESSAGE_WIRE_MAX_SIZE 4100U
+#define TELEMETRY_MESSAGE_OVERHEAD 40U
+esp_err_t telemetry_message_encode(uint8_t type, uint64_t source,
+    uint64_t mission, uint32_t sequence, const uint8_t *payload, size_t length,
+    uint8_t *output, size_t capacity, size_t *written);
+
 /* A cloud consumer returns one DTA1 acknowledgement only after the complete
  * DTF2 message and its inner record have passed validation. */
 #define TELEMETRY_ACK_MAGIC UINT32_C(0x31415444)

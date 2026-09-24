@@ -121,6 +121,7 @@ static int64_t s_next_reflectance_release_us;
  * intentionally kept off the small internal-RAM RTOS stack. */
 static uint8_t s_record_buffer[TELEMETRY_RECORD_BUFFER_SIZE];
 static uint8_t s_fragment_buffer[TELEMETRY_FRAGMENT_WIRE_MAX_SIZE];
+static uint8_t s_message_buffer[TELEMETRY_MESSAGE_WIRE_MAX_SIZE];
 static uint8_t s_ack_stream[TELEMETRY_ACK_STREAM_CAPACITY];
 static size_t s_ack_stream_length;
 
@@ -603,6 +604,13 @@ static void process_ack(const telemetry_ack_t *ack)
 
 static bool drain_downlink(TickType_t wait_ticks)
 {
+    if (s_config.m100m != NULL) {
+        m100m_poll();
+        telemetry_ack_t ack;
+        while (take_next_ack(&ack)) process_ack(&ack);
+        if (wait_ticks) vTaskDelay(wait_ticks);
+        return false;
+    }
     uint8_t incoming[TELEMETRY_UART_DRAIN_SIZE];
     int count = uart_read_bytes(s_config.uart_port, incoming,
                                 sizeof(incoming), wait_ticks);
@@ -786,6 +794,50 @@ static telemetry_entry_t *take_recovery_probe_due(
     return NULL;
 }
 
+/** Drop expired queue heads without selecting a live message for transmission.
+ * This task is the only consumer; producers append only. The shutdown caller
+ * may reset queues, in which case abort-side pool cleanup owns reclamation.
+ * Never free a slot while its queue owns the pointer.
+ * Stop at a live/producer-owned head: preserve FIFO order and avoid re-enqueue
+ * races with producers filling a just-vacated queue slot. A later tombstone
+ * is removed once preceding records are sent or expire. */
+static void reclaim_expired_queue_heads(QueueHandle_t queue,
+                                         uint8_t expected_message_type)
+{
+    for (size_t i = 0; i < s_config.pool_length; i++) {
+        if (abort_requested()) return;
+        telemetry_entry_t *entry = NULL;
+        if (xQueuePeek(queue, &entry, 0) != pdTRUE) return;
+        if (!entry_belongs_to_pool(entry)) {
+            note_pool_fault("expired queue head outside pool");
+            return;
+        }
+        taskENTER_CRITICAL(&s_lock);
+        bool expired = entry->state == ENTRY_EXPIRED;
+        bool valid_type = entry->message_type == expected_message_type;
+        taskEXIT_CRITICAL(&s_lock);
+        if (!expired) return;
+        if (!valid_type) {
+            note_pool_fault("expired entry on wrong ready list");
+            return;
+        }
+        telemetry_entry_t *removed = NULL;
+        if (xQueueReceive(queue, &removed, 0) != pdTRUE || removed != entry) {
+            if (abort_requested()) return;
+            note_pool_fault("expired queue head changed under sole consumer");
+            return;
+        }
+        release_entry(entry);
+    }
+}
+
+static void reclaim_expired_queues(void)
+{
+    reclaim_expired_queue_heads(s_event_queue, TELEMETRY_MESSAGE_OPERATION_LOG);
+    reclaim_expired_queue_heads(s_gps_queue, TELEMETRY_MESSAGE_GPS_BATCH);
+    reclaim_expired_queue_heads(s_ready_queue, TELEMETRY_MESSAGE_REFLECTANCE);
+}
+
 static telemetry_entry_t *take_queued(QueueHandle_t queue,
                                       uint8_t expected_message_type)
 {
@@ -849,22 +901,14 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
         return result;
     }
 
-    telemetry_fragment_plan_t plan;
-    result = telemetry_fragment_plan_init(
-        &plan, entry->message_type, s_config.source_id, mission_id,
-        entry_sequence(entry), 0, s_record_buffer, length);
-    if (result != ESP_OK) {
-        note_serialization_fault();
-        discard_failed_entry(entry, "fragment plan failed");
-        return result;
-    }
+    uint32_t payload_crc = telemetry_crc32(s_record_buffer, length);
     if (entry->payload_crc_known &&
-        entry->payload_crc32 != plan.payload_crc32) {
+        entry->payload_crc32 != payload_crc) {
         note_pool_fault("immutable retry payload changed");
         discard_failed_entry(entry, "retry payload changed");
         return ESP_ERR_INVALID_CRC;
     }
-    entry->payload_crc32 = plan.payload_crc32;
+    entry->payload_crc32 = payload_crc;
     entry->payload_crc_known = true;
 
     telemetry_timing_t timing = {
@@ -877,9 +921,34 @@ static esp_err_t transmit_entry(telemetry_entry_t *entry, uint64_t mission_id)
     if (prior_transmissions != 0) s_status.messages_retried++;
     taskEXIT_CRITICAL(&s_lock);
 
-    result = telemetry_fragment_emit_all(
-        &plan, s_fragment_buffer, sizeof(s_fragment_buffer),
-        emit_fragment, &timing);
+    if (s_config.m100m != NULL) {
+        size_t wire_length = 0;
+        result = telemetry_message_encode(entry->message_type,
+            s_config.source_id, mission_id, entry_sequence(entry),
+            s_record_buffer, length, s_message_buffer,
+            sizeof(s_message_buffer), &wire_length);
+        if (result == ESP_OK) {
+            result = m100m_publish(s_message_buffer, wire_length);
+            if (result != ESP_OK) timing.uart_failed = true;
+            else {
+                timing.last_tx_done_us = esp_timer_get_time();
+                timing.emit_done_us = timing.last_tx_done_us;
+                timing.fragments = 1; /* legacy summary key: publications in DTM1 */
+                timing.bytes = wire_length;
+                taskENTER_CRITICAL(&s_lock);
+                s_status.fragments_sent++;
+                s_status.bytes_sent += wire_length;
+                taskEXIT_CRITICAL(&s_lock);
+            }
+        }
+    } else {
+        telemetry_fragment_plan_t plan;
+        result = telemetry_fragment_plan_init(&plan, entry->message_type,
+            s_config.source_id, mission_id, entry_sequence(entry), 0,
+            s_record_buffer, length);
+        if (result == ESP_OK) result = telemetry_fragment_emit_all(
+            &plan, s_fragment_buffer, sizeof(s_fragment_buffer), emit_fragment, &timing);
+    }
     int64_t finished_us = esp_timer_get_time();
     if (result != ESP_OK && !timing.uart_failed && !abort_requested())
         note_serialization_fault();
@@ -1069,6 +1138,9 @@ static void telemetry_task(void *unused)
     (void)unused;
     size_t recovery_cursor = 0;
     int64_t next_recovery_probe_us = 0;
+    if (s_config.m100m != NULL)
+        m100m_init(s_config.uart_port, s_config.baud_rate, s_config.source_id,
+                  s_config.m100m, append_downlink, abort_requested);
 
     while (true) {
         if (abort_requested()) {
@@ -1097,9 +1169,19 @@ static void telemetry_task(void *unused)
         /* Fresh ACKs win over expiry. Anything still retained beyond the
          * residency window is then shed before another retry or new send. */
         expire_stale_entries(now_us);
+        /* Reclaim tombstones even while the native modem is offline, busy or
+         * quarantined. Otherwise expired queued records exhaust the free pool. */
+        reclaim_expired_queues();
         if (s_config.delivery_mode == TELEMETRY_DELIVERY_APPLICATION_ACK)
             update_ack_deadlines(now_us);
         release_due_reflectance(now_us);
+
+        /* Native AT PUBACK gates local submission only. DTA1 alone clears
+         * retained records. Offline modem must not block pool expiration. */
+        if (s_config.m100m != NULL && !m100m_ready()) {
+            vTaskDelay(pdMS_TO_TICKS(TELEMETRY_POLL_MS));
+            continue;
+        }
 
         /* Rare operational events are sent first so start/stop/link alarms do
          * not sit behind scientific traffic. GPS and ordinary retries follow;

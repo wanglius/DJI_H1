@@ -1,6 +1,8 @@
 # DJI H1 独立地面站
 
-本子项目用于接收 MQTT 遥测、重组 DTF2 分片、展开 DGB1 GPS 批次、解码 DHR1 v01 数据、保存地面接收日志，以及通过 PyQt GUI / Python / 本机 HTTP 查询飞行数据。
+M100M 分支增加 DTM1 完整消息支持：每个 MQTT publication 直接校验和解码，不经过分片重组；DTA1、持久日志和地图隔离语义不变。仍兼容旧 DTF2。新固件默认部署模板使用 `dji-h1/m100m/up` / `dji-h1/m100m/down`；请将本地地面配置与固件配置对齐，勿沿用旧 topic 而误判无数据。详见项目 `Docs/m100m_integration_zh.md`。
+
+本子项目用于接收 MQTT 遥测、校验 DTM1 完整消息（兼容旧 DTF2 分片重组）、展开 DGB1 GPS 批次、解码 DHR1 v01 数据、保存地面接收日志，以及通过 PyQt GUI / Python / 本机 HTTP 查询飞行数据。
 
 可以把整个 `ground_app` 文件夹交给同事，或复制到另一台电脑单独安装。运行不依赖上级固件工程、ESP-IDF、`tools/mission_viewer`、原有 `tests` 目录或硬件串口。当前 Python 包名为 `dji_h1_ground`，发行版本为 `0.1.0`。
 

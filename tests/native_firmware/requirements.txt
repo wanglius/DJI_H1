@@ -1,0 +1,2 @@
+# Optional host compiler; no change to firmware or ground-app runtime dependencies.
+ziglang==0.13.0

@@ -117,13 +117,21 @@ def main():
                         help='expect test-only writer stall and visible raw drops')
     parser.add_argument('--endurance', action='store_true',
                         help='run the 10-minute four-line mission with incidents')
+    parser.add_argument('--duration', type=float, help='override mission duration (60..600 s)')
+    parser.add_argument('--capture-diagnostics', action='store_true')
+    parser.add_argument('--reopen-on-debug-silence', action='store_true',
+                        help='diagnostics only: reopen USB once after 10 s silence, without a reset command')
     parser.add_argument('--report-prefix', required=True)
     cli = parser.parse_args()
     if cli.port.upper() == cli.debug_port.upper():
         parser.error('protocol and debug ports must differ')
     if cli.probe and cli.faults:
         parser.error('--probe and --faults are separate scenarios')
-    args = argparse.Namespace(duration=600 if cli.endurance else 60, grace=10,
+    if cli.duration is not None and not 60 <= cli.duration <= 600:
+        parser.error('duration must be 60..600 seconds')
+    if cli.reopen_on_debug_silence and not cli.capture_diagnostics:
+        parser.error('--reopen-on-debug-silence requires --capture-diagnostics')
+    args = argparse.Namespace(duration=cli.duration or (600 if cli.endurance else 60), grace=10,
         scenario='endurance' if cli.endurance else 'normal',
         session_id=(secrets.randbelow(65535) + 1) << 16 | 1,
         drone_sn='DJI-H1-HARDWARE-MISSION',
@@ -138,6 +146,8 @@ def main():
     with ExitStack() as stack:
         report_file = stack.enter_context(prefix.with_suffix('.json').open('x', encoding='utf-8'))
         log_file = stack.enter_context(prefix.with_suffix('.log').open('x', encoding='utf-8'))
+        health_file = (stack.enter_context(prefix.with_suffix('.capture.jsonl').open('x', encoding='utf-8'))
+                       if cli.capture_diagnostics else None)
         debug = stack.enter_context(serial.Serial(cli.debug_port, 115200, timeout=.1))
         uart = stack.enter_context(serial.Serial(cli.port, 115200, timeout=.01, write_timeout=1))
         debug.dtr = False
@@ -158,8 +168,15 @@ def main():
             except Exception as exc:
                 capture_errors.append(str(exc))
 
-        thread = threading.Thread(target=capture)
-        thread.start()
+        diagnostic = None
+        if cli.capture_diagnostics:
+            from debug_capture import DiagnosticCapture
+            diagnostic = DiagnosticCapture(debug, log_file, health_file, chunks, capture_errors,
+                                           allow_reopen=cli.reopen_on_debug_silence)
+            diagnostic.start()
+        else:
+            thread = threading.Thread(target=capture)
+            thread.start()
         try:
             if cli.reset:
                 from esptool.reset import HardReset
@@ -176,7 +193,14 @@ def main():
             raise
         finally:
             stop.set()
-            thread.join(2)
+            if diagnostic:
+                capture_result = diagnostic.finish()
+            else:
+                thread.join(2)
+        if diagnostic:
+            result['debug_capture'] = capture_result
+            if capture_result['reopen_attempts']:
+                capture_errors.append('USB logging silence triggered diagnostic reopen; inspect capture evidence')
         result['hardware_failures'] = verify_debug(
             ''.join(chunks), result, require_clock=True,
             require_recording=True,

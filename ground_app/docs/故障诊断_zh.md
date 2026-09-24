@@ -11,18 +11,20 @@
 
 不需要为本应用安装 ESP-IDF 或接入 A/B 串口；真实采集控制仍由 A 板或上级工程的模拟器负责。
 
+M100M 分支使用 DTM1 和独立 topic（默认 `dji-h1/m100m/up`、`dji-h1/m100m/down`）；必须使用支持 DTM1 的 `ground_app`。旧 mission viewer 或只调用 DTF2 stream decoder 的自编应用会忽略新消息。自行提供 payload 时请使用 [API 文档第 3 节](API使用说明_zh.md#3-不经过-mqtt自行提供-payload) 的格式分流示例。
+
 ## 接收计数的含义
 
 | 计数 | 含义/判断 |
 |---|---|
 | mqtt_messages / mqtt_bytes | 进入指定主题回调的 publication 和字节数 |
 | processed_publications | 处理线程已处理的 publication，可能包含无效或部分数据 |
-| fragments | 可恢复的 DTF2 完整分片数 |
+| fragments | 可恢复的旧 DTF2 完整分片数；纯 DTM1 任务为 0 是正常现象 |
 | complete_messages | 应用接受完成次数，GPS 批次计一次 |
 | gps_records / reflectance_records / event_records | 内存中新接受的相应记录数量 |
 | decoded_messages | 完成解码输出次数 |
 | filtered_messages | 设备/任务筛选排除的完整消息数；不发送任何 DTA1 |
-| duplicate_fragments | ACK 缓存识别到的重复分片 |
+| duplicate_fragments | 历史计数名：DTF2 重复分片或 DTM1 重复完整消息 |
 | invalid_messages | 重组/完整消息校验或类型处理错误；并非每个坏字节都计一次 |
 | expired_assemblies | 空闲清理时发现的过期重组数；不能据此计算精确丢包率 |
 | ingress_dropped | 入口队列满；对应 payload 没进入处理/日志 |
@@ -32,7 +34,9 @@
 | ack_publish_failures / ack_queue_overflows | ACK 出口异常或压力 |
 | processing_max_ms | 处理一次 publication 的最大耗时，含 SQLite 提交 |
 
-DTF2 是连续字节流，魔数扫描会跳过噪声，因此 invalid_messages 不等于物理链路错误总数。原始 publications 可用于另行逐字节分析。
+DTM1 不创建重组状态；纯 DTM1 任务的 inflight、buffered_bytes、expired_assemblies 正常为 0，不能据此认为未收到数据，应看 complete_messages 和各记录计数。每个 DTM1 publication 都先校验完整长度及 CRC，即使它是已确认消息的重传。
+
+旧 DTF2 是连续字节流，魔数扫描会跳过噪声，因此 invalid_messages 不等于物理链路错误总数。原始 publications 可用于另行逐字节分析。
 
 ## 地图坏了，数据仍在
 

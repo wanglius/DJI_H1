@@ -5,7 +5,7 @@
 | 原来源 | 本项目副本 |
 |---|---|
 | tools/mission_viewer/dji_h1_viewer/decoder.py | src/dji_h1_ground/decoder.py |
-| 同目录 telemetry.py | DTF2 / DGB1 / DTA1 协议及重组 |
+| 同目录 telemetry.py | DTM1 完整消息、旧 DTF2 分片重组、DGB1 / DTA1 协议 |
 | 同目录 mission.py / geolocation.py / presentation.py | 离线任务、插值和地图数据模型 |
 | 同目录 live.py / live_transport.py | 网络/解码/ACK 分离的接收基础 |
 | 同目录 ui.py / baidu_map.py / resources | GUI、离线图、百度卫星图模板 |

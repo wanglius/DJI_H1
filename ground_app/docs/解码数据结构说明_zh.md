@@ -2,17 +2,19 @@
 
 本文面向使用 `dji_h1_ground` Python API、HTTP API 或 JSONL 导出的开发者，说明数据的层级、字段、单位、有效性和使用边界。配套调用方法见 [API 使用说明](API使用说明_zh.md)。
 
-本文对应当前 `ground_app` 独立副本：Python 包版本 0.1.0，测量记录 DHR1 v01，SD 文件头 DHF1 v01，传输分片 DTF2 v02，GPS 批次 DGB1 v01。不同层的版本号独立，不能用包版本代替协议版本。本说明不修改既有 mission viewer 或固件。
+本文对应当前 `ground_app` 独立副本：Python 包版本 0.1.0，测量记录 DHR1 v01，SD 文件头 DHF1 v01，完整传输消息 DTM1 v01，旧版传输分片 DTF2 v02，GPS 批次 DGB1 v01。不同层的版本号独立，不能用包版本代替协议版本。本说明不修改既有 mission viewer 或固件。
 
 ## 1. 先区分三层数据
 
 | 层级 | Python 对象 | 用途 |
 |---|---|---|
-| 传输层 | `TelemetryFragment`、`ReassembledTelemetry` | 将 MQTT 字节流中的 DTF2 分片恢复为完整逻辑消息 |
+| 传输层 | `ReassembledTelemetry`；旧 DTF2 另用 `TelemetryFragment` | DTM1 直接校验完整 publication；DTF2 才经过分片重组，最后返回相同逻辑消息对象 |
 | 记录层 | `DecodedMessage.records` 中的 `GpsRecord`、`RawSpectrum`、`ReflectanceSpectrum`、`OperationEvent` | 保留设备产生的记录、时间戳和质量标志 |
 | 查询与展示层 | `MissionService` 字典、`InterpolatedPosition`、`MissionMapModel` | 添加分页索引、百分比换算、位置插值和地图图层 |
 
-一个 MQTT publication 不一定等于一个分片，也不一定等于一条测量记录：publication 可能含分片的一部分或多个分片；一个完整 GPS 批次又会展开为多条 GPS 记录。应用通常应消费 `GroundReceiver.get_message()` 的结果，而不是直接对 MQTT payload 做 JSON 解码。
+M100M 使用 DTM1，一个 MQTT publication 恰好是一条完整逻辑消息，但一个 GPS 批次会展开为多条 GPS 记录。仅旧 DTF2 路径可能出现 publication 含半个或多个分片。应用通常应消费 `GroundReceiver.get_message()` 的结果，而不是直接对 MQTT payload 做 JSON 解码。
+
+DTM1 开销 40 字节，总长不超过 4100 字节；含版本、类型、设备/任务身份、序号、内层长度、内层 CRC32、payload 和外层 CRC32。没有线上分片字段。校验通过后返回 `ReassembledTelemetry`，名字是兼容已有 API，并不表示新路径发生过重组。711 点反射率总长 2273 字节，十条 GPS 合包总长 784 字节。SD DHR1 记录和 DTA1 确认格式不变；DTA1 的 message_crc32 指内层 payload CRC，不是最外层 CRC。
 
 SD 文件和实时遥测共享记录解释，但可用产品不同：接收器支持原始光谱类型，不代表生产固件正在通过 MQTT 发送原始光谱。也不能因实时视图缺少某种产品，就认为 SD 上未记录该产品。
 
@@ -26,13 +28,13 @@ SD 文件和实时遥测共享记录解释，但可用产品不同：接收器�
 | `mission_id` | `int`，uint64 范围 | 传输任务身份；不等同于记录内 `session_id` |
 | `message_type` | `int` | 1 GPS、2 原始光谱、3 反射率、4 事件、5 GPS 批次 |
 | `message_sequence` | `int`，uint32 范围 | 逻辑消息序号；批次为第一条 GPS 记录的序号 |
-| `fragment_count` | `int` | 组成该消息的分片数，不是记录数，也不含重复重传次数 |
+| `fragment_count` | `int` | DTM1 固定为 1，仅为 API 兼容值；DTF2 为实际分片数。均不是记录数或重传次数 |
 | `received_utc_ns` | `int` | 地面收到补全该消息的 publication 时的 UTC 纳秒 |
 | `received_monotonic` | `float` | 同一接收时刻的地面单调时钟秒；不与设备单调时钟直接相减 |
 | `topic` | `str` | 最后补全 publication 的 MQTT 主题 |
 | `qos` | `int` | 该 publication 实际交付的 QoS，不代表另一方向的发布配置 |
 | `records` | `tuple` | 类型 1～4 各包含一条记录；类型 5 包含 1～10 条 `GpsRecord` |
-| `payload` | `bytes` | 完整逻辑消息体：DHR1 记录或 DGB1 批次，不含 DTF2 分片外壳 |
+| `payload` | `bytes` | 完整逻辑消息体：DHR1 记录或 DGB1 批次，不含 DTM1 或 DTF2 外壳 |
 
 直接调用低层 `decode_message()` 时，若没有传入接收元数据，接收时间默认为 0、主题为空；它们不是测量时间。接收时刻减测量时刻得到的差还包含时钟误差、缓存及网络延迟，不能不加条件地称为纯网络时延。
 
@@ -308,7 +310,7 @@ SD 的 `EVENTS.JSONL` 是可读事件记录，可能含比紧凑遥测事件更�
 | 反射率完整 DHR1 记录 | `100 + 3*N` |
 | 紧凑事件完整 DHR1 记录 | 76 |
 
-N 为本条 `sample_count`，本项目完整实测光谱预期为 711；格式仍允许其他数量以保留异常帧或测试数据。N=711 时原始光谱记录为 1502 字节，反射率记录为 2233 字节。以上不含 DTF2 开销，也不适用于直接计算 DGB1 压缩批次大小。`magic` 只是帮助识别格式的固定签名，不是设备序号或加密密钥。
+N 为本条 `sample_count`，本项目完整实测光谱预期为 711；格式仍允许其他数量以保留异常帧或测试数据。N=711 时原始光谱记录为 1502 字节，反射率记录为 2233 字节。以上不含 DTM1 或 DTF2 开销，也不适用于直接计算 DGB1 压缩批次大小。`magic` 只是帮助识别格式的固定签名，不是设备序号或加密密钥。
 
 ## 11. 最小数据消费示例
 
@@ -353,7 +355,7 @@ def consume(message):
 
 - [decoder.py](../src/dji_h1_ground/decoder.py)：DHR1 字段及 CRC 解码。
 - [messages.py](../src/dji_h1_ground/messages.py)：完整消息与 JSON 表示。
-- [telemetry.py](../src/dji_h1_ground/telemetry.py)：DTF2 与 DGB1 重组、批次恢复。
+- [telemetry.py](../src/dji_h1_ground/telemetry.py)：DTM1 校验、旧 DTF2 重组及 DGB1 批次恢复。
 - [geolocation.py](../src/dji_h1_ground/geolocation.py)：时间域与位置插值。
 - [api.py](../src/dji_h1_ground/api.py)：查询 / HTTP 字典。
 - [live.py](../src/dji_h1_ground/live.py)：实时事件名称投影。

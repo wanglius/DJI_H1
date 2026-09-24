@@ -6,6 +6,7 @@
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "measurement_records.h"
+#include "m100m.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,9 @@ typedef enum {
 
 typedef struct {
     uart_port_t uart_port;
+    /** NULL preserves the legacy transparent-DTU diagnostic projects.
+     * Production on this branch supplies native M100M MQTT configuration. */
+    const m100m_config_t *m100m;
     int tx_gpio;
     int rx_gpio;
     uint32_t baud_rate;
@@ -144,8 +148,9 @@ typedef struct {
     bool shutdown_aborted;
 } telemetry_status_t;
 
-/** Start the sole DTU UART owner and its paced transmit task. The DTU must
- * already contain its persistent MQTT provisioning. The fixed shared payload
+/** Start the sole DTU UART owner and its transmit task. Native M100M is
+ * asynchronously provisioned by the task; legacy transparent DTU requires
+ * persistent provisioning. The fixed shared payload
  * pool is allocated from initialized PSRAM during this call.
  */
 esp_err_t telemetry_start(const telemetry_config_t *config);

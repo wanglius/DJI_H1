@@ -1,6 +1,6 @@
 # Python 与 HTTP API 使用说明
 
-公共导入入口为 `dji_h1_ground`。本 API 版本为 0.1.0，记录格式 DHR1 v01、分片格式 DTF2 v02、GPS 批次 DGB1 v01、确认 DTA1 v01。这些版本独立于 Python 包版本。
+公共导入入口为 `dji_h1_ground`。本 API 版本为 0.1.0，记录格式 DHR1 v01、完整消息 DTM1 v01、旧版分片 DTF2 v02、GPS 批次 DGB1 v01、确认 DTA1 v01。这些版本独立于 Python 包版本。M100M 固件使用 DTM1：一个 MQTT publication 就是一条完整逻辑消息；DTF2 仅用于兼容旧透明 DTU。
 
 字段类型、单位、质量位、GPS 批次展开以及 Python/JSON 差异见 [解码数据结构说明](解码数据结构说明_zh.md)。
 
@@ -39,9 +39,9 @@ finally:
 |---|---|
 | source_id / mission_id | Python uint64 范围整数，用于区分设备与任务 |
 | message_type | 1 GPS、2 原始光谱、3 反射率、4 操作事件、5 GPS 批次 |
-| message_sequence | DTF2 逻辑消息序号；GPS 批次对应批内第一条序号 |
-| fragment_count | 本逻辑消息的分片总数，不是 MQTT publication 数 |
-| received_utc_ns | 最后一个补全分片所在 publication 到达地面时的 UTC 纳秒 |
+| message_sequence | DTM1/DTF2 逻辑消息序号；GPS 批次对应批内第一条序号 |
+| fragment_count | DTM1 固定为 1（内存 API 兼容字段，不在线上传输）；DTF2 为实际分片总数 |
+| received_utc_ns | DTM1 完整 publication、或 DTF2 最后补全分片所在 publication 到达地面时的 UTC 纳秒 |
 | received_monotonic | 同一 publication 的地面单调时钟秒，仅在同一进程时钟域比较 |
 | topic / qos | 最后补全 publication 的主题及实际交付 QoS |
 | records | 解码后的记录 tuple；GPS 批次展开后有 1～10 条，其余通常 1 条 |
@@ -64,12 +64,16 @@ finally:
 ```python
 from dji_h1_ground import (
     TelemetryFragmentStreamDecoder, TelemetryReassembler, decode_message,
+    decode_message_envelope,
 )
 
 stream = TelemetryFragmentStreamDecoder()
 assembler = TelemetryReassembler(timeout_seconds=30, max_inflight=512)
 
 def consume_payload(payload: bytes):
+    if payload.startswith(b"DTM1"):
+        # 验证精确长度、身份与两层 CRC；错误直接抛异常，不回退为旧分片。
+        return [decode_message(decode_message_envelope(payload))]
     output = []
     for fragment in stream.feed(payload):
         complete = assembler.push(fragment)
@@ -78,7 +82,9 @@ def consume_payload(payload: bytes):
     return output
 ```
 
-每条独立传输字节流分别建立 stream/assembler 实例；这些低层对象本身不是线程安全的，应由一个处理线程独占。DTU 可能把一个 DTF2 分片切成多个 MQTT payload，也可能把多个分片拼在一起，所以不能假设一次 MQTT 回调等于一个 DTF2 分片。
+本例同时支持新旧格式。M100M 的 DTM1 必须按单个 MQTT publication 调用，不能拆开或拼接；总长上限 4100 字节，外层开销 40 字节。711 点反射率 DHR1 为 2233 字节，加 DTM1 后为 2273 字节。十条 GPS 的 DGB1 为 744 字节，加 DTM1 后为 784 字节。DTM1 使用 `encode_message(ReassembledTelemetry(...))` 生成，接收用 `decode_message_envelope`，不是 `TelemetryFragmentStreamDecoder`。
+
+仅旧 DTF2 路径需为每条独立传输字节流分别建立 stream/assembler 实例；这些低层对象本身不是线程安全的，应由一个处理线程独占。旧透明 DTU 可能把一个 DTF2 分片切成多个 MQTT payload，也可能把多个分片拼在一起，所以旧格式不能假设一次 MQTT 回调等于一个分片。
 
 `stream.feed` 处理魔数重同步及分片 CRC；`assembler.push` 处理乱序、重复、元信息一致性、完整消息 CRC。push 返回 None 表示未完成或重复。空闲时可调用 assembler.expire 清理未完成记录。调用方传入 now 时需始终使用同一个单调时钟域。
 

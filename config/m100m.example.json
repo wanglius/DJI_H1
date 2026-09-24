@@ -1,0 +1,8 @@
+{
+  "host": "mqtt.example.com",
+  "port": 1883,
+  "username": "",
+  "password": "",
+  "uplink_topic": "dji-h1/m100m/up",
+  "ack_topic": "dji-h1/m100m/down"
+}

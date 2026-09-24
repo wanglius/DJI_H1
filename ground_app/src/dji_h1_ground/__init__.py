@@ -36,7 +36,7 @@ from .telemetry import (
     TelemetryFragment,
     TelemetryFragmentStreamDecoder, TelemetryReassembler, decode_fragment,
     decode_acknowledgement, decode_gps_batch, encode_acknowledgement,
-    encode_gps_batch, fragment_message,
+    encode_gps_batch, fragment_message, encode_message, decode_message_envelope,
 )
 
 __all__ = [
@@ -65,7 +65,7 @@ __all__ = [
     "decode_acknowledgement", "decode_fragment", "decode_gps_batch",
     "decode_record",
     "encode_acknowledgement", "encode_gps_batch", "event_severity",
-    "fragment_message", "open_mission",
+    "fragment_message", "open_mission", "encode_message", "decode_message_envelope",
     "start_http_api",
 ]
 
