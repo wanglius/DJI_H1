@@ -1,4 +1,5 @@
 #include "acquisition.h"
+#include "boot_health.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -317,22 +318,30 @@ static void reset_sensor_run_state(sensor_context_t *ctx)
     ctx->interval_sum_us = 0;
 }
 
-static esp_err_t prepare_sensor(sensor_context_t *ctx)
+static esp_err_t prepare_sensor(sensor_context_t *ctx, bool boot_check)
 {
     ESP_LOGI(TAG, "Preparing %s on UART-%c", ctx->name,
              ctx->channel == SC16_CHANNEL_A ? 'A' : 'B');
     esp_err_t ret = sc16_test_channel(ctx->channel);
-    if (ret != ESP_OK) return ret;
-    ret = sc16_uart_init(ctx->channel);
+    if (ret == ESP_OK) ret = sc16_uart_init(ctx->channel);
+    if (boot_check) {
+        boot_check_t bridge = ctx->channel == SC16_CHANNEL_A ? BOOT_SC16_A : BOOT_SC16_B;
+        boot_check_t sensor = ctx->channel == SC16_CHANNEL_A ? BOOT_H1_A : BOOT_H1_B;
+        boot_health_result(bridge, ret);
+        if (ret != ESP_OK) boot_health_set(sensor, BOOT_BLOCKED, ret);
+    }
     if (ret != ESP_OK) return ret;
     ret = h1_init(&ctx->device, ctx->channel);
     if (ret != ESP_OK) return ret;
+    if (__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) return ESP_ERR_INVALID_STATE;
     ret = h1_get_device_info(&ctx->device);
     if (ret != ESP_OK) return ret;
     ESP_LOGI(TAG, "%s identity: %s", ctx->name, ctx->device.device_info);
+    if (__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) return ESP_ERR_INVALID_STATE;
     ret = h1_set_exposure_mode(&ctx->device, H1_EXPOSURE_AUTO);
     if (ret != ESP_OK) return ret;
     h1_exposure_mode_t mode = H1_EXPOSURE_MANUAL;
+    if (__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) return ESP_ERR_INVALID_STATE;
     ret = h1_get_exposure_mode(&ctx->device, &mode);
     if (ret != ESP_OK) return ret;
     ESP_LOGI(TAG, "%s exposure mode: %s", ctx->name,
@@ -603,12 +612,19 @@ static void configure_watchdog(void)
 
 esp_err_t acquisition_prepare_dual(void)
 {
+    esp_err_t first_error = ESP_OK;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         reset_sensor_run_state(&s_sensors[i]);
-        esp_err_t result = prepare_sensor(&s_sensors[i]);
-        if (result != ESP_OK) return result;
+        esp_err_t result = prepare_sensor(&s_sensors[i], true);
+        boot_health_snapshot_t health;
+        boot_health_snapshot(&health);
+        boot_check_t sensor = i == 0 ? BOOT_H1_A : BOOT_H1_B;
+        if (health.checks[sensor].state != BOOT_BLOCKED)
+            boot_health_result(sensor, result);
+        /* A missing ground spectrometer must not hide the sky result. */
+        if (first_error == ESP_OK && result != ESP_OK) first_error = result;
     }
-    return ESP_OK;
+    return first_error;
 }
 
 esp_err_t acquisition_run_dual(uint32_t duration_ms)
@@ -630,7 +646,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         reset_sensor_run_state(&s_sensors[i]);
         if (__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) goto cleanup;
-        result = prepare_sensor(&s_sensors[i]);
+        result = prepare_sensor(&s_sensors[i], false);
         if (result != ESP_OK) {
             ESP_LOGE(TAG, "%s preparation failed: %s",
                      s_sensors[i].name, esp_err_to_name(result));

@@ -1,4 +1,5 @@
 #include "mission_control.h"
+#include "boot_health.h"
 
 #include "acquisition.h"
 #include "calculation.h"
@@ -124,8 +125,12 @@ uint8_t mission_control_power_off(uint8_t grace_seconds)
 
 bool mission_control_ready(void)
 {
+    boot_health_snapshot_t health;
+    boot_health_snapshot(&health);
     taskENTER_CRITICAL(&s_lock);
-    bool ready = s_initialized && (!s_error || s_error == 3) && !s_power_off;
+    /* Wait only for the bounded probe to finish, not for telemetry to succeed. */
+    bool ready = s_initialized && (!s_error || s_error == 3) && !s_power_off &&
+                 health.checks[BOOT_DTU_PROFILE].state != BOOT_PENDING;
     taskEXIT_CRITICAL(&s_lock);
     return ready;
 }
@@ -137,6 +142,7 @@ void mission_control_get_status(ab_status_report_t *out)
     telemetry_status_t telemetry;
     measurement_recorder_get_status(&recorder);
     telemetry_get_status(&telemetry);
+    bool telemetry_boot_failed = boot_health_telemetry_failed();
     taskENTER_CRITICAL(&s_lock);
     acquisition_get_status(&acquisition);
     uint8_t error = s_error;
@@ -146,6 +152,7 @@ void mission_control_get_status(ab_status_report_t *out)
                    recorder.identity_mismatches))
         error = 5;
     if (!error && (acquisition.errors[0] || acquisition.errors[1])) error = 5;
+    if (!error && telemetry_boot_failed) error = 5;
     /* Delivery loss is mission degradation, not a recorder stop condition.
      * Keep it visible to A while later SD and telemetry submissions continue. */
     if (!error && telemetry.initialized &&
@@ -197,10 +204,18 @@ static void control_task(void *unused)
         .mount_point = DJI_SD_MOUNT_POINT,
     };
     esp_err_t result = sd_card_mount(&sd);
+    boot_health_result(BOOT_SD, result);
     if (result == ESP_OK) result = refresh_storage();
-    if (result == ESP_OK) result = measurement_recorder_init();
+    if (result == ESP_OK) {
+        result = measurement_recorder_init();
+        boot_health_result(BOOT_RECORDER, result);
+    } else {
+        boot_health_set(BOOT_RECORDER, BOOT_BLOCKED, result);
+    }
     uint8_t error = result == ESP_OK ? 0 : 1;
-    if (!error) {
+    esp_err_t first_error = result;
+    /* Storage and sensors are independent; do not hide one behind the other. */
+    {
         const sc16_config_t bridge = {
             .spi_host = DJI_SC16_SPI_HOST,
             .pin_mosi = DJI_SC16_PIN_MOSI,
@@ -212,17 +227,31 @@ static void control_task(void *unused)
             .crystal_hz = DJI_SC16_CRYSTAL_HZ,
         };
         result = sc16_init(&bridge);
+        boot_health_result(BOOT_SC16, result);
         if (result == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(500));
             result = acquisition_prepare_dual();
+        } else {
+            boot_health_set(BOOT_SC16_A, BOOT_BLOCKED, result);
+            boot_health_set(BOOT_SC16_B, BOOT_BLOCKED, result);
+            boot_health_set(BOOT_H1_A, BOOT_BLOCKED, result);
+            boot_health_set(BOOT_H1_B, BOOT_BLOCKED, result);
         }
-        if (result != ESP_OK) error = 2;
+        if (result != ESP_OK && !error) {
+            error = 2;
+            first_error = result;
+        }
+    }
+    if (!error && boot_health_critical_failed()) {
+        error = 2;
+        first_error = ESP_ERR_INVALID_STATE;
     }
     taskENTER_CRITICAL(&s_lock);
     s_error = error;
     s_initialized = !error;
     taskEXIT_CRITICAL(&s_lock);
-    ESP_LOGI(TAG, "Initialization: %s; awaiting A-board commands", esp_err_to_name(result));
+    ESP_LOGI(TAG, "Initialization: %s; awaiting A-board commands", esp_err_to_name(first_error));
+    boot_health_report();
 
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);

@@ -54,6 +54,9 @@ typedef struct {
     uint32_t gps_batch_max_delay_ms;
     /** Emit one compact microsecond timing record per delivery attempt. */
     bool timing_diagnostics;
+    /** Production-only, read-only YY-M200 profile/connection check before TX.
+     * Diagnostic firmware defaults false; never provisions or resets the DTU. */
+    bool verify_dtu_at_boot;
 } telemetry_config_t;
 
 typedef struct {

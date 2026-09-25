@@ -13,6 +13,7 @@
 #include "telemetry.h"
 #include "telemetry_transport.h"
 #include "startup_checks.h"
+#include "boot_health.h"
 
 static const char *TAG = "DJI_H1";
 
@@ -73,8 +74,11 @@ static esp_err_t verify_board_flash(void)
 void app_main(void)
 {
     printf("\nDJI_H1 - A-BOARD CONTROLLED DUAL ACQUISITION\n");
-    ESP_ERROR_CHECK(verify_board_flash());
-    ESP_ERROR_CHECK(verify_board_psram());
+    /* Keep the A-board/debug reporting alive after detectable board-profile
+     * faults instead of entering an ESP_ERROR_CHECK reboot loop. IDF failures
+     * before app_main (e.g. unusable RAM) remain outside application control. */
+    boot_health_result(BOOT_FLASH, verify_board_flash());
+    boot_health_result(BOOT_PSRAM, verify_board_psram());
     ESP_ERROR_CHECK(startup_checks_run());
     ESP_ERROR_CHECK(clock_sync_init());
     uint8_t factory_mac[6];
@@ -99,8 +103,15 @@ void app_main(void)
         .gps_batch_max_records = DJI_DTU_GPS_BATCH_MAX_RECORDS,
         .gps_batch_max_delay_ms = DJI_DTU_GPS_BATCH_MAX_DELAY_MS,
         .timing_diagnostics = DJI_DTU_TIMING_DIAGNOSTICS,
+        .verify_dtu_at_boot = true,
     };
-    ESP_ERROR_CHECK(telemetry_start(&telemetry));
+    esp_err_t telemetry_result = telemetry_start(&telemetry);
+    boot_health_result(BOOT_TELEMETRY_UART, telemetry_result);
+    if (telemetry_result != ESP_OK) {
+        boot_health_set(BOOT_DTU_PROFILE, BOOT_BLOCKED, telemetry_result);
+        boot_health_set(BOOT_DTU_NETWORK, BOOT_BLOCKED, telemetry_result);
+        boot_health_set(BOOT_GROUND_ACK, BOOT_BLOCKED, telemetry_result);
+    }
     ESP_ERROR_CHECK(mission_control_init());
     ESP_ERROR_CHECK(ab_link_start());
     /* Persistent services own the app: no boot acquisition or scratch writes. */

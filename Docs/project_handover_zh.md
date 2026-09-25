@@ -166,17 +166,22 @@ SC16 初始化完成后，固件固定等待 500 ms，再准备两台 H1。该�
 
 ## 5. 固件启动流程
 
+2026-09-25 增加每次启动的生产硬件自验证，详细定义、配置来源、故障处理和实机验收表见
+[boot_self_verification_zh.md](boot_self_verification_zh.md)。新流程已构建/主机测试，并完成
+正常 60 秒任务、故意不发地面 ACK，以及 SD 卡和 H1-A 同时断开的实机故障测试；
+SC16/DTU 断开等其他物理故障仍待验收。
+
 `main/main.c` 中的 `app_main()` 保持很薄，当前顺序为：
 
 1. 输出固件启动横幅；
 2. 核对 16 MB Flash 和 8 MB PSRAM，并运行 PSRAM 启动内存测试；
 3. 调用 `startup_checks_run()`；正常生产配置中 `CONFIG_DJI_H1_BOOT_SELF_TESTS` 关闭，因此该调用不执行测试体；资格镜像显式开启该选项时才运行数据流水线、A/B 协议、遥测传输、时间同步和计算自检，并清除自检产生的假定位数据；
 4. 启动 `clock_sync`；
-5. 从 ESP32 出厂 MAC 生成遥测 `source_id`，初始化 UART1 和 512 项 PSRAM 遥测池；
+5. 从 ESP32 出厂 MAC 生成遥测 `source_id`，初始化 UART1 和 512 项 PSRAM 遥测池；遥测任务在二进制发送前执行有界、只读的 YY-M200 配置/联网检查；
 6. 启动 `mission_control`；
 7. 启动 `ab_link`。
 
-固件上电后不会立即采集。`mission_control` 先挂载 SD 卡、创建本次飞行目录、初始化记录器、初始化 SC16 并准备 H1；完成后进入 READY，等待 A 板命令。
+固件上电后不会立即采集。`mission_control` 检查 SD/记录器和 SC16/H1 两条独立分支；缺卡仍检查传感器，H1-A 失败仍检查 H1-B。关键检查通过且有限 DTU 检查结束后才可 READY。仅遥测失败不阻止 SD 采集，通过已有 error 5 报告；关键启动失败维持 `b_ready=0`，因未建立握手没有正常心跳，具体原因从 USB 或可写的 `MISSION.JSON.boot_health` 查看。Flash/PSRAM 应用层核对失败仍阻止进入任务，但尽可能保留通信诊断而不是主动复位。UART 成功或 Socket ON 均不代表端到端通过，`ground_ack` 需等待真实消息的匹配 DTA1。
 
 ## 6. 软件模块划分
 
@@ -185,6 +190,7 @@ SC16 初始化完成后，固件固定等待 500 ms，再准备两台 H1。该�
 | 文件 | 职责 |
 |---|---|
 | `main/main.c` | 启动与自检编排 |
+| `components/boot_health/` | 跨任务启动检查结果、USB 报告和摘要 JSON；不直接访问设备 |
 | `components/board_support/` | 量产板全部 UART、SPI、存储与内存配置 |
 | `main/ab_link.c` | UART 收发、协议解析、握手、实时数据、控制命令、ACK、1 Hz 心跳 |
 | `main/mission_control.c` | 飞行任务生命周期的唯一所有者，协调 SD、记录器、SC16/H1 和采集 |
@@ -281,7 +287,7 @@ H1-A/H1-B ──> calculation ──> measurement_recorder ──> REFLECTANCE.B
 | 正常重试 | 1 次；第二次等待名义上为 6000 ms |
 | 最大池驻留 | 自接纳起 10000 ms |
 
-DTU 是透明串口模块，MQTT broker、端口、client ID、用户名、上/下行 topic、QoS、UART 波特率和打包参数保存在 DTU 自身的持久配置里，而不是由飞行固件每次启动下发。当前开发 topic 为 `dji-h1/test/up` 和 `dji-h1/test/down`。受版本控制的配置模板是 `tests/dtu_uart_bridge/dtu_mqtt_config.example.json`；实际部署应复制为同目录的 `dtu_mqtt_config.local.json`，该名称已被局部 `.gitignore` 排除。broker 地址和认证信息属于部署配置，正式产品不得硬编码密钥或提交真实密码。更换 DTU、SIM、broker 或 UART 参数后，应先使用 `tests/dtu_uart_bridge/configure_dtu_mqtt.py` 和双向验证脚本单独确认，再刷回生产固件。
+DTU 是透明串口模块，MQTT broker、端口、client ID、用户名、上/下行 topic、QoS、UART 波特率和打包参数保存在 DTU 自身的持久配置里，而不是由飞行固件每次启动下发。当前开发 topic 为 `dji-h1/test/up` 和 `dji-h1/test/down`。受版本控制的配置模板是 `tests/dtu_uart_bridge/dtu_mqtt_config.example.json`；实际部署应复制为同目录的 `dtu_mqtt_config.local.json`，该名称已被局部 `.gitignore` 排除。新的启动自验证从同一 JSON 编译非机密读回期望值，每次启动只查询核对，不重写 DTU；没有 local JSON 会回退 example 并警告，不能把示例 broker 当作可部署配置。认证字段不编译、不读回，需地面 DTA1 验证；生产 offline cache 为 OFF。broker 地址和认证信息属于部署配置，正式产品不得硬编码密钥或提交真实密码。更换 DTU、SIM、broker 或 UART 参数后，应先使用 `tests/dtu_uart_bridge/configure_dtu_mqtt.py` 和双向验证脚本单独确认，再从对应部署 JSON 构建并刷回生产固件。
 
 当前 YY-M200 在实测中稳定使用 460800 baud。曾尝试 921600，但现有模块固件拒绝该 AT 参数，因此生产值不得仅按手册宣称修改。DGB1 十条 GPS 合包已经通过 C/Python 协议测试、生产固件构建、60 秒板级联调和 10 分钟真实 DTU/EMQX 全功能任务；当前室内模拟任务下不再表现为主要吞吐瓶颈。候选 Air780、单包超过 4 KB、选择性/位图 ACK 等仍只是后续方案，当前固件均未实现。
 
@@ -595,11 +601,11 @@ B 板每秒发送一次状态，主要包含：
 1. 挂载 SD 卡并读取容量；
 2. 初始化记录器；记录器先运行 flight-index codec 和地面/天空因果配对策略的轻量自检；
 3. 从带 CRC 的根目录 `FLIGHT.IDX` 读取下一编号并确认目录未占用；缓存缺失或损坏时安全扫描 `F_0001` 至 `F_9999`；
-4. 打开任务记录文件、创建初始摘要、开始遥测 mission 并启动 writer；
+4. 打开任务记录文件、创建初始摘要、尝试开始遥测 mission 并启动 writer；遥测不可用不回滚 SD 文件；
 5. 初始化 SC16；
 6. 等待 500 ms；
 7. 查询并准备 H1-A、H1-B；
-8. 进入 READY，接受 A 板握手和控制。
+8. 关键检查通过并等待有界 DTU 探测结束后进入 READY，接受 A 板握手和控制；遥测不必成功，但失败会报告降级。
 
 成功创建任务后通过 `FLIGHT.TMP/FLIGHT.BAK` 更新索引。缓存只是加速提示，永远不能绕过目录存在性检查。目录编号当前不会循环复用；达到 `F_9999` 后需要人工归档/清卡或扩展命名策略。
 

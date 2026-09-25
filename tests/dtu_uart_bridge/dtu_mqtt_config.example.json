@@ -41,7 +41,7 @@
     }
   },
   "transport": {
-    "offline_cache": true,
+    "offline_cache": false,
     "uplink_conversion": "RAW",
     "downlink_conversion": "RAW",
     "registration_mode": "OFF",

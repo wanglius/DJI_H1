@@ -23,6 +23,11 @@ media unless the named test files have been backed up.
 Deterministic embedded qualification checks live in
 `components/startup_checks/`. Enable `CONFIG_DJI_H1_BOOT_SELF_TESTS` only for a
 qualification image; normal flight firmware does not compile their test bodies.
+Always-on production hardware checks are separate: see
+`Docs/boot_self_verification_zh.md` and `components/boot_health/`.
+`boot_health/` host tests exercise profile credential exclusion and the actual
+C checker with a simulated UART. Install `ziglang` (or put `zig` on PATH) to
+enable the native-C group; otherwise it is explicitly skipped.
 
 ## Host-only tests
 

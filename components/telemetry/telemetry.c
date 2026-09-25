@@ -1,4 +1,6 @@
 #include "telemetry.h"
+#include "boot_health.h"
+#include "dtu_boot_check.h"
 
 #include <limits.h>
 #include <string.h>
@@ -107,6 +109,12 @@ static TaskHandle_t s_task;
 static bool s_accepting;
 static bool s_sending;
 static bool s_abort_requested;
+/* Protected by s_lock; profile failures prohibit TX but never stop SD work. */
+static bool s_boot_tx_disabled;
+/* Sole telemetry task owns end-to-end verification, independent of status
+ * resets at begin_mission. No timeout is charged before the first real TX. */
+static int64_t s_boot_first_tx_us;
+static bool s_boot_ack_verified;
 static uint32_t s_submitters;
 /* The first record reserves one retained-pool slot. Later records are appended
  * in place until the configured count/deadline seals the immutable message. */
@@ -243,7 +251,7 @@ static bool try_mark_admitted(telemetry_entry_t *entry, uint8_t message_type,
 {
     int64_t admitted_us = esp_timer_get_time();
     taskENTER_CRITICAL(&s_lock);
-    if (!s_accepting || s_abort_requested || s_status.mission_id == 0) {
+    if (!s_accepting || s_abort_requested || s_boot_tx_disabled || s_status.mission_id == 0) {
         taskEXIT_CRITICAL(&s_lock);
         return false;
     }
@@ -589,6 +597,12 @@ static void process_ack(const telemetry_ack_t *ack)
     uint32_t pool_used = s_status.pool_used;
     uint32_t in_flight = s_status.messages_in_flight;
     taskEXIT_CRITICAL(&s_lock);
+
+    if (s_config.verify_dtu_at_boot && !s_boot_ack_verified) {
+        s_boot_ack_verified = true;
+        boot_health_result(BOOT_GROUND_ACK, ESP_OK);
+        boot_health_result(BOOT_DTU_NETWORK, ESP_OK);
+    }
 
     if (s_config.timing_diagnostics) {
         ESP_LOGI(TAG,
@@ -1070,6 +1084,18 @@ static void telemetry_task(void *unused)
     size_t recovery_cursor = 0;
     int64_t next_recovery_probe_us = 0;
 
+    if (s_config.verify_dtu_at_boot) {
+        bool allowed = dtu_boot_check(&s_config, abort_requested);
+        taskENTER_CRITICAL(&s_lock);
+        s_boot_tx_disabled = !allowed;
+        if (!allowed) {
+            s_status.healthy = false;
+            s_accepting = false;
+        }
+        taskEXIT_CRITICAL(&s_lock);
+        boot_health_report();
+    }
+
     while (true) {
         if (abort_requested()) {
             xQueueReset(s_event_queue);
@@ -1093,6 +1119,9 @@ static void telemetry_task(void *unused)
          * slots, rather than a single stop-and-wait current message. */
         while (drain_downlink(0)) {}
         int64_t now_us = esp_timer_get_time();
+        if (s_config.verify_dtu_at_boot && !s_boot_ack_verified &&
+            s_boot_first_tx_us != 0 && now_us - s_boot_first_tx_us >= 10000000)
+            boot_health_result(BOOT_GROUND_ACK, ESP_ERR_TIMEOUT);
         release_due_gps_batch(now_us);
         /* Fresh ACKs win over expiry. Anything still retained beyond the
          * residency window is then shed before another retry or new send. */
@@ -1125,7 +1154,13 @@ static void telemetry_task(void *unused)
             s_sending = true;
             uint64_t mission_id = s_status.mission_id;
             taskEXIT_CRITICAL(&s_lock);
-            (void)transmit_entry(entry, mission_id);
+            if (s_boot_tx_disabled) {
+                discard_failed_entry(entry, "boot DTU verification failed");
+            } else {
+                if (s_config.verify_dtu_at_boot && s_boot_first_tx_us == 0)
+                    s_boot_first_tx_us = esp_timer_get_time();
+                (void)transmit_entry(entry, mission_id);
+            }
             taskENTER_CRITICAL(&s_lock);
             s_sending = false;
             taskEXIT_CRITICAL(&s_lock);
@@ -1511,7 +1546,7 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     if (s_task == NULL) return ESP_ERR_INVALID_STATE;
     taskENTER_CRITICAL(&s_lock);
     bool available = s_status.mission_id == 0 && !s_accepting &&
-                     !s_abort_requested && s_submitters == 0 &&
+                     !s_abort_requested && !s_boot_tx_disabled && s_submitters == 0 &&
                      s_status.pool_used == 0 &&
                      s_pending_gps_batch == NULL;
     taskEXIT_CRITICAL(&s_lock);
@@ -1532,7 +1567,7 @@ esp_err_t telemetry_begin_mission(uint64_t mission_id)
     taskENTER_CRITICAL(&s_lock);
     /* Power-off is terminal for this boot. Recheck under the publication lock
      * because an abort may arrive after the queue/free-list observations. */
-    if (s_abort_requested || s_status.mission_id != 0 || s_accepting ||
+    if (s_abort_requested || s_boot_tx_disabled || s_status.mission_id != 0 || s_accepting ||
         s_submitters != 0 || s_status.pool_used != 0) {
         taskEXIT_CRITICAL(&s_lock);
         return ESP_ERR_INVALID_STATE;

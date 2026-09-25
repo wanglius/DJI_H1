@@ -1,4 +1,5 @@
 #include "measurement_recorder.h"
+#include "boot_health.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -24,7 +25,7 @@ static const char *TAG = "MEAS_REC";
 
 #define RAW_POOL_COUNT 24
 #define WRITER_QUEUE_LENGTH 64
-#define SERIAL_BUFFER_SIZE 4096
+#define SERIAL_BUFFER_SIZE 8192
 #define FILE_HEADER_SIZE 16U
 #define SKY_HISTORY_COUNT 8U
 #define PENDING_GROUND_COUNT 128U
@@ -528,10 +529,15 @@ static esp_err_t write_mission_summary(const char *state)
     const char *timezone_name = clock_sync_timezone_name();
     int timezone_offset = clock_sync_timezone_offset_minutes();
     const esp_app_desc_t *app = esp_app_get_description();
+    /* Same writer/lifecycle ownership as s_serial_buffer; not on RTOS stack. */
+    static char boot_json[1024];
+    esp_err_t boot_result = boot_health_json(boot_json, sizeof(boot_json));
+    if (boot_result != ESP_OK) return boot_result;
     int length = snprintf((char *)s_serial_buffer, sizeof(s_serial_buffer),
         "{\n"
         "  \"schema\": \"DJI_H1_MISSION\",\n"
         "  \"schema_version\": 1,\n"
+        "  \"boot_health\": %s,\n"
         "  \"record_format_version\": %u,\n"
         "  \"timestamp_basis\": \"UTC\",\n"
         "  \"timezone\": {\"name\": \"%s\", "
@@ -622,7 +628,7 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"flush_errors\": %" PRIu32 ",\n"
         "  \"max_flush_us\": %" PRIu32 "\n"
         "}\n",
-        DATA_RECORD_FORMAT_VERSION, timezone_name, timezone_offset,
+        boot_json, DATA_RECORD_FORMAT_VERSION, timezone_name, timezone_offset,
         state, s_directory, s_flight_index,
         telemetry_mission_id,
         app ? app->version : "unknown", a_firmware, drone_link,
@@ -949,6 +955,31 @@ static void resolve_pending_grounds(size_t *pending_count,
     *pending_count = retained;
 }
 
+/* Persist changes even without an A-board handshake (e.g. H1 unplugged).
+ * Compare fields, not struct padding. Called only at the writer's existing
+ * periodic flush boundaries, so modem/ACK updates never perform SD I/O. */
+static void checkpoint_boot_health(void)
+{
+    static boot_health_snapshot_t saved;
+    static bool have_saved;
+    taskENTER_CRITICAL(&s_lock);
+    bool permitted = s_have_flight && s_accept_aux && !s_shutdown_pending;
+    taskEXIT_CRITICAL(&s_lock);
+    /* Never add optional checkpoint work once shutdown reserves SD time. */
+    if (!permitted) return;
+    boot_health_snapshot_t current;
+    boot_health_snapshot(&current);
+    bool changed = !have_saved;
+    for (int i = 0; i < BOOT_CHECK_COUNT; ++i)
+        changed |= current.checks[i].state != saved.checks[i].state ||
+                   current.checks[i].error != saved.checks[i].error;
+    if (changed) {
+        esp_err_t result = write_mission_summary("in_progress");
+        note_storage_result(result, "Boot health MISSION.JSON checkpoint");
+        if (result == ESP_OK) { saved = current; have_saved = true; }
+    }
+}
+
 static void writer_task(void *unused)
 {
     (void)unused;
@@ -956,12 +987,14 @@ static void writer_task(void *unused)
     size_t pending_count = 0;
     uint64_t sky_watermark_us = 0;
     TickType_t last_flush = xTaskGetTickCount();
+    bool finalized = false;
     message_t message;
     while (true) {
         if (xQueueReceive(s_writer_queue, &message,
                           pdMS_TO_TICKS(PERIODIC_FLUSH_MS)) != pdTRUE) {
-            if (s_raw_file || s_reflectance_file || s_gps_file || s_event_file) {
+            if (!finalized && (s_raw_file || s_reflectance_file || s_gps_file || s_event_file)) {
                 (void)flush_files();
+                checkpoint_boot_health();
                 last_flush = xTaskGetTickCount();
             }
             continue;
@@ -995,6 +1028,9 @@ static void writer_task(void *unused)
             write_internal_event(MEASUREMENT_EVENT_FLIGHT_CLOSED,
                                  s_totals.segments_completed, 0);
             (void)flush_files();
+            /* No idle checkpoint/flush may race the owner's close/final JSON
+             * after this barrier. One flight per boot; FINALIZE is terminal. */
+            finalized = true;
             xSemaphoreGive(s_barrier);
             continue;
         }
@@ -1060,6 +1096,7 @@ periodic_flush:
         if (xTaskGetTickCount() - last_flush >=
             pdMS_TO_TICKS(PERIODIC_FLUSH_MS)) {
             (void)flush_files();
+            checkpoint_boot_health();
             last_flush = xTaskGetTickCount();
         }
     }
@@ -1258,8 +1295,8 @@ static esp_err_t open_flight_files(void)
      * needed and telemetry cannot outlive a failed recorder open. */
     result = telemetry_begin_mission(telemetry_mission_id);
     if (result != ESP_OK) {
-        (void)close_files();
-        return result;
+        ESP_LOGW(TAG, "Telemetry unavailable; retaining SD mission: %s",
+                 esp_err_to_name(result));
     }
     index_result = store_next_flight_index(flight_index + 1U);
     if (index_result != ESP_OK) {
