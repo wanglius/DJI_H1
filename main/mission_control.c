@@ -152,6 +152,11 @@ void mission_control_get_status(ab_status_report_t *out)
                    recorder.identity_mismatches))
         error = 5;
     if (!error && (acquisition.errors[0] || acquisition.errors[1])) error = 5;
+    /* Mission totals preserve transport degradation across later STARTs.
+     * Unlike storage failure, loss degrades status but does not halt capture. */
+    if (!error && (recorder.rx_overruns[0] || recorder.rx_overruns[1] ||
+                  recorder.rx_software_drops[0] || recorder.rx_software_drops[1]))
+        error = 5;
     if (!error && telemetry_boot_failed) error = 5;
     /* Delivery loss is mission degradation, not a recorder stop condition.
      * Keep it visible to A while later SD and telemetry submissions continue. */

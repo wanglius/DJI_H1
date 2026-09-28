@@ -1,6 +1,7 @@
 """Chinese presentation labels only; never translate stored/API protocol values."""
 
 EVENT_NAMES = {
+    "acquisition_rx_loss": "光谱接收数据丢失",
     "handshake": "握手", "segment_start": "测量段开始",
     "stop_request": "停止请求", "segment_end": "测量段结束",
     "power_off_request": "断电预告", "protocol_crc_error": "协议 CRC 错误",

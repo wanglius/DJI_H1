@@ -97,6 +97,11 @@ int main(int argc, char **argv)
     bool expected = scenario == 0 || scenario == 2 || scenario == 3 || scenario >= 10;
     assert(allowed == expected);
     assert(now <= 20800000); /* global check budget plus bounded cleanup */
+    /* No modem must fail fast; a responding but offline modem may consume
+     * the full registration budget. These are simulated UART timings, not
+     * a claim about scheduler latency or the real A-board's retry policy. */
+    if (scenario == 4) assert(now >= 2900000 && now <= 3000000);
+    if (scenario == 2) assert(now >= 20000000 && now <= 20800000);
     assert(exits == (scenario == 8 ? 0 : 1));
     if (scenario == 8) assert(writes == 0);
     if (scenario == 6) assert(now < 3000000);

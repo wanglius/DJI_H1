@@ -62,6 +62,8 @@ typedef struct {
     uint32_t calculation_rejected;
     uint32_t reflectance_skipped_shutdown;
     uint32_t identity_mismatches;
+    uint32_t rx_overruns[2];
+    uint32_t rx_software_drops[2];
     uint32_t write_errors;
     uint32_t flush_errors;
     uint32_t max_flush_us;
@@ -98,7 +100,7 @@ static uint8_t s_drone_link;
 /* Noisy per-frame diagnostics stay complete in EVENTS.JSONL but only the first
  * and each hundredth occurrence enter the priority telemetry queue. */
 static uint32_t s_live_event_occurrences[
-    MEASUREMENT_EVENT_AB_LINK_RESTORED + 1U];
+    MEASUREMENT_EVENT_ACQUISITION_RX_LOSS + 1U];
 /* Sole writer-task workspaces live in BSS to keep its stack bounded. */
 static uint8_t s_serial_buffer[SERIAL_BUFFER_SIZE];
 static raw_spectrum_record_t s_sky_history[SKY_HISTORY_COUNT];
@@ -389,6 +391,7 @@ static const char *event_name(measurement_event_t event)
         return "drone_identity_mismatch";
     case MEASUREMENT_EVENT_AB_LINK_LOST: return "ab_link_lost";
     case MEASUREMENT_EVENT_AB_LINK_RESTORED: return "ab_link_restored";
+    case MEASUREMENT_EVENT_ACQUISITION_RX_LOSS: return "acquisition_rx_loss";
     default: return "unknown";
     }
 }
@@ -414,6 +417,8 @@ static uint8_t event_severity(measurement_event_t event, int32_t argument1)
     case MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH:
     case MEASUREMENT_EVENT_AB_LINK_LOST:
         return OPERATION_EVENT_SEVERITY_CRITICAL;
+    case MEASUREMENT_EVENT_ACQUISITION_RX_LOSS:
+        return OPERATION_EVENT_SEVERITY_ERROR;
     default:
         return OPERATION_EVENT_SEVERITY_INFO;
     }
@@ -570,6 +575,8 @@ static esp_err_t write_mission_summary(const char *state)
         "  \"drops\": {\"raw\": %" PRIu32 ", \"gps\": %" PRIu32
         ", \"events\": %" PRIu32 "},\n"
         "  \"calculation_rejected\": %" PRIu32 ",\n"
+        "  \"acquisition_rx_loss\": {\"hardware_overruns\": [%" PRIu32 ", %" PRIu32
+        "], \"software_dropped_bytes\": [%" PRIu32 ", %" PRIu32 "]},\n"
         "  \"reflectance_skipped_shutdown\": %" PRIu32 ",\n"
         "  \"telemetry\": {\"infrastructure_healthy\": %s"
         ", \"delivery_degraded\": %s"
@@ -640,7 +647,10 @@ static esp_err_t write_mission_summary(const char *state)
         totals.segments_completed, totals.raw_written,
         totals.reflectance_written, totals.gps_written, totals.events_written,
         totals.raw_dropped, totals.gps_dropped, totals.events_dropped,
-        totals.calculation_rejected, totals.reflectance_skipped_shutdown,
+        totals.calculation_rejected,
+        totals.rx_overruns[0], totals.rx_overruns[1],
+        totals.rx_software_drops[0], totals.rx_software_drops[1],
+        totals.reflectance_skipped_shutdown,
         telemetry.healthy ? "true" : "false",
         telemetry_delivery_degraded ? "true" : "false",
         telemetry.shutdown_aborted ? "true" : "false",
@@ -1448,7 +1458,7 @@ esp_err_t measurement_recorder_log_event(measurement_event_t event,
                                          int32_t argument1)
 {
     if (event < MEASUREMENT_EVENT_HANDSHAKE ||
-        event > MEASUREMENT_EVENT_AB_LINK_RESTORED)
+        event > MEASUREMENT_EVENT_ACQUISITION_RX_LOSS)
         return ESP_ERR_INVALID_ARG;
     taskENTER_CRITICAL(&s_lock);
     bool available = s_task != NULL && s_have_flight && s_accept_aux &&
@@ -1708,7 +1718,21 @@ void measurement_recorder_get_status(measurement_recorder_status_t *out)
     if (!out) return;
     taskENTER_CRITICAL(&s_lock);
     *out = s_status;
-    /* Identity belongs to the boot-to-poweroff mission, not one segment. */
+    /* Identity and RX loss belong to the boot-to-poweroff mission, not one
+     * segment. A successful later START must not hide earlier data loss. */
     out->identity_mismatches = s_totals.identity_mismatches;
+    memcpy(out->rx_overruns, s_totals.rx_overruns, sizeof(out->rx_overruns));
+    memcpy(out->rx_software_drops, s_totals.rx_software_drops,
+           sizeof(out->rx_software_drops));
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+void measurement_recorder_note_rx_loss(unsigned channel, uint32_t overruns,
+                                       uint32_t software_drops)
+{
+    if (channel >= 2) return;
+    taskENTER_CRITICAL(&s_lock);
+    s_totals.rx_overruns[channel] += overruns;
+    s_totals.rx_software_drops[channel] += software_drops;
     taskEXIT_CRITICAL(&s_lock);
 }

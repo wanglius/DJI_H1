@@ -1,4 +1,5 @@
 #include "acquisition.h"
+#include "acquisition_rx_loss.h"
 #include "boot_health.h"
 
 #include <stdbool.h>
@@ -82,6 +83,38 @@ static int64_t s_stop_deadline_us = INT64_MAX;
 static acquisition_runtime_state_t s_runtime_state;
 static bool s_service_started;
 static bool s_stream_started[SENSOR_COUNT];
+static acquisition_rx_loss_t s_rx_loss[SENSOR_COUNT];
+static int64_t s_rx_loss_next_sample_us;
+
+/* Sole lifecycle owner samples atomics; no SPI or SD I/O is done here. Poll
+ * independently of successful H1 frames so broken streams are observable.
+ * Freeze on every teardown path, including partial startup and retry cleanup. */
+static void sample_rx_loss(bool freeze)
+{
+    int64_t now = esp_timer_get_time();
+    if (!freeze && now < s_rx_loss_next_sample_us) return;
+    s_rx_loss_next_sample_us = now + 100000;
+    for (size_t i = 0; i < SENSOR_COUNT; ++i) {
+        uint32_t overruns, drops;
+        bool first = acquisition_rx_loss_sample(&s_rx_loss[i],
+            sc16_get_channel_rx_overrun_count(s_sensors[i].channel),
+            sc16_get_software_rx_drop_count(s_sensors[i].channel), freeze,
+            &overruns, &drops);
+        if (!overruns && !drops) continue;
+        taskENTER_CRITICAL(&s_status_lock);
+        s_status.rx_overruns[i] += overruns;
+        s_status.rx_software_drops[i] += drops;
+        taskEXIT_CRITICAL(&s_status_lock);
+        measurement_recorder_note_rx_loss((unsigned)i, overruns, drops);
+        if (first) {
+            /* One alarm per channel/segment; totals retain subsequent loss.
+             * During power-off external events are closed intentionally;
+             * note_rx_loss still preserves totals in the final summary. */
+            (void)measurement_recorder_log_event(MEASUREMENT_EVENT_ACQUISITION_RX_LOSS,
+                (uint32_t)i, (overruns ? 1 : 0) | (drops ? 2 : 0));
+        }
+    }
+}
 
 static void set_runtime_state(acquisition_runtime_state_t state)
 {
@@ -433,6 +466,7 @@ static esp_err_t stop_reader_stream(sensor_context_t *ctx,
 
 static esp_err_t stop_acquisition_tasks(bool *all_tasks_stopped)
 {
+    sample_rx_loss(true);
     *all_tasks_stopped = false;
     for (size_t i = 0; i < SENSOR_COUNT; i++) {
         __atomic_store_n(&s_sensors[i].run, false, __ATOMIC_RELEASE);
@@ -667,6 +701,11 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
     configure_watchdog();
 
     sc16_reset_rx_overrun_count();
+    for (size_t i = 0; i < SENSOR_COUNT; ++i)
+        acquisition_rx_loss_begin(&s_rx_loss[i],
+            sc16_get_channel_rx_overrun_count(s_sensors[i].channel),
+            sc16_get_software_rx_drop_count(s_sensors[i].channel));
+    s_rx_loss_next_sample_us = 0;
     /* Sky is the denominator for every ground-derived reflectance row. Prime
      * its stream first so a short capture segment cannot lose its initial
      * ground frames merely because no causal sky reference exists yet. */
@@ -684,6 +723,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
 
     int64_t prime_deadline = esp_timer_get_time() + FRAME_TIMEOUT_MS * 1000LL;
     while (!__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) {
+        sample_rx_loss(false);
         acquisition_status_t status;
         acquisition_get_status(&status);
         if (status.frames[1] != 0) break;
@@ -717,6 +757,7 @@ esp_err_t acquisition_run_dual(uint32_t duration_ms)
         esp_timer_get_time() + (int64_t)duration_ms * 1000;
     while (!__atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE) &&
            esp_timer_get_time() < deadline) {
+        sample_rx_loss(false);
         vTaskDelay(1);
     }
 

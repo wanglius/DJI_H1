@@ -65,7 +65,12 @@
 #define DJI_SD_MAX_OPEN_FILES 8
 #define DJI_SD_MOUNT_POINT "/sdcard"
 
-/* Dual H1 UART bridge on SPI3. */
+/* Dual H1 UART bridge on SPI3; IRQ is not used on this board.
+ * The polling service requires CONFIG_FREERTOS_HZ=1000 (compile-time checked
+ * in sc16is752). At 115200 baud, 8N1, an empty 64-byte FIFO fills in ~5.56 ms;
+ * nominal 1 ms polling leaves ~4.56 ms, less SPI/scheduling overhead. This is
+ * a timing budget, not a hard guarantee: prolonged starvation can still lose
+ * bytes and must be diagnosed through acquisition RX-loss counters. */
 #define DJI_SC16_SPI_HOST SPI3_HOST
 #define DJI_SC16_PIN_MOSI 2
 #define DJI_SC16_PIN_MISO 3

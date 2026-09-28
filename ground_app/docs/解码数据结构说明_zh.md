@@ -230,6 +230,13 @@ A 原始 UTC 毫秒为 `sample.utc_seconds * 1000 + sample.utc_milliseconds`。�
 | 12 | `drone_identity_mismatch` | 飞行器身份不一致 |
 | 13 | `ab_link_lost` | A-B 链路丢失 |
 | 14 | `ab_link_restored` | A-B 链路恢复 |
+| 15 | `acquisition_rx_loss` | 光谱接收数据丢失，error 级；argument0 为通道（0 地面，1 天空），argument1 的 bit0 表示硬件溢出，bit1 表示软件接收缓冲丢字节 |
+
+事件 15 每个采集段、每个通道最多首次报告一次；参数位表示首次检测到的损失类型，
+不是全段累计计数。后续损失累计到 `MISSION.JSON.acquisition_rx_loss`，其中
+`hardware_overruns` 与 `software_dropped_bytes` 均为 `[地面, 天空]` 数组。
+前者为硬件 OE 溢出标志的观测次数（不能推断丢失字节数），后者为软件缓冲拒收字节数。
+旧任务没有此字段，表示未提供统计，不能据此断言没有接收损失。
 
 参数含义依赖事件码，不能统一解释成经纬度、次数或停止原因。低层记录保留数值；实时查询层将其投影为扁平字典，包含 `event`、字符串 `severity`、`sequence`、会话/测量段、时间和两个参数。未知事件名称形如 `event_123`。
 

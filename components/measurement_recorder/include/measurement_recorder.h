@@ -26,6 +26,9 @@ typedef struct {
     uint32_t reflectance_skipped_shutdown;
     /** Non-empty A-board serials that disagreed with the first canonical ID. */
     uint32_t identity_mismatches;
+    /** Mission-wide acquisition loss; excludes teardown and survives START. */
+    uint32_t rx_overruns[2];
+    uint32_t rx_software_drops[2];
     uint32_t write_errors;
     uint32_t flush_count;
     uint32_t flush_errors;
@@ -48,6 +51,8 @@ typedef enum {
     MEASUREMENT_EVENT_DRONE_IDENTITY_MISMATCH,
     MEASUREMENT_EVENT_AB_LINK_LOST,
     MEASUREMENT_EVENT_AB_LINK_RESTORED,
+    /** arg0: channel (0 ground, 1 sky); arg1: bit0 OE, bit1 software drop. */
+    MEASUREMENT_EVENT_ACQUISITION_RX_LOSS,
 } measurement_event_t;
 
 /** Create the fixed pools, sole SD writer task, and a new mission directory.
@@ -103,6 +108,11 @@ void measurement_recorder_note_handshake(const uint8_t drone_serial[32],
                                          uint8_t drone_link);
 
 void measurement_recorder_get_status(measurement_recorder_status_t *out);
+
+/** Acquisition lifecycle owner only, before recorder end/finalize. Add deltas
+ * even after prepare_shutdown closes external events; never queues or waits. */
+void measurement_recorder_note_rx_loss(unsigned channel, uint32_t overruns,
+                                       uint32_t software_drops);
 
 #ifdef __cplusplus
 }

@@ -52,6 +52,7 @@ _EVENT_NAMES = {
     12: "drone_identity_mismatch",
     13: "ab_link_lost",
     14: "ab_link_restored",
+    15: "acquisition_rx_loss",
 }
 _EVENT_SEVERITIES = {
     0: "info",

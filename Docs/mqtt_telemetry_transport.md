@@ -80,7 +80,7 @@ and reflectance.
 
 | Body offset | Size | Field |
 | ---: | ---: | --- |
-| 0 | 2 | Event code from `measurement_event_code_t` |
+| 0 | 2 | Event code from `measurement_event_t` |
 | 2 | 1 | Severity: info `0`, warning `1`, error `2`, critical `3` |
 | 3 | 1 | Reserved, must be zero |
 | 4 | 4 | Unsigned event-specific argument 0 |
@@ -92,6 +92,15 @@ power-off forecast, A/B link loss/restoration, and rate-limited diagnostic
 events. High-frequency diagnostic classes send their first occurrence and
 then every hundredth occurrence live so a fault storm cannot starve lifecycle
 events; no SD events are omitted by this live rate limit.
+
+Event 15, `acquisition_rx_loss` (error severity), reports the first observed
+RX loss per channel per capture segment. Argument 0 is channel 0 (ground) or
+1 (sky); argument 1 is a bitmask: bit 0 hardware FIFO overrun, bit 1 software
+RX-buffer dropped bytes. The mask describes that first observation, not the
+whole segment. Later losses accumulate in `MISSION.JSON.acquisition_rx_loss`.
+This event is intentionally generated at most once per channel/segment on
+both SD and telemetry paths. Power-off does not reopen closed event admission;
+the final summary still retains the counters. No wire-layout change is made.
 
 ## GPS batch payload format (DGB1 v01)
 

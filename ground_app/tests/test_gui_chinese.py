@@ -17,6 +17,7 @@ class ChineseGuiTests(unittest.TestCase):
     def test_labels_preserve_unknown_codes_and_template_language(self):
         self.assertEqual(display_value("subscribed"), "已订阅")
         self.assertEqual(event_name("ab_link_lost"), "A-B 链路丢失")
+        self.assertEqual(event_name("acquisition_rx_loss"), "光谱接收数据丢失")
         self.assertIn("event_999", event_name("event_999"))
         self.assertEqual(display_value("future-state"), "future-state")
         template = (ROOT / "src/dji_h1_ground/resources/baidu_map.html").read_text(

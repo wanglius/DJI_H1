@@ -150,6 +150,15 @@ class LiveViewerTests(unittest.TestCase):
             MESSAGE_OPERATION_LOG, 4, _event(4, 2050))), 0)
         self.assertEqual(len(store.snapshot({}).events), 1)
 
+    def test_acquisition_rx_loss_event(self) -> None:
+        store = LiveMissionStore(LiveReceiverConfig(host="localhost"))
+        self.assertEqual(store.accept(_message(MESSAGE_OPERATION_LOG, 5,
+            _event(5, 2050, code=15, severity=2, argument0=1, argument1=3))), 1)
+        event = store.snapshot({}).events[0]
+        self.assertEqual(event["event"], "acquisition_rx_loss")
+        self.assertEqual(event["severity"], "error")
+        self.assertEqual((event["argument0"], event["argument1"]), (1, 3))
+
     def test_local_live_configuration_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "live_mqtt.local.json"

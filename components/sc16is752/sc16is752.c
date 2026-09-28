@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
+#include "sc16_polling_contract.h"
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"

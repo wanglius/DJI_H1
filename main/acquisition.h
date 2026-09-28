@@ -14,6 +14,11 @@ typedef struct {
     bool cleanup_pending;
     uint32_t frames[2];
     uint32_t errors[2];
+    /** Current segment only, frozen before teardown; A=ground, B=sky.
+     * Overruns count observed hardware OE indications, not lost bytes.
+     * Software drops count bytes rejected by the RX stream buffer. */
+    uint32_t rx_overruns[2];
+    uint32_t rx_software_drops[2];
 } acquisition_status_t;
 
 /** Single lifecycle owner only; call before accepting the first mission. */
